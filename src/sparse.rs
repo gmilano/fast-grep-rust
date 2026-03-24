@@ -191,30 +191,101 @@ pub fn extract_covering_ngrams(text: &[u8], freq: &BigramFreq) -> Vec<Box<[u8]>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    // --- BigramFreq tests ---
 
     #[test]
-    fn test_bigram_weight() {
+    fn common_bigram_has_lower_weight_than_rare() {
         let freq = BigramFreq::new();
-        // Common bigram "th" should have low weight (high frequency)
         let w_th = freq.weight(b't', b'h');
-        // Rare bigram "zq" should have high weight (low frequency)
         let w_zq = freq.weight(b'z', b'q');
         assert!(w_th < w_zq, "th={} should be < zq={}", w_th, w_zq);
     }
 
+    // --- extract_sparse_ngrams tests (ported from sparse-ngram.test.ts) ---
+
     #[test]
-    fn test_extract_sparse_ngrams() {
+    fn sparse_returns_empty_for_short_text() {
         let freq = BigramFreq::new();
-        let text = b"EXPORT_SYMBOL";
-        let ngrams = extract_sparse_ngrams(text, &freq);
+        assert!(extract_sparse_ngrams(b"", &freq).is_empty());
+        assert!(extract_sparse_ngrams(b"ab", &freq).is_empty());
+    }
+
+    #[test]
+    fn sparse_produces_ngrams_for_short_text() {
+        let freq = BigramFreq::new();
+        let ngrams = extract_sparse_ngrams(b"hello", &freq);
+        // All n-grams should be substrings of the text
+        for ng in &ngrams {
+            let text = b"hello";
+            assert!(
+                text.windows(ng.len()).any(|w| w == ng.as_ref()),
+                "{:?} should be a substring of 'hello'",
+                ng
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_produces_ngrams_from_longer_text() {
+        let freq = BigramFreq::new();
+        let ngrams = extract_sparse_ngrams(b"EXPORT_SYMBOL", &freq);
         assert!(!ngrams.is_empty());
     }
 
     #[test]
-    fn test_extract_covering_ngrams() {
+    fn sparse_deduplicates_ngrams() {
         let freq = BigramFreq::new();
-        let text = b"EXPORT_SYMBOL";
-        let ngrams = extract_covering_ngrams(text, &freq);
-        assert!(!ngrams.is_empty());
+        let ngrams = extract_sparse_ngrams(b"aaabbbaaabbb", &freq);
+        let unique: HashSet<&[u8]> = ngrams.iter().map(|n| n.as_ref()).collect();
+        assert_eq!(ngrams.len(), unique.len());
+    }
+
+    // --- extract_covering_ngrams tests (ported from extractCoveringSparseNgrams) ---
+
+    #[test]
+    fn covering_returns_empty_for_short_text() {
+        let freq = BigramFreq::new();
+        assert!(extract_covering_ngrams(b"", &freq).is_empty());
+        assert!(extract_covering_ngrams(b"ab", &freq).is_empty());
+    }
+
+    #[test]
+    fn covering_ngrams_are_substrings_of_text() {
+        let freq = BigramFreq::new();
+        let text = b"functionName";
+        let covering = extract_covering_ngrams(text, &freq);
+        for ng in &covering {
+            assert!(
+                text.windows(ng.len()).any(|w| w == ng.as_ref()),
+                "{:?} should be a substring of 'functionName'",
+                ng
+            );
+        }
+    }
+
+    #[test]
+    fn covering_returns_fewer_or_equal_ngrams_than_full() {
+        let freq = BigramFreq::new();
+        let text = b"this is a longer text for testing coverage";
+        let all = extract_sparse_ngrams(text, &freq);
+        let covering = extract_covering_ngrams(text, &freq);
+        assert!(covering.len() <= all.len());
+    }
+
+    #[test]
+    fn covering_ngrams_are_subset_of_full_extraction() {
+        let freq = BigramFreq::new();
+        let text = b"constructorPattern";
+        let all: HashSet<Box<[u8]>> = extract_sparse_ngrams(text, &freq).into_iter().collect();
+        let covering = extract_covering_ngrams(text, &freq);
+        for ng in &covering {
+            assert!(
+                all.contains(ng),
+                "covering ngram {:?} should be in full extraction set",
+                ng
+            );
+        }
     }
 }

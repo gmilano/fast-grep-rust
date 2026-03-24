@@ -226,10 +226,13 @@ fn run_bench(
     // 5. ripgrep (if available)
     let rg_time = bench_external("rg", &["-n", pattern, &dir.to_string_lossy()]);
 
-    // Position mask stats
+    // Position mask stats — compare file-level candidates vs files with actual matches
     let idx_for_stats =
         index::SparseIndex::build_from_directory(dir, no_ignore, type_filter, false)?;
-    let inmem_stats = idx_for_stats.search_with_stats(pattern, inmem_matches.len());
+    let mut verified_files: Vec<&PathBuf> = inmem_matches.iter().map(|m| &m.path).collect();
+    verified_files.sort();
+    verified_files.dedup();
+    let inmem_stats = idx_for_stats.search_with_stats(pattern, verified_files.len());
 
     // Print results
     println!();

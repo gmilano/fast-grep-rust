@@ -94,6 +94,7 @@ impl SparseIndex {
 
     fn search_inner(&self, pattern: &str) -> (Vec<&Path>, usize) {
         let alternatives = trigram::decompose_pattern(pattern);
+        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
 
         // If no useful trigrams, fall back to full scan
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
@@ -143,11 +144,11 @@ impl SparseIndex {
                 }
             }
 
-            // Step 2: adjacency filtering using position masks
-            // For consecutive trigrams in the query, check that next_mask of T[i]
-            // overlaps with loc_mask of T[i+1] for the same document.
-            if alt_trigrams.len() >= 2 && !candidate_docs.is_empty() {
-                for pair in alt_trigrams.windows(2) {
+            // Step 2: adjacency filtering using position masks (ordered trigrams)
+            // Use the ordered (non-sorted) trigrams so consecutive pairs are truly adjacent.
+            let ordered = &ordered_alternatives[i];
+            if ordered.len() >= 2 && !candidate_docs.is_empty() {
+                for pair in ordered.windows(2) {
                     let masks_a: HashMap<u32, (u8, u8)> = self
                         .ngrams
                         .get(&pair[0])
@@ -284,62 +285,102 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    #[test]
-    fn test_add_and_search() {
-        let mut index = SparseIndex::new();
-        index.add_document(
-            Path::new("test1.rs"),
-            b"fn main() { println!(\"hello world\"); }",
-        );
-        index.add_document(Path::new("test2.rs"), b"fn helper() { return 42; }");
-        index.add_document(
-            Path::new("test3.txt"),
-            b"This is a completely different file about cats.",
-        );
+    // --- TrigramIndex-equivalent tests (ported from index.test.ts) ---
 
-        let results = index.search("println");
-        assert!(
-            results.iter().any(|p| *p == Path::new("test1.rs")),
-            "Should find test1.rs for 'println'"
-        );
+    #[test]
+    fn finds_documents_containing_a_literal_pattern() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"const hello = 'world';");
+        idx.add_document(Path::new("b.ts"), b"function goodbye() {}");
+        idx.add_document(Path::new("c.ts"), b"say hello to everyone");
+
+        let results = idx.search("hello");
+        assert!(results.contains(&&*Path::new("a.ts")));
+        assert!(results.contains(&&*Path::new("c.ts")));
+        assert!(!results.contains(&&*Path::new("b.ts")));
     }
 
     #[test]
-    fn test_adjacency_filtering() {
-        let mut index = SparseIndex::new();
-        // "println" appears in test1 but not test2
-        index.add_document(
+    fn returns_empty_when_pattern_not_found() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"const x = 1;");
+
+        let results = idx.search("zzzzz");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn returns_all_docs_for_short_patterns() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"abc");
+        idx.add_document(Path::new("b.ts"), b"def");
+
+        // Short pattern = no trigrams = fallback to all docs
+        let results = idx.search("xy");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn handles_alternation_patterns() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"function hello() {}");
+        idx.add_document(Path::new("b.ts"), b"const world = 1;");
+        idx.add_document(Path::new("c.ts"), b"nothing here");
+
+        let results = idx.search("hello|world");
+        assert!(results.contains(&&*Path::new("a.ts")));
+        assert!(results.contains(&&*Path::new("b.ts")));
+        assert!(!results.contains(&&*Path::new("c.ts")));
+    }
+
+    #[test]
+    fn reports_correct_stats() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"hello world");
+        idx.add_document(Path::new("b.ts"), b"hello again");
+
+        let stats = idx.stats();
+        assert_eq!(stats.num_docs, 2);
+        assert!(stats.num_ngrams > 0);
+        assert!(stats.avg_postings_len > 0.0);
+    }
+
+    #[test]
+    fn intersects_trigrams_correctly_and_logic() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.ts"), b"import React from 'react'");
+        idx.add_document(Path::new("b.ts"), b"import Vue from 'vue'");
+        idx.add_document(Path::new("c.ts"), b"React component here");
+
+        // "React" trigrams: Rea, eac, act — should match a.ts and c.ts
+        let results = idx.search("React");
+        assert!(results.contains(&&*Path::new("a.ts")));
+        assert!(results.contains(&&*Path::new("c.ts")));
+        assert!(!results.contains(&&*Path::new("b.ts")));
+    }
+
+    // --- adjacency filtering ---
+
+    #[test]
+    fn adjacency_filtering_finds_real_match() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(
             Path::new("test1.rs"),
             b"fn main() { println!(\"hello\"); }",
         );
-        // Has "pri" and "ntl" separately but not "println"
-        index.add_document(
-            Path::new("test2.rs"),
-            b"priority control ntly",
-        );
+        idx.add_document(Path::new("test2.rs"), b"priority control ntly");
 
-        let results = index.search("println");
-        // test1 should match, test2 might be filtered by adjacency
-        assert!(
-            results.iter().any(|p| *p == Path::new("test1.rs")),
-            "Should find test1.rs for 'println'"
-        );
+        let results = idx.search("println");
+        assert!(results.contains(&&*Path::new("test1.rs")));
     }
 
-    #[test]
-    fn test_stats() {
-        let mut index = SparseIndex::new();
-        index.add_document(Path::new("a.rs"), b"hello world foo bar baz");
-        let stats = index.stats();
-        assert_eq!(stats.num_docs, 1);
-        assert!(stats.num_ngrams > 0);
-    }
+    // --- search_with_stats ---
 
     #[test]
-    fn test_search_with_stats() {
-        let mut index = SparseIndex::new();
-        index.add_document(Path::new("a.rs"), b"hello world foo bar baz");
-        let stats = index.search_with_stats("hello", 1);
+    fn search_with_stats_returns_valid_metrics() {
+        let mut idx = SparseIndex::new();
+        idx.add_document(Path::new("a.rs"), b"hello world foo bar baz");
+        let stats = idx.search_with_stats("hello", 1);
         assert!(stats.candidates >= 1);
         assert_eq!(stats.verified, 1);
     }

@@ -24,7 +24,7 @@ Verification of candidates runs in parallel via Rayon using the `regex` crate (T
 | `EXPORT_SYMBOL` | 1.50s | **163ms** | **9.2×** |
 | `int main` | 1.86s | **391ms** | **4.8×** |
 | `static.*inline` | 2.12s | **411ms** | **5.2×** |
-| `printk` | 1.68s | 1.35s | 1.2× |
+| `printk` | 1.84s | **192ms** | **9.6×** |
 
 > `printk` is the worst case — it appears in ~40k files, so the index can't filter much. The position mask filter closes this gap significantly.
 

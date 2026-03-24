@@ -165,25 +165,117 @@ fn is_meta(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    // --- extract_trigrams tests (ported from trigram.test.ts) ---
+
     #[test]
-    fn test_extract_trigrams() {
-        let tris = extract_trigrams("hello");
-        assert!(tris.contains(&[b'h', b'e', b'l']));
-        assert!(tris.contains(&[b'e', b'l', b'l']));
-        assert!(tris.contains(&[b'l', b'l', b'o']));
-        assert_eq!(tris.len(), 3);
+    fn empty_string_returns_no_trigrams() {
+        assert_eq!(extract_trigrams("").len(), 0);
     }
 
     #[test]
-    fn test_decompose_simple() {
+    fn short_string_returns_no_trigrams() {
+        assert_eq!(extract_trigrams("ab").len(), 0);
+    }
+
+    #[test]
+    fn extracts_single_trigram_from_3_char_string() {
+        let result = extract_trigrams("abc");
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&[b'a', b'b', b'c']));
+    }
+
+    #[test]
+    fn extracts_all_trigrams_from_a_word() {
+        let result = extract_trigrams("hello");
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&[b'h', b'e', b'l']));
+        assert!(result.contains(&[b'e', b'l', b'l']));
+        assert!(result.contains(&[b'l', b'l', b'o']));
+    }
+
+    #[test]
+    fn deduplicates_repeated_trigrams() {
+        let result = extract_trigrams("aaaa");
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&[b'a', b'a', b'a']));
+    }
+
+    #[test]
+    fn handles_unicode_characters() {
+        let result = extract_trigrams("café");
+        assert!(result.len() > 0);
+        // "caf" should be present as bytes
+        assert!(result.contains(&[b'c', b'a', b'f']));
+    }
+
+    // --- decompose_pattern tests (ported from decomposeRegex in trigram.test.ts) ---
+
+    #[test]
+    fn extracts_required_trigrams_from_plain_literal() {
         let result = decompose_pattern("hello");
         assert_eq!(result.len(), 1);
-        assert!(!result[0].is_empty());
+        assert!(result[0].contains(&[b'h', b'e', b'l']));
+        assert!(result[0].contains(&[b'e', b'l', b'l']));
+        assert!(result[0].contains(&[b'l', b'l', b'o']));
     }
 
     #[test]
-    fn test_decompose_alternation() {
-        let result = decompose_pattern("TODO|FIXME");
+    fn returns_empty_trigrams_for_short_patterns() {
+        let result = decompose_pattern("ab");
+        // Short pattern → single alternative with no trigrams → falls back to vec![vec![]]
+        assert!(result.iter().all(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn handles_alternation_producing_separate_branches() {
+        let result = decompose_pattern("hello|world");
         assert_eq!(result.len(), 2);
+        assert!(result[0].contains(&[b'h', b'e', b'l']));
+        assert!(result[1].contains(&[b'w', b'o', b'r']));
+    }
+
+    #[test]
+    fn extracts_trigrams_from_literal_parts_with_wildcards() {
+        let result = decompose_pattern("function.*async");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(&[b'f', b'u', b'n']));
+        assert!(result[0].contains(&[b'a', b's', b'y']));
+    }
+
+    #[test]
+    fn handles_escaped_metacharacters_as_literals() {
+        let result = decompose_pattern("a\\.b\\.c");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(&[b'a', b'.', b'b']));
+    }
+
+    #[test]
+    fn handles_character_classes_by_breaking_literal_run() {
+        let result = decompose_pattern("foo[abc]bar");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(&[b'f', b'o', b'o']));
+        assert!(result[0].contains(&[b'b', b'a', b'r']));
+    }
+
+    #[test]
+    fn handles_shorthand_classes_like_d_w() {
+        let result = decompose_pattern("hello\\dworld");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(&[b'h', b'e', b'l']));
+        assert!(result[0].contains(&[b'w', b'o', b'r']));
+    }
+
+    #[test]
+    fn returns_empty_for_pure_wildcard_patterns() {
+        let result = decompose_pattern(".*");
+        assert!(result.iter().all(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn handles_nested_groups_in_alternation() {
+        // (foo|bar)baz — parens are not top-level alternation, treated as single alternative
+        let result = decompose_pattern("(foo|bar)baz");
+        // Should not panic; result depends on implementation details
+        assert!(result.len() >= 1);
     }
 }

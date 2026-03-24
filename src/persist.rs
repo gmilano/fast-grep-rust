@@ -38,6 +38,7 @@ pub struct PersistentIndex {
 impl PersistentIndex {
     pub fn search(&self, pattern: &str) -> Vec<&Path> {
         let alternatives = trigram::decompose_pattern(pattern);
+        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
 
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
             return self.doc_ids.iter().map(|p| p.as_path()).collect();
@@ -81,19 +82,30 @@ impl PersistentIndex {
                 candidate_docs.retain(|d| doc_set.contains(d));
             }
 
-            // Adjacency filtering with position masks
-            if alt_trigrams.len() >= 2 && !candidate_docs.is_empty() {
-                for pair_idx in 0..alt_trigrams.len() - 1 {
-                    let masks_a: HashMap<u32, (u8, u8)> = postings_list[pair_idx]
-                        .iter()
-                        .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                        .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                        .collect();
-                    let masks_b: HashMap<u32, (u8, u8)> = postings_list[pair_idx + 1]
-                        .iter()
-                        .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                        .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                        .collect();
+            // Adjacency filtering with position masks (ordered trigrams)
+            let ordered = &ordered_alternatives[i];
+            if ordered.len() >= 2 && !candidate_docs.is_empty() {
+                // Build a lookup for ordered trigrams from their postings
+                let ordered_postings: Vec<Option<Vec<Posting>>> = ordered
+                    .iter()
+                    .map(|tri| self.lookup_trigram(tri))
+                    .collect();
+
+                for pair_idx in 0..ordered.len() - 1 {
+                    let masks_a: HashMap<u32, (u8, u8)> = ordered_postings[pair_idx]
+                        .as_ref()
+                        .map(|p| p.iter()
+                            .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                            .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                            .collect())
+                        .unwrap_or_default();
+                    let masks_b: HashMap<u32, (u8, u8)> = ordered_postings[pair_idx + 1]
+                        .as_ref()
+                        .map(|p| p.iter()
+                            .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                            .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                            .collect())
+                        .unwrap_or_default();
 
                     candidate_docs.retain(|doc_id| {
                         if let (Some((_, next_a)), Some((loc_b, _))) =
