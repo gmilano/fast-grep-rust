@@ -49,6 +49,9 @@ pub enum Commands {
         /// Skip index building, use parallel full scan (like ripgrep)
         #[arg(long)]
         no_index: bool,
+        /// Don't auto-update stale index before searching
+        #[arg(long)]
+        no_auto_update: bool,
     },
     /// Benchmark search performance
     Bench {
@@ -56,6 +59,14 @@ pub enum Commands {
         pattern: String,
         /// Directory to search
         dir: PathBuf,
+    },
+    /// Incrementally update a persistent index
+    Update {
+        /// Directory that was indexed
+        dir: Option<PathBuf>,
+        /// Path to persistent index
+        #[arg(long, default_value = ".fgr")]
+        index: PathBuf,
     },
     /// Show index statistics
     Stats {
@@ -88,8 +99,24 @@ pub fn run() -> Result<()> {
             count,
             files_only,
             no_index,
+            no_auto_update,
         } => {
             if let Some(idx_path) = index_path {
+                // Auto-update stale index before searching
+                if !no_auto_update {
+                    let probe = persist::load(&idx_path)?;
+                    if probe.is_stale() {
+                        eprintln!("Updating index...");
+                        let root = std::path::PathBuf::from(&probe.meta.root_dir);
+                        drop(probe);
+                        let stats = persist::update_incremental(&idx_path, &root, false)?;
+                        eprintln!(
+                            "Updated: +{} added, {} modified, {} deleted in {}ms",
+                            stats.added, stats.modified, stats.deleted, stats.duration_ms
+                        );
+                    }
+                }
+
                 // Use persistent index
                 let start = Instant::now();
                 let idx = persist::load(&idx_path)?;
@@ -180,6 +207,27 @@ pub fn run() -> Result<()> {
                     "Index build: {:.2}ms, Search: {:.2}ms",
                     build_time.as_secs_f64() * 1000.0,
                     search_time.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+
+        Commands::Update { dir, index: idx_path } => {
+            let root = if let Some(d) = dir {
+                d
+            } else {
+                let probe = persist::load(&idx_path)?;
+                PathBuf::from(&probe.meta.root_dir)
+            };
+            let stats = persist::update_incremental(&idx_path, &root, true)?;
+            if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
+                eprintln!(
+                    "Index is up to date ({} files)",
+                    stats.unchanged
+                );
+            } else {
+                eprintln!(
+                    "Updated index: +{} added, {} modified, {} deleted (unchanged: {}) in {}ms",
+                    stats.added, stats.modified, stats.deleted, stats.unchanged, stats.duration_ms
                 );
             }
         }
@@ -339,6 +387,62 @@ fn run_bench(
         "  False positive rate:  {:.2}%",
         inmem_stats.false_positive_rate * 100.0
     );
+
+    // 6. Incremental update benchmark
+    // Rebuild the index fresh for incremental testing
+    persist::build(dir, &tmp_dir, no_ignore, type_filter, false)?;
+    let pidx = persist::load(&tmp_dir)?;
+    let num_files = pidx.doc_ids.len();
+    let num_to_modify = std::cmp::min(10, num_files);
+    if num_to_modify > 0 {
+        let step = std::cmp::max(1, num_files / num_to_modify);
+        let files_to_modify: Vec<PathBuf> = (0..num_to_modify)
+            .map(|i| pidx.doc_ids[i * step].clone())
+            .collect();
+        drop(pidx);
+
+        // Save originals and append a comment
+        let mut originals: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for path in &files_to_modify {
+            if let Ok(content) = std::fs::read(path) {
+                originals.push((path.clone(), content));
+                if let Ok(mut f) =
+                    std::fs::OpenOptions::new().append(true).open(path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "\n// fast-grep benchmark marker");
+                }
+            }
+        }
+
+        // Measure incremental update
+        let start = Instant::now();
+        let inc_stats = persist::update_incremental(&tmp_dir, dir, false)?;
+        let incr_time = start.elapsed();
+
+        // Revert changes before full rebuild measurement
+        for (path, content) in &originals {
+            let _ = std::fs::write(path, content);
+        }
+
+        // Measure full rebuild
+        let start = Instant::now();
+        persist::build(dir, &tmp_dir, no_ignore, type_filter, false)?;
+        let full_time = start.elapsed();
+
+        let speedup = full_time.as_secs_f64() / incr_time.as_secs_f64();
+        println!();
+        println!("Incremental Update Benchmark:");
+        println!(
+            "  Incremental update ({} files): {} vs Full rebuild: {} ({:.1}x faster)",
+            inc_stats.modified,
+            format_duration(incr_time),
+            format_duration(full_time),
+            speedup
+        );
+    } else {
+        drop(pidx);
+    }
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
