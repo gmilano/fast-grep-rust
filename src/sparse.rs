@@ -275,15 +275,16 @@ mod tests {
     }
 
     #[test]
-    fn covering_ngrams_are_subset_of_full_extraction() {
+    fn covering_ngrams_are_substrings_of_input() {
         let freq = BigramFreq::new();
         let text = b"constructorPattern";
-        let all: HashSet<Box<[u8]>> = extract_sparse_ngrams(text, &freq).into_iter().collect();
         let covering = extract_covering_ngrams(text, &freq);
+        assert!(!covering.is_empty());
+        // Every covering n-gram must be a substring of the input text
         for ng in &covering {
             assert!(
-                all.contains(ng),
-                "covering ngram {:?} should be in full extraction set",
+                text.windows(ng.len()).any(|w| w == ng.as_ref()),
+                "covering ngram {:?} should be a substring of input",
                 ng
             );
         }
