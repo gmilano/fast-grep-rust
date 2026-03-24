@@ -306,6 +306,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "ignore",
+ "memchr",
  "memmap2",
  "rayon",
  "regex",

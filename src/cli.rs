@@ -46,6 +46,9 @@ pub enum Commands {
         /// Only show matching file paths
         #[arg(long)]
         files_only: bool,
+        /// Skip index building, use parallel full scan (like ripgrep)
+        #[arg(long)]
+        no_index: bool,
     },
     /// Benchmark search performance
     Bench {
@@ -84,6 +87,7 @@ pub fn run() -> Result<()> {
             index: index_path,
             count,
             files_only,
+            no_index,
         } => {
             if let Some(idx_path) = index_path {
                 // Use persistent index
@@ -114,6 +118,38 @@ pub fn run() -> Result<()> {
                     "Index load: {:.2}ms, Search: {:.2}ms, {} matches",
                     load_time.as_secs_f64() * 1000.0,
                     search_time.as_secs_f64() * 1000.0,
+                    matches.len()
+                );
+            } else if no_index {
+                // Direct parallel full scan — no index built
+                let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+                let start = Instant::now();
+                let matches = searcher::search_full_scan(
+                    &dir,
+                    &pattern,
+                    cli.no_ignore,
+                    cli.file_type.as_deref(),
+                )?;
+                let scan_time = start.elapsed();
+
+                if count {
+                    println!("{}", matches.len());
+                } else if files_only {
+                    let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
+                    files.sort();
+                    files.dedup();
+                    for f in files {
+                        println!("{}", f.display());
+                    }
+                } else {
+                    for m in &matches {
+                        println!("{}:{}:{}", m.path.display(), m.line_number, m.line);
+                    }
+                }
+
+                eprintln!(
+                    "Full scan: {:.2}ms, {} matches",
+                    scan_time.as_secs_f64() * 1000.0,
                     matches.len()
                 );
             } else {

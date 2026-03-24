@@ -1,7 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(cargo build:*)",
+      "Bash(time grep:*)",
+      "Bash(time /Users/gmilano/Projects/fast-grep-rust/target/release/fast-grep EXPORT_SYMBOL /tmp/linux-6.6)",
+      "Bash(/Users/gmilano/Projects/fast-grep-rust/target/release/fast-grep bench:*)",
+      "WebSearch",
+      "WebFetch(domain:burntsushi.net)",
+      "WebFetch(domain:blog.mbrt.dev)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
