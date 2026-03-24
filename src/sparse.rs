@@ -7,7 +7,22 @@ pub struct BigramFreq {
 }
 
 impl BigramFreq {
+    /// Create a BigramFreq table. If FAST_GREP_REAL_FREQ=1, uses corpus-derived frequencies.
     pub fn new() -> Self {
+        if std::env::var("FAST_GREP_REAL_FREQ").as_deref() == Ok("1") {
+            return Self::from_real_corpus();
+        }
+        Self::from_hardcoded()
+    }
+
+    /// Use real corpus-derived frequencies from freq_real.rs.
+    pub fn from_real_corpus() -> Self {
+        BigramFreq {
+            table: crate::freq_real::REAL_BIGRAM_FREQ,
+        }
+    }
+
+    fn from_hardcoded() -> Self {
         let mut table = [0.0f32; 65536];
         // Populate with realistic frequencies for ASCII printable range.
         // Common bigrams in source code get higher frequencies.

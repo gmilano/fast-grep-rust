@@ -13,7 +13,9 @@
       "WebSearch",
       "WebFetch(domain:burntsushi.net)",
       "WebFetch(domain:blog.mbrt.dev)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(for p:*)",
+      "Bash(do echo:*)"
     ]
   }
 }

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use memchr::memmem;
+use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::bytes::Regex as BytesRegex;
 
@@ -68,19 +69,60 @@ impl Matcher {
             Matcher::Regex(re) => re.is_match(buf),
         }
     }
+
+    /// Count matching lines without allocating Strings.
+    #[inline]
+    fn count_lines(&self, buf: &[u8]) -> usize {
+        match self {
+            Matcher::Literal(finder) => {
+                let mut count = 0;
+                let mut offset = 0;
+                while let Some(pos) = finder.find(&buf[offset..]) {
+                    count += 1;
+                    let abs_pos = offset + pos;
+                    let (_, line_end) = line_bounds(buf, abs_pos);
+                    offset = line_end + 1;
+                    if offset >= buf.len() {
+                        break;
+                    }
+                }
+                count
+            }
+            Matcher::Regex(re) => {
+                let mut count = 0;
+                let mut last_line_start = usize::MAX;
+                for m in re.find_iter(buf) {
+                    let (line_start, _) = line_bounds(buf, m.start());
+                    if line_start != last_line_start {
+                        count += 1;
+                        last_line_start = line_start;
+                    }
+                }
+                count
+            }
+        }
+    }
 }
 
-/// Literal search using SIMD memmem. Deduplicates per-line.
+/// Literal search using SIMD memmem. Incremental line counting.
 #[inline]
 fn search_literal(buf: &[u8], finder: &memmem::Finder) -> Vec<(usize, String)> {
     let mut results = Vec::new();
     let mut offset = 0;
+    let mut line_num: usize = 1;
+    let mut counted_to: usize = 0; // how far we've counted newlines
 
     while let Some(pos) = finder.find(&buf[offset..]) {
         let abs_pos = offset + pos;
-        let (line_num, line_start, line_end) = line_at_offset(buf, abs_pos);
+
+        // Incrementally count newlines from where we left off
+        line_num += memchr::memchr_iter(b'\n', &buf[counted_to..abs_pos]).count();
+        counted_to = abs_pos;
+
+        let (line_start, line_end) = line_bounds(buf, abs_pos);
         let line = String::from_utf8_lossy(&buf[line_start..line_end]).into_owned();
         results.push((line_num, line));
+
         // Advance past this line to avoid duplicates
         offset = line_end + 1;
         if offset >= buf.len() {
@@ -91,32 +133,37 @@ fn search_literal(buf: &[u8], finder: &memmem::Finder) -> Vec<(usize, String)> {
     results
 }
 
-/// Regex search on raw byte buffer.
+/// Regex search on raw byte buffer. Incremental line counting.
 #[inline]
 fn search_regex(buf: &[u8], re: &BytesRegex) -> Vec<(usize, String)> {
     let mut results = Vec::new();
-    let mut last_line_num = 0;
+    let mut last_line_start = usize::MAX;
+    let mut line_num: usize = 1;
+    let mut counted_to: usize = 0;
 
     for m in re.find_iter(buf) {
         let start = m.start();
-        let (line_num, line_start, line_end) = line_at_offset(buf, start);
-        // Deduplicate: skip if same line as previous match
-        if line_num != last_line_num || results.is_empty() {
+
+        // Incrementally count newlines
+        line_num += memchr::memchr_iter(b'\n', &buf[counted_to..start]).count();
+        counted_to = start;
+
+        let (line_start, line_end) = line_bounds(buf, start);
+
+        // Deduplicate: skip if same line
+        if line_start != last_line_start {
             let line = String::from_utf8_lossy(&buf[line_start..line_end]).into_owned();
             results.push((line_num, line));
-            last_line_num = line_num;
+            last_line_start = line_start;
         }
     }
 
     results
 }
 
-/// Given a byte buffer and an offset, find line number and line boundaries.
-/// Uses SIMD memchr for newline scanning.
+/// Find line start and end boundaries around an offset.
 #[inline]
-fn line_at_offset(buf: &[u8], offset: usize) -> (usize, usize, usize) {
-    let line_num = memchr::memchr_iter(b'\n', &buf[..offset]).count() + 1;
-
+fn line_bounds(buf: &[u8], offset: usize) -> (usize, usize) {
     let line_start = match memchr::memrchr(b'\n', &buf[..offset]) {
         Some(p) => p + 1,
         None => 0,
@@ -127,6 +174,16 @@ fn line_at_offset(buf: &[u8], offset: usize) -> (usize, usize, usize) {
         None => buf.len(),
     };
 
+    (line_start, line_end)
+}
+
+/// Given a byte buffer and an offset, find line number and line boundaries.
+/// Uses SIMD memchr for newline scanning. Used when incremental counting
+/// is not available (e.g. single-match lookups).
+#[inline]
+fn line_at_offset(buf: &[u8], offset: usize) -> (usize, usize, usize) {
+    let line_num = memchr::memchr_iter(b'\n', &buf[..offset]).count() + 1;
+    let (line_start, line_end) = line_bounds(buf, offset);
     (line_num, line_start, line_end)
 }
 
@@ -207,25 +264,101 @@ impl Searcher {
     }
 }
 
+/// Count-optimized search: chunked parallel with buffer reuse, no String allocation.
+pub fn search_persistent_count(
+    index: &crate::persist::PersistentIndex,
+    pattern: &str,
+) -> Result<(usize, crate::persist::SearchTiming)> {
+    let matcher = Matcher::new(pattern)?;
+    let (candidates, mut timing) = index.search_timed(pattern);
+
+    if candidates.is_empty() {
+        timing.matches = 0;
+        return Ok((0, timing));
+    }
+
+    let t_verify = std::time::Instant::now();
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunk_size = (candidates.len() / nthreads).max(64);
+
+    let count: usize = candidates
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut total = 0usize;
+            let mut buf = Vec::with_capacity(128 * 1024);
+            for path in chunk {
+                buf.clear();
+                let mut f = match std::fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                use std::io::Read;
+                if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
+                    continue;
+                }
+                if is_binary(&buf) {
+                    continue;
+                }
+                total += matcher.count_lines(&buf);
+            }
+            total
+        })
+        .sum();
+
+    timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+    timing.matches = count;
+    Ok((count, timing))
+}
+
+/// mmap a file for zero-copy read. Returns None on error or empty file.
+#[inline]
+fn open_mmap(path: &Path) -> Option<Mmap> {
+    let file = std::fs::File::open(path).ok()?;
+    let mmap = unsafe { Mmap::map(&file).ok()? };
+    if mmap.is_empty() {
+        None
+    } else {
+        Some(mmap)
+    }
+}
+
 /// Search using a persistent index with Rayon parallel verify.
 pub fn search_persistent(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
 ) -> Result<Vec<Match>> {
-    let matcher = Matcher::new(pattern)?;
-    let candidates = index.search(pattern);
+    Ok(search_persistent_timed(index, pattern)?.0)
+}
 
+/// Search with detailed timing breakdown.
+pub fn search_persistent_timed(
+    index: &crate::persist::PersistentIndex,
+    pattern: &str,
+) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
+    let matcher = Matcher::new(pattern)?;
+    let (candidates, mut timing) = index.search_timed(pattern);
+
+    // Opt 4: skip verify if 0 candidates
+    if candidates.is_empty() {
+        timing.matches = 0;
+        return Ok((Vec::new(), timing));
+    }
+
+    let t_verify = std::time::Instant::now();
     let matches: Vec<Match> = candidates
         .par_iter()
         .flat_map(|path| {
-            let buf = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(_) => return Vec::new(),
+            let mmap = match open_mmap(path) {
+                Some(m) => m,
+                None => return Vec::new(),
             };
-            if is_binary(&buf) {
+            let buf = &*mmap;
+            if is_binary(buf) {
                 return Vec::new();
             }
-            let hits = matcher.search_buffer(&buf);
+            let hits = matcher.search_buffer(buf);
             if hits.is_empty() {
                 return Vec::new();
             }
@@ -240,7 +373,9 @@ pub fn search_persistent(
         })
         .collect();
 
-    Ok(matches)
+    timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+    timing.matches = matches.len();
+    Ok((matches, timing))
 }
 
 /// Fast full scan — optimized hot path:
@@ -333,4 +468,44 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Verify using mmap instead of fs::read — avoids heap allocation per file.
+pub fn search_persistent_mmap(
+    index: &crate::persist::PersistentIndex,
+    pattern: &str,
+) -> Result<Vec<Match>> {
+    let matcher = Matcher::new(pattern)?;
+    let candidates = index.search(pattern);
+
+    let matches: Vec<Match> = candidates
+        .par_iter()
+        .flat_map(|path| {
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => return Vec::new(),
+            };
+            let buf = match unsafe { memmap2::Mmap::map(&file) } {
+                Ok(m) => m,
+                Err(_) => return Vec::new(),
+            };
+            if is_binary(&buf) {
+                return Vec::new();
+            }
+            let hits = matcher.search_buffer(&buf);
+            if hits.is_empty() {
+                return Vec::new();
+            }
+            let path_buf = path.to_path_buf();
+            hits.into_iter()
+                .map(|(ln, line)| Match {
+                    path: path_buf.clone(),
+                    line_number: ln,
+                    line,
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(matches)
 }

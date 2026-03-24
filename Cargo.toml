@@ -3,6 +3,10 @@ name = "fast-grep"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "fgr"
+path = "src/main.rs"
+
 [dependencies]
 regex = "1"
 rayon = "1"

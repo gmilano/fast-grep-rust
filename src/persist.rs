@@ -2,15 +2,95 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ignore::WalkBuilder;
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::index::{Posting, SparseIndex};
 use crate::trigram;
+
+// --- Zero-copy read helpers ---
+
+#[inline(always)]
+fn read_u32_le(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+#[inline(always)]
+fn read_u64_le(data: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        data[off],
+        data[off + 1],
+        data[off + 2],
+        data[off + 3],
+        data[off + 4],
+        data[off + 5],
+        data[off + 6],
+        data[off + 7],
+    ])
+}
+
+/// Sorted merge intersection of two sorted slices.
+fn sorted_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    result
+}
+
+/// Merge two sorted slices into a new sorted Vec (union).
+fn merge_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                result.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                result.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    result.extend_from_slice(&a[i..]);
+    result.extend_from_slice(&b[j..]);
+    result
+}
+
+// --- Timing ---
+
+pub struct SearchTiming {
+    pub covering_ngrams_ms: f64,
+    pub lookup_ms: f64,
+    pub bitmap_intersect_ms: f64,
+    pub verify_ms: f64,
+    pub candidates: usize,
+    pub matches: usize,
+    pub ngrams_queried: usize,
+}
+
+// --- Index structures ---
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct IndexMeta {
@@ -20,6 +100,9 @@ pub struct IndexMeta {
     pub root_dir: String,
     pub built_at: String,
     pub file_mtimes: HashMap<String, u64>,
+    /// Number of docs in the main (non-delta) index. Set on full build.
+    #[serde(default)]
+    pub main_num_docs: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -29,86 +112,280 @@ pub struct LookupEntry {
     pub len: u32,
 }
 
+const LOOKUP_ENTRY_SIZE: usize = 4 + 8 + 4; // 16 bytes
+
 pub struct PersistentIndex {
-    pub lookup: Vec<LookupEntry>,
+    /// Main lookup table — memory-mapped for zero-copy binary search
+    pub lookup_mmap: Mmap,
+    pub lookup_count: usize,
+    /// Main postings — memory-mapped
     pub postings_mmap: Mmap,
-    pub doc_ids: Vec<PathBuf>,
+    /// Doc IDs: mmap'd flat buffer + offset table for zero-alloc load
+    pub docids_mmap: Mmap,
+    pub docid_offsets: Vec<(u32, u16)>, // (offset, length) for main docs
+    pub delta_doc_ids: Vec<PathBuf>,    // delta docs (small count)
     pub meta: IndexMeta,
+    // Overlay for incremental updates
+    pub deleted_docs: HashSet<u32>,
+    pub delta_lookup: Vec<LookupEntry>,
+    pub delta_postings: Vec<u8>,
+    pub main_num_docs: usize,
 }
 
 impl PersistentIndex {
-    pub fn search(&self, pattern: &str) -> Vec<&Path> {
-        let alternatives = trigram::decompose_pattern(pattern);
-        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
+    /// Resolve a doc_id to its file path (zero-alloc for main docs).
+    #[inline]
+    pub fn doc_path(&self, id: u32) -> Option<&Path> {
+        let id = id as usize;
+        if id < self.docid_offsets.len() {
+            let (off, len) = self.docid_offsets[id];
+            let end = off as usize + len as usize;
+            if end <= self.docids_mmap.len() {
+                let bytes = &self.docids_mmap[off as usize..end];
+                std::str::from_utf8(bytes).ok().map(Path::new)
+            } else {
+                None
+            }
+        } else {
+            let delta_idx = id - self.docid_offsets.len();
+            self.delta_doc_ids.get(delta_idx).map(|p| p.as_path())
+        }
+    }
 
-        if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
-            return self.doc_ids.iter().map(|p| p.as_path()).collect();
+    /// Total number of docs (main + delta).
+    pub fn num_docs(&self) -> usize {
+        self.docid_offsets.len() + self.delta_doc_ids.len()
+    }
+
+    // --- Low-level lookup methods (zero-copy) ---
+
+    /// Binary search in mmap'd main lookup table.
+    #[inline]
+    fn find_in_main_lookup(&self, hash: u32) -> Option<(u64, u32)> {
+        let data = &*self.lookup_mmap;
+        let mut lo = 0usize;
+        let mut hi = self.lookup_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
+            match h.cmp(&hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = read_u64_le(data, mid * LOOKUP_ENTRY_SIZE + 4);
+                    let len = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE + 12);
+                    return Some((off, len));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get raw posting bytes for a trigram hash from main index.
+    #[inline]
+    fn main_posting_data(&self, hash: u32) -> Option<&[u8]> {
+        let (offset, len) = self.find_in_main_lookup(hash)?;
+        let start = offset as usize;
+        let end = start + len as usize;
+        if end <= self.postings_mmap.len() && (end - start) % 6 == 0 {
+            Some(&self.postings_mmap[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Get raw posting bytes for a trigram hash from delta index.
+    #[inline]
+    fn delta_posting_data(&self, hash: u32) -> Option<&[u8]> {
+        if self.delta_lookup.is_empty() {
+            return None;
+        }
+        let idx = self
+            .delta_lookup
+            .binary_search_by_key(&hash, |e| e.hash)
+            .ok()?;
+        let entry = &self.delta_lookup[idx];
+        let start = entry.offset as usize;
+        let end = start + entry.len as usize;
+        if end <= self.delta_postings.len() && (end - start) % 6 == 0 {
+            Some(&self.delta_postings[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Extract sorted doc_ids from raw posting bytes, excluding deleted docs.
+    fn extract_doc_ids(&self, data: &[u8]) -> Vec<u32> {
+        let num = data.len() / 6;
+        let mut ids = Vec::with_capacity(num);
+        for i in 0..num {
+            let doc_id = read_u32_le(data, i * 6);
+            if !self.deleted_docs.contains(&doc_id) {
+                ids.push(doc_id);
+            }
+        }
+        ids
+    }
+
+    /// Get merged (main + delta) sorted doc_ids for a trigram hash.
+    fn trigram_doc_ids(&self, hash: u32) -> Option<Vec<u32>> {
+        let main = self.main_posting_data(hash);
+        let delta = self.delta_posting_data(hash);
+
+        if main.is_none() && delta.is_none() {
+            return None;
         }
 
-        let mut result_docs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let main_ids = main.map(|d| self.extract_doc_ids(d)).unwrap_or_default();
+        let delta_ids = delta.map(|d| self.extract_doc_ids(d)).unwrap_or_default();
+
+        let ids = if delta_ids.is_empty() {
+            main_ids
+        } else if main_ids.is_empty() {
+            delta_ids
+        } else {
+            merge_sorted(&main_ids, &delta_ids)
+        };
+
+        if ids.is_empty() {
+            None
+        } else {
+            Some(ids)
+        }
+    }
+
+    /// Extract position masks for sorted candidates from raw posting data (both main + delta).
+    fn trigram_masks(&self, hash: u32, candidates: &[u32]) -> HashMap<u32, (u8, u8)> {
+        let mut masks = HashMap::with_capacity(candidates.len());
+
+        for data in [self.main_posting_data(hash), self.delta_posting_data(hash)] {
+            if let Some(data) = data {
+                let num = data.len() / 6;
+                for i in 0..num {
+                    let doc_id = read_u32_le(data, i * 6);
+                    if self.deleted_docs.contains(&doc_id) {
+                        continue;
+                    }
+                    if candidates.binary_search(&doc_id).is_ok() {
+                        let loc = data[i * 6 + 4];
+                        let next = data[i * 6 + 5];
+                        let entry = masks.entry(doc_id).or_insert((0u8, 0u8));
+                        entry.0 |= loc;
+                        entry.1 |= next;
+                    }
+                }
+            }
+        }
+
+        masks
+    }
+
+    // --- Search methods ---
+
+    pub fn search(&self, pattern: &str) -> Vec<&Path> {
+        self.search_timed(pattern).0
+    }
+
+    pub fn search_timed(&self, pattern: &str) -> (Vec<&Path>, SearchTiming) {
+        let t0 = Instant::now();
+
+        let alternatives = trigram::decompose_pattern(pattern);
+        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
+        let covering_ngrams_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
+            let docs = self.live_doc_ids();
+            let n = docs.len();
+            return (
+                docs,
+                SearchTiming {
+                    covering_ngrams_ms,
+                    lookup_ms: 0.0,
+                    bitmap_intersect_ms: 0.0,
+                    verify_ms: 0.0,
+                    candidates: n,
+                    matches: 0,
+                    ngrams_queried: 0,
+                },
+            );
+        }
+
+        let mut ngrams_queried = 0usize;
+        let mut result_docs: Vec<u32> = Vec::new();
+        let mut lookup_dur = Duration::ZERO;
+        let mut intersect_dur = Duration::ZERO;
 
         for (i, alt_trigrams) in alternatives.iter().enumerate() {
             if alt_trigrams.is_empty() {
-                return self.doc_ids.iter().map(|p| p.as_path()).collect();
+                let docs = self.live_doc_ids();
+                let n = docs.len();
+                return (
+                    docs,
+                    SearchTiming {
+                        covering_ngrams_ms,
+                        lookup_ms: 0.0,
+                        bitmap_intersect_ms: 0.0,
+                        verify_ms: 0.0,
+                        candidates: n,
+                        matches: 0,
+                        ngrams_queried: 0,
+                    },
+                );
             }
 
-            // Check all trigrams exist
-            let postings_list: Vec<Option<Vec<Posting>>> = alt_trigrams
-                .iter()
-                .map(|tri| self.lookup_trigram(tri))
-                .collect();
+            ngrams_queried += alt_trigrams.len();
 
-            if postings_list.iter().any(|p| p.is_none()) {
+            // Phase 1: Lookup — parallel hash + posting list extraction
+            let t_lookup = Instant::now();
+            let hashes: Vec<u32> = alt_trigrams.iter().map(|tri| crc32fast::hash(tri)).collect();
+
+            // Parallel lookup of all trigram posting lists (Opt 3)
+            let posting_lists: Vec<Option<Vec<u32>>> =
+                hashes.par_iter().map(|&h| self.trigram_doc_ids(h)).collect();
+
+            lookup_dur += t_lookup.elapsed();
+
+            // Check all trigrams exist
+            if posting_lists.iter().any(|p| p.is_none()) {
                 continue;
             }
 
-            let postings_list: Vec<Vec<Posting>> =
-                postings_list.into_iter().map(|p| p.unwrap()).collect();
+            // Phase 2: Intersection (sorted merge instead of HashSet)
+            let t_intersect = Instant::now();
+            let mut posting_lists: Vec<Vec<u32>> =
+                posting_lists.into_iter().map(|p| p.unwrap()).collect();
 
-            // Sort by posting list size for fast intersection
-            let mut indices: Vec<usize> = (0..alt_trigrams.len()).collect();
-            indices.sort_by_key(|&idx| postings_list[idx].len());
+            // Sort by posting list size (smallest first for fast intersection)
+            posting_lists.sort_by_key(|v| v.len());
 
-            // Intersect on doc_ids
-            let first = &postings_list[indices[0]];
-            let mut candidate_docs: std::collections::HashSet<u32> =
-                first.iter().map(|&(doc_id, _, _)| doc_id).collect();
-
-            for &idx in &indices[1..] {
-                if candidate_docs.is_empty() {
+            // Intersect all lists using sorted merge
+            let mut candidates = posting_lists.swap_remove(0);
+            for other in &posting_lists {
+                if candidates.is_empty() {
                     break;
                 }
-                let doc_set: std::collections::HashSet<u32> =
-                    postings_list[idx].iter().map(|&(doc_id, _, _)| doc_id).collect();
-                candidate_docs.retain(|d| doc_set.contains(d));
+                candidates = sorted_intersect(&candidates, other);
             }
 
             // Adjacency filtering with position masks (ordered trigrams)
             let ordered = &ordered_alternatives[i];
-            if ordered.len() >= 2 && !candidate_docs.is_empty() {
-                // Build a lookup for ordered trigrams from their postings
-                let ordered_postings: Vec<Option<Vec<Posting>>> = ordered
-                    .iter()
-                    .map(|tri| self.lookup_trigram(tri))
-                    .collect();
+            if ordered.len() >= 2 && !candidates.is_empty() {
+                let ordered_hashes: Vec<u32> =
+                    ordered.iter().map(|tri| crc32fast::hash(tri)).collect();
+
+                // Cache masks_b from previous pair as masks_a for next pair
+                let mut prev_masks: Option<HashMap<u32, (u8, u8)>> = None;
 
                 for pair_idx in 0..ordered.len() - 1 {
-                    let masks_a: HashMap<u32, (u8, u8)> = ordered_postings[pair_idx]
-                        .as_ref()
-                        .map(|p| p.iter()
-                            .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                            .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                            .collect())
-                        .unwrap_or_default();
-                    let masks_b: HashMap<u32, (u8, u8)> = ordered_postings[pair_idx + 1]
-                        .as_ref()
-                        .map(|p| p.iter()
-                            .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                            .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                            .collect())
-                        .unwrap_or_default();
+                    let masks_a = if let Some(prev) = prev_masks.take() {
+                        prev
+                    } else {
+                        self.trigram_masks(ordered_hashes[pair_idx], &candidates)
+                    };
+                    let masks_b =
+                        self.trigram_masks(ordered_hashes[pair_idx + 1], &candidates);
 
-                    candidate_docs.retain(|doc_id| {
+                    candidates.retain(|doc_id| {
                         if let (Some((_, next_a)), Some((loc_b, _))) =
                             (masks_a.get(doc_id), masks_b.get(doc_id))
                         {
@@ -118,57 +395,48 @@ impl PersistentIndex {
                         }
                     });
 
-                    if candidate_docs.is_empty() {
+                    prev_masks = Some(masks_b);
+
+                    if candidates.is_empty() {
                         break;
                     }
                 }
             }
 
-            if i == 0 {
-                result_docs = candidate_docs;
-            } else {
-                result_docs.extend(candidate_docs);
-            }
+            intersect_dur += t_intersect.elapsed();
+            result_docs.extend(candidates);
         }
 
-        result_docs
+        // Dedup result docs (needed when multiple alternatives)
+        result_docs.sort();
+        result_docs.dedup();
+
+        let num_candidates = result_docs.len();
+        let paths: Vec<&Path> = result_docs
             .iter()
-            .filter_map(|&id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
-            .collect()
+            .filter_map(|&id| self.doc_path(id))
+            .collect();
+
+        (
+            paths,
+            SearchTiming {
+                covering_ngrams_ms,
+                lookup_ms: lookup_dur.as_secs_f64() * 1000.0,
+                bitmap_intersect_ms: intersect_dur.as_secs_f64() * 1000.0,
+                verify_ms: 0.0,
+                candidates: num_candidates,
+                matches: 0,
+                ngrams_queried,
+            },
+        )
     }
 
-    fn lookup_trigram(&self, trigram: &[u8; 3]) -> Option<Vec<Posting>> {
-        let hash = crc32fast::hash(trigram);
-        let idx = self
-            .lookup
-            .binary_search_by_key(&hash, |e| e.hash)
-            .ok()?;
-
-        let entry = &self.lookup[idx];
-        let start = entry.offset as usize;
-        let end = start + entry.len as usize;
-
-        if end > self.postings_mmap.len() {
-            return None;
-        }
-
-        let data = &self.postings_mmap[start..end];
-        // Each posting is 6 bytes: u32 doc_id + u8 loc_mask + u8 next_mask
-        let posting_size = 6;
-        if data.len() % posting_size != 0 {
-            return None;
-        }
-
-        let mut postings = Vec::with_capacity(data.len() / posting_size);
-        let mut cursor = std::io::Cursor::new(data);
-        while (cursor.position() as usize) < data.len() {
-            let doc_id = cursor.read_u32::<LittleEndian>().ok()?;
-            let loc_mask = cursor.read_u8().ok()?;
-            let next_mask = cursor.read_u8().ok()?;
-            postings.push((doc_id, loc_mask, next_mask));
-        }
-
-        Some(postings)
+    /// Return paths for all non-deleted docs (fallback for short patterns).
+    fn live_doc_ids(&self) -> Vec<&Path> {
+        (0..self.num_docs() as u32)
+            .filter(|id| !self.deleted_docs.contains(id))
+            .filter_map(|id| self.doc_path(id))
+            .collect()
     }
 
     pub fn is_stale(&self) -> bool {
@@ -268,17 +536,25 @@ pub fn build(
     docids_file.flush()?;
 
     // Write meta
+    let num_docs = index.doc_ids.len();
     let meta = IndexMeta {
-        version: 2, // bumped for new posting format
-        num_docs: index.doc_ids.len(),
+        version: 2,
+        num_docs,
         num_ngrams: index.ngrams.len(),
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes,
+        main_num_docs: Some(num_docs),
     };
     let meta_path = output.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
     fs::write(&meta_path, meta_json)?;
+
+    // Clean up any delta files from previous incremental updates
+    let _ = fs::remove_file(output.join("delta.postings"));
+    let _ = fs::remove_file(output.join("delta.lookup"));
+    let _ = fs::remove_file(output.join("delta.docids"));
+    let _ = fs::remove_file(output.join("deleted.bin"));
 
     if verbose {
         eprintln!(
@@ -297,43 +573,106 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
 
+    // Load main lookup via mmap (zero-copy binary search)
     let lookup_path = index_path.join("ngrams.lookup");
-    let lookup_data = fs::read(&lookup_path).context("reading ngrams.lookup")?;
-    let entry_size = 4 + 8 + 4;
-    let num_entries = lookup_data.len() / entry_size;
-    let mut lookup = Vec::with_capacity(num_entries);
-    let mut cursor = std::io::Cursor::new(&lookup_data);
-    for _ in 0..num_entries {
-        let hash = cursor.read_u32::<LittleEndian>()?;
-        let offset = cursor.read_u64::<LittleEndian>()?;
-        let len = cursor.read_u32::<LittleEndian>()?;
-        lookup.push(LookupEntry { hash, offset, len });
-    }
+    let lookup_file = File::open(&lookup_path).context("opening ngrams.lookup")?;
+    let lookup_mmap = unsafe { Mmap::map(&lookup_file)? };
+    let lookup_count = lookup_mmap.len() / LOOKUP_ENTRY_SIZE;
 
+    // Load main postings mmap
     let postings_path = index_path.join("ngrams.postings");
     let postings_file = File::open(&postings_path).context("opening ngrams.postings")?;
     let postings_mmap = unsafe { Mmap::map(&postings_file)? };
 
+    // Load main doc_ids via mmap (zero-alloc offset table)
     let docids_path = index_path.join("docids.bin");
-    let docids_data = fs::read(&docids_path).context("reading docids.bin")?;
-    let mut doc_ids = Vec::new();
-    let mut cursor = std::io::Cursor::new(&docids_data);
-    while (cursor.position() as usize) < docids_data.len() {
-        let len = cursor.read_u16::<LittleEndian>()? as usize;
-        let pos = cursor.position() as usize;
-        if pos + len > docids_data.len() {
-            break;
+    let docids_file = File::open(&docids_path).context("opening docids.bin")?;
+    let docids_mmap = unsafe { Mmap::map(&docids_file)? };
+    let mut docid_offsets = Vec::new();
+    {
+        let data = &*docids_mmap;
+        let mut pos = 0usize;
+        while pos + 2 <= data.len() {
+            let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > data.len() {
+                break;
+            }
+            docid_offsets.push((pos as u32, len as u16));
+            pos += len;
         }
-        let path_str = std::str::from_utf8(&docids_data[pos..pos + len])?;
-        doc_ids.push(PathBuf::from(path_str));
-        cursor.set_position((pos + len) as u64);
+    }
+
+    let main_num_docs = meta.main_num_docs.unwrap_or(docid_offsets.len());
+
+    // Load deleted set (if exists)
+    let deleted_path = index_path.join("deleted.bin");
+    let deleted_docs = if deleted_path.exists() {
+        let data = fs::read(&deleted_path)?;
+        let mut set = HashSet::new();
+        let mut cursor = std::io::Cursor::new(&data);
+        while (cursor.position() as usize) + 4 <= data.len() {
+            if let Ok(id) = cursor.read_u32::<LittleEndian>() {
+                set.insert(id);
+            }
+        }
+        set
+    } else {
+        HashSet::new()
+    };
+
+    // Load delta index (if exists)
+    let delta_lookup_path = index_path.join("delta.lookup");
+    let delta_postings_path = index_path.join("delta.postings");
+    let delta_docids_path = index_path.join("delta.docids");
+    let entry_size = 4 + 8 + 4;
+
+    let (delta_lookup, delta_postings) = if delta_lookup_path.exists() {
+        let ldata = fs::read(&delta_lookup_path)?;
+        let num = ldata.len() / entry_size;
+        let mut dlookup = Vec::with_capacity(num);
+        let mut cursor = std::io::Cursor::new(&ldata);
+        for _ in 0..num {
+            let hash = cursor.read_u32::<LittleEndian>()?;
+            let offset = cursor.read_u64::<LittleEndian>()?;
+            let len = cursor.read_u32::<LittleEndian>()?;
+            dlookup.push(LookupEntry { hash, offset, len });
+        }
+        let dpostings = fs::read(&delta_postings_path).unwrap_or_default();
+        (dlookup, dpostings)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Load delta doc_ids (small count, keep as PathBuf)
+    let mut delta_doc_ids = Vec::new();
+    if delta_docids_path.exists() {
+        let ddata = fs::read(&delta_docids_path)?;
+        let mut cursor = std::io::Cursor::new(&ddata);
+        while (cursor.position() as usize) < ddata.len() {
+            let len = cursor.read_u16::<LittleEndian>()? as usize;
+            let pos = cursor.position() as usize;
+            if pos + len > ddata.len() {
+                break;
+            }
+            let path_str = std::str::from_utf8(&ddata[pos..pos + len])?;
+            delta_doc_ids.push(PathBuf::from(path_str));
+            cursor.set_position((pos + len) as u64);
+        }
     }
 
     Ok(PersistentIndex {
-        lookup,
+        lookup_mmap,
+        lookup_count,
         postings_mmap,
-        doc_ids,
+        docids_mmap,
+        docid_offsets,
+        delta_doc_ids,
         meta,
+        deleted_docs,
+        delta_lookup,
+        delta_postings,
+        main_num_docs,
     })
 }
 
@@ -353,6 +692,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
     let saved_mtimes = meta.file_mtimes;
+    let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
     // 2. Walk root — get current file mtimes
     let walker = WalkBuilder::new(root)
@@ -376,7 +716,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         }
     }
 
-    // 3. Classify: added, modified, deleted
+    // 3. Classify: added, modified, deleted (vs last known state)
     let mut added_set: HashSet<String> = HashSet::new();
     let mut modified_set: HashSet<String> = HashSet::new();
     for (path, &mtime) in &current_files {
@@ -408,58 +748,71 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         });
     }
 
-    // 5. Load existing index metadata (lookup + docids + mmap)
+    // 5. Load existing index to get doc_ids and current delta/deleted state
     let pidx = load(index_path)?;
 
-    // Build set of doc_ids to remove (deleted + modified; modified will be re-added)
-    let remove_ids: HashSet<u32> = pidx
-        .doc_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(id, path)| {
-            let ps = path.to_string_lossy();
-            if deleted_set.contains(ps.as_ref()) || modified_set.contains(ps.as_ref()) {
-                Some(id as u32)
-            } else {
-                None
-            }
-        })
+    // Build path → doc_id mapping
+    let path_to_docid: HashMap<String, u32> = (0..pidx.num_docs() as u32)
+        .filter_map(|id| pidx.doc_path(id).map(|p| (p.to_string_lossy().into_owned(), id)))
         .collect();
 
-    // Build new doc_ids list (keep unchanged files, remap IDs)
-    let mut new_doc_ids: Vec<PathBuf> = Vec::with_capacity(pidx.doc_ids.len());
-    let mut old_to_new: HashMap<u32, u32> = HashMap::new();
-    for (old_id, path) in pidx.doc_ids.iter().enumerate() {
-        if remove_ids.contains(&(old_id as u32)) {
-            continue;
+    // 6. Update deleted set: mark deleted/modified docs
+    let mut new_deleted: HashSet<u32> = pidx.deleted_docs.clone();
+    for path in deleted_set.iter().chain(modified_set.iter()) {
+        if let Some(&doc_id) = path_to_docid.get(path) {
+            new_deleted.insert(doc_id);
         }
-        let new_id = new_doc_ids.len() as u32;
-        old_to_new.insert(old_id as u32, new_id);
-        new_doc_ids.push(path.clone());
     }
 
-    // 6. Index added/modified files — collect new postings in a small HashMap
+    // 7. Determine which files go in the new delta.
+    //    Delta = (existing delta files still valid) + (newly added/modified)
+    //    "Still valid" = delta doc that's not deleted/modified in this update.
+    let mut delta_files_to_index: Vec<String> = Vec::new();
+
+    // Keep existing delta files that haven't changed
+    for id in main_num_docs..pidx.num_docs() {
+        if new_deleted.contains(&(id as u32)) {
+            continue;
+        }
+        if let Some(p) = pidx.doc_path(id as u32) {
+            delta_files_to_index.push(p.to_string_lossy().into_owned());
+        }
+    }
+
+    // Add newly added/modified files
+    delta_files_to_index.extend(added_set.iter().cloned());
+    delta_files_to_index.extend(modified_set.iter().cloned());
+
+    // Drop the loaded index (releases mmap)
+    drop(pidx);
+
+    // 8. Index all delta files (small set — only changed files + carried-over delta)
+    let mut delta_ngrams: HashMap<u32, Vec<Posting>> = HashMap::new();
+    let mut delta_doc_ids: Vec<PathBuf> = Vec::new();
     let mut actual_added = 0usize;
     let mut actual_modified = 0usize;
-    let mut new_postings: HashMap<u32, Vec<Posting>> = HashMap::new();
-    for path_str in added_set.iter().chain(modified_set.iter()) {
+
+    for path_str in &delta_files_to_index {
         let path = Path::new(path_str);
         let content = match fs::read(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
+        // Skip binary files
         if content.iter().take(512).any(|&b| b == 0) {
             continue;
         }
 
-        let doc_id = new_doc_ids.len() as u32;
-        new_doc_ids.push(path.to_path_buf());
+        // Doc_id in combined space: main_num_docs + delta_doc_ids.len()
+        let doc_id = (main_num_docs + delta_doc_ids.len()) as u32;
+        delta_doc_ids.push(path.to_path_buf());
 
         if added_set.contains(path_str) {
             actual_added += 1;
-        } else {
+        } else if modified_set.contains(path_str) {
             actual_modified += 1;
         }
+        // else: carried-over delta file, not counted as change
 
         if content.len() < 3 {
             continue;
@@ -477,104 +830,50 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
         for (tri, (loc_mask, next_mask)) in masks {
             let hash = crc32fast::hash(&tri);
-            new_postings
+            delta_ngrams
                 .entry(hash)
                 .or_default()
                 .push((doc_id, loc_mask, next_mask));
         }
     }
 
-    // Collect and sort new-only hashes (not in existing lookup)
-    let existing_hashes: HashSet<u32> = pidx.lookup.iter().map(|e| e.hash).collect();
-    let mut new_only_hashes: Vec<u32> = new_postings
-        .keys()
-        .filter(|h| !existing_hashes.contains(h))
+    // 9. Write delta files (small — only changed files)
+
+    // Write deleted.bin: only main doc_ids that are deleted (delta docs are just absent)
+    let deleted_path = index_path.join("deleted.bin");
+    let main_deleted: Vec<u32> = new_deleted
+        .iter()
+        .filter(|&&id| (id as usize) < main_num_docs)
         .copied()
         .collect();
-    new_only_hashes.sort();
-
-    // 7. Streaming merge: read existing postings from mmap, filter/remap,
-    //    merge with new postings, write directly to output file.
-    //    This avoids loading 757MB of postings into a HashMap.
-    let tmp_postings_path = index_path.join("ngrams.postings.tmp");
-    let mut postings_out = BufWriter::new(File::create(&tmp_postings_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut write_offset: u64 = 0;
-    let mut num_ngrams = 0usize;
-
-    let needs_filter = !remove_ids.is_empty();
-
-    // Process existing posting lists + any new postings for the same hash
-    let mut new_only_idx = 0;
-    for entry in &pidx.lookup {
-        // Emit any new-only hashes that sort before this existing hash
-        while new_only_idx < new_only_hashes.len() && new_only_hashes[new_only_idx] < entry.hash {
-            let nh = new_only_hashes[new_only_idx];
-            if let Some(postings) = new_postings.get(&nh) {
-                let mut buf = Vec::with_capacity(postings.len() * 6);
-                for &(doc_id, loc_mask, next_mask) in postings {
-                    buf.write_u32::<LittleEndian>(doc_id)?;
-                    buf.write_u8(loc_mask)?;
-                    buf.write_u8(next_mask)?;
-                }
-                let len = buf.len() as u32;
-                postings_out.write_all(&buf)?;
-                lookup_entries.push((nh, write_offset, len));
-                write_offset += len as u64;
-                num_ngrams += 1;
-            }
-            new_only_idx += 1;
+    if main_deleted.is_empty() {
+        let _ = fs::remove_file(&deleted_path);
+    } else {
+        let mut f = BufWriter::new(File::create(&deleted_path)?);
+        for id in &main_deleted {
+            f.write_u32::<LittleEndian>(*id)?;
         }
-
-        let s = entry.offset as usize;
-        let e = s + entry.len as usize;
-        if e > pidx.postings_mmap.len() {
-            continue;
-        }
-        let data = &pidx.postings_mmap[s..e];
-
-        // Stream through existing postings: filter removed, remap IDs
-        let mut buf = Vec::with_capacity(data.len());
-        let mut cursor = std::io::Cursor::new(data);
-        while (cursor.position() as usize) < data.len() {
-            let doc_id = cursor.read_u32::<LittleEndian>()?;
-            let loc_mask = cursor.read_u8()?;
-            let next_mask = cursor.read_u8()?;
-            if needs_filter && remove_ids.contains(&doc_id) {
-                continue;
-            }
-            let mapped_id = if needs_filter {
-                old_to_new[&doc_id]
-            } else {
-                doc_id
-            };
-            buf.write_u32::<LittleEndian>(mapped_id)?;
-            buf.write_u8(loc_mask)?;
-            buf.write_u8(next_mask)?;
-        }
-
-        // Append new postings for this same hash
-        if let Some(extra) = new_postings.get(&entry.hash) {
-            for &(doc_id, loc_mask, next_mask) in extra {
-                buf.write_u32::<LittleEndian>(doc_id)?;
-                buf.write_u8(loc_mask)?;
-                buf.write_u8(next_mask)?;
-            }
-        }
-
-        if !buf.is_empty() {
-            let len = buf.len() as u32;
-            postings_out.write_all(&buf)?;
-            lookup_entries.push((entry.hash, write_offset, len));
-            write_offset += len as u64;
-            num_ngrams += 1;
-        }
+        f.flush()?;
     }
 
-    // Emit remaining new-only hashes
-    while new_only_idx < new_only_hashes.len() {
-        let nh = new_only_hashes[new_only_idx];
-        if let Some(postings) = new_postings.get(&nh) {
+    // Write delta postings + lookup
+    let mut sorted_ngrams: Vec<(u32, Vec<Posting>)> = delta_ngrams.into_iter().collect();
+    sorted_ngrams.sort_by_key(|(hash, _)| *hash);
+
+    let delta_postings_path = index_path.join("delta.postings");
+    let delta_lookup_path = index_path.join("delta.lookup");
+    let delta_docids_path = index_path.join("delta.docids");
+
+    if sorted_ngrams.is_empty() && delta_doc_ids.is_empty() {
+        let _ = fs::remove_file(&delta_postings_path);
+        let _ = fs::remove_file(&delta_lookup_path);
+        let _ = fs::remove_file(&delta_docids_path);
+    } else {
+        let mut postings_file = BufWriter::new(File::create(&delta_postings_path)?);
+        let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+        let mut offset: u64 = 0;
+
+        for (hash, postings) in &sorted_ngrams {
             let mut buf = Vec::with_capacity(postings.len() * 6);
             for &(doc_id, loc_mask, next_mask) in postings {
                 buf.write_u32::<LittleEndian>(doc_id)?;
@@ -582,65 +881,62 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
                 buf.write_u8(next_mask)?;
             }
             let len = buf.len() as u32;
-            postings_out.write_all(&buf)?;
-            lookup_entries.push((nh, write_offset, len));
-            write_offset += len as u64;
-            num_ngrams += 1;
+            postings_file.write_all(&buf)?;
+            lookup_entries.push((*hash, offset, len));
+            offset += len as u64;
         }
-        new_only_idx += 1;
+        postings_file.flush()?;
+
+        let mut lookup_file = BufWriter::new(File::create(&delta_lookup_path)?);
+        for (hash, off, len) in &lookup_entries {
+            lookup_file.write_u32::<LittleEndian>(*hash)?;
+            lookup_file.write_u64::<LittleEndian>(*off)?;
+            lookup_file.write_u32::<LittleEndian>(*len)?;
+        }
+        lookup_file.flush()?;
+
+        // Write delta docids
+        let mut docids_file = BufWriter::new(File::create(&delta_docids_path)?);
+        for path in &delta_doc_ids {
+            let path_bytes = path.to_string_lossy();
+            let bytes = path_bytes.as_bytes();
+            docids_file.write_u16::<LittleEndian>(bytes.len() as u16)?;
+            docids_file.write_all(bytes)?;
+        }
+        docids_file.flush()?;
     }
-    postings_out.flush()?;
 
-    // Drop the mmap before renaming files
-    drop(pidx);
-
-    // Atomically replace postings file
-    let postings_path = index_path.join("ngrams.postings");
-    fs::rename(&tmp_postings_path, &postings_path)?;
-
-    // Write lookup table
-    let lookup_path = index_path.join("ngrams.lookup");
-    let mut lookup_file = BufWriter::new(File::create(&lookup_path)?);
-    for (hash, off, len) in &lookup_entries {
-        lookup_file.write_u32::<LittleEndian>(*hash)?;
-        lookup_file.write_u64::<LittleEndian>(*off)?;
-        lookup_file.write_u32::<LittleEndian>(*len)?;
-    }
-    lookup_file.flush()?;
-
-    // Write docids
-    let docids_path = index_path.join("docids.bin");
-    let mut docids_file = BufWriter::new(File::create(&docids_path)?);
-    for path in &new_doc_ids {
-        let path_bytes = path.to_string_lossy();
-        let bytes = path_bytes.as_bytes();
-        docids_file.write_u16::<LittleEndian>(bytes.len() as u16)?;
-        docids_file.write_all(bytes)?;
-    }
-    docids_file.flush()?;
-
-    // 8. Update meta.json with new mtimes
-    let mut new_mtimes: HashMap<String, u64> = HashMap::with_capacity(new_doc_ids.len());
-    for path in &new_doc_ids {
-        let ps = path.to_string_lossy().into_owned();
-        if let Some(&mtime) = current_files.get(&ps) {
-            new_mtimes.insert(ps, mtime);
-        } else if let Some(&mtime) = saved_mtimes.get(&ps) {
-            new_mtimes.insert(ps, mtime);
+    // 10. Update meta.json with current file_mtimes
+    let mut new_mtimes: HashMap<String, u64> = HashMap::with_capacity(saved_mtimes.len());
+    // Start from saved, remove deleted, update modified, add new
+    for (path, &mtime) in &saved_mtimes {
+        if !deleted_set.contains(path) && !modified_set.contains(path) {
+            new_mtimes.insert(path.clone(), mtime);
         }
     }
+    for path_str in added_set.iter().chain(modified_set.iter()) {
+        if let Some(&mtime) = current_files.get(path_str) {
+            // Only add if it was actually indexed (not binary)
+            if delta_doc_ids.iter().any(|p| p.to_string_lossy() == *path_str) {
+                new_mtimes.insert(path_str.clone(), mtime);
+            }
+        }
+    }
+
+    let total_docs = main_num_docs - main_deleted.len() + delta_doc_ids.len();
     let new_meta = IndexMeta {
         version: 2,
-        num_docs: new_doc_ids.len(),
-        num_ngrams,
+        num_docs: total_docs,
+        num_ngrams: meta.num_ngrams, // approximate (main ngrams, not including delta)
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes: new_mtimes,
+        main_num_docs: Some(main_num_docs),
     };
     let meta_json = serde_json::to_string_pretty(&new_meta)?;
     fs::write(&meta_path, meta_json)?;
 
-    let unchanged = new_doc_ids.len() - actual_added - actual_modified;
+    let unchanged = total_docs - actual_added - actual_modified;
 
     if verbose {
         eprintln!(

@@ -1,4 +1,5 @@
 mod cli;
+mod freq_real;
 mod index;
 mod persist;
 mod searcher;
