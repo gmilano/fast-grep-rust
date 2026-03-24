@@ -7,9 +7,8 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use memmap2::Mmap;
-use roaring::RoaringBitmap;
 
-use crate::index::SparseIndex;
+use crate::index::{Posting, SparseIndex};
 use crate::trigram;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -44,63 +43,89 @@ impl PersistentIndex {
             return self.doc_ids.iter().map(|p| p.as_path()).collect();
         }
 
-        let mut result_bitmap = RoaringBitmap::new();
+        let mut result_docs: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for (i, alt_trigrams) in alternatives.iter().enumerate() {
             if alt_trigrams.is_empty() {
                 return self.doc_ids.iter().map(|p| p.as_path()).collect();
             }
 
-            let mut alt_bitmap: Option<RoaringBitmap> = None;
-            let mut missing = false;
-
-            // Sort by posting list size for fast intersection
-            let mut with_sizes: Vec<(&[u8; 3], u64)> = alt_trigrams
+            // Check all trigrams exist
+            let postings_list: Vec<Option<Vec<Posting>>> = alt_trigrams
                 .iter()
-                .filter_map(|tri| {
-                    self.lookup_trigram(tri).map(|bm| (tri, bm.len()))
-                })
+                .map(|tri| self.lookup_trigram(tri))
                 .collect();
 
-            if with_sizes.len() < alt_trigrams.len() {
-                missing = true;
+            if postings_list.iter().any(|p| p.is_none()) {
+                continue;
             }
 
-            if !missing {
-                with_sizes.sort_by_key(|&(_, len)| len);
-                for (tri, _) in &with_sizes {
-                    if let Some(bm) = self.lookup_trigram(tri) {
-                        match &mut alt_bitmap {
-                            None => alt_bitmap = Some(bm),
-                            Some(acc) => {
-                                *acc &= &bm;
-                                if acc.is_empty() {
-                                    break;
-                                }
-                            }
+            let postings_list: Vec<Vec<Posting>> =
+                postings_list.into_iter().map(|p| p.unwrap()).collect();
+
+            // Sort by posting list size for fast intersection
+            let mut indices: Vec<usize> = (0..alt_trigrams.len()).collect();
+            indices.sort_by_key(|&idx| postings_list[idx].len());
+
+            // Intersect on doc_ids
+            let first = &postings_list[indices[0]];
+            let mut candidate_docs: std::collections::HashSet<u32> =
+                first.iter().map(|&(doc_id, _, _)| doc_id).collect();
+
+            for &idx in &indices[1..] {
+                if candidate_docs.is_empty() {
+                    break;
+                }
+                let doc_set: std::collections::HashSet<u32> =
+                    postings_list[idx].iter().map(|&(doc_id, _, _)| doc_id).collect();
+                candidate_docs.retain(|d| doc_set.contains(d));
+            }
+
+            // Adjacency filtering with position masks
+            if alt_trigrams.len() >= 2 && !candidate_docs.is_empty() {
+                for pair_idx in 0..alt_trigrams.len() - 1 {
+                    let masks_a: HashMap<u32, (u8, u8)> = postings_list[pair_idx]
+                        .iter()
+                        .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                        .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                        .collect();
+                    let masks_b: HashMap<u32, (u8, u8)> = postings_list[pair_idx + 1]
+                        .iter()
+                        .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                        .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                        .collect();
+
+                    candidate_docs.retain(|doc_id| {
+                        if let (Some((_, next_a)), Some((loc_b, _))) =
+                            (masks_a.get(doc_id), masks_b.get(doc_id))
+                        {
+                            next_a & loc_b != 0
+                        } else {
+                            false
                         }
+                    });
+
+                    if candidate_docs.is_empty() {
+                        break;
                     }
                 }
             }
 
-            if let Some(bm) = alt_bitmap {
-                if i == 0 {
-                    result_bitmap = bm;
-                } else {
-                    result_bitmap |= bm;
-                }
+            if i == 0 {
+                result_docs = candidate_docs;
+            } else {
+                result_docs.extend(candidate_docs);
             }
         }
 
-        result_bitmap
+        result_docs
             .iter()
-            .filter_map(|id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
+            .filter_map(|&id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
             .collect()
     }
 
-    fn lookup_trigram(&self, trigram: &[u8; 3]) -> Option<RoaringBitmap> {
+    fn lookup_trigram(&self, trigram: &[u8; 3]) -> Option<Vec<Posting>> {
         let hash = crc32fast::hash(trigram);
-        // Binary search in lookup table
         let idx = self
             .lookup
             .binary_search_by_key(&hash, |e| e.hash)
@@ -115,11 +140,25 @@ impl PersistentIndex {
         }
 
         let data = &self.postings_mmap[start..end];
-        RoaringBitmap::deserialize_from(data).ok()
+        // Each posting is 6 bytes: u32 doc_id + u8 loc_mask + u8 next_mask
+        let posting_size = 6;
+        if data.len() % posting_size != 0 {
+            return None;
+        }
+
+        let mut postings = Vec::with_capacity(data.len() / posting_size);
+        let mut cursor = std::io::Cursor::new(data);
+        while (cursor.position() as usize) < data.len() {
+            let doc_id = cursor.read_u32::<LittleEndian>().ok()?;
+            let loc_mask = cursor.read_u8().ok()?;
+            let next_mask = cursor.read_u8().ok()?;
+            postings.push((doc_id, loc_mask, next_mask));
+        }
+
+        Some(postings)
     }
 
     pub fn is_stale(&self) -> bool {
-        // Sample check — don't check all files, just a few
         for (path_str, &stored_mtime) in self.meta.file_mtimes.iter().take(100) {
             let path = Path::new(path_str);
             match fs::metadata(path) {
@@ -177,12 +216,16 @@ pub fn build(
     let mut offset: u64 = 0;
 
     // Sort trigrams by hash for binary search
-    let mut trigram_list: Vec<(&[u8; 3], &RoaringBitmap)> = index.ngrams.iter().collect();
+    let mut trigram_list: Vec<(&[u8; 3], &Vec<Posting>)> = index.ngrams.iter().collect();
     trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
 
-    for (tri, bitmap) in &trigram_list {
-        let mut buf = Vec::new();
-        bitmap.serialize_into(&mut buf)?;
+    for (tri, postings) in &trigram_list {
+        let mut buf = Vec::with_capacity(postings.len() * 6);
+        for &(doc_id, loc_mask, next_mask) in *postings {
+            buf.write_u32::<LittleEndian>(doc_id)?;
+            buf.write_u8(loc_mask)?;
+            buf.write_u8(next_mask)?;
+        }
         let len = buf.len() as u32;
         postings_file.write_all(&buf)?;
         lookup_entries.push((crc32fast::hash(*tri), offset, len));
@@ -213,7 +256,7 @@ pub fn build(
 
     // Write meta
     let meta = IndexMeta {
-        version: 1,
+        version: 2, // bumped for new posting format
         num_docs: index.doc_ids.len(),
         num_ngrams: index.ngrams.len(),
         root_dir: root.to_string_lossy().into_owned(),

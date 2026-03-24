@@ -41,6 +41,30 @@ pub fn decompose_pattern(pattern: &str) -> Vec<Vec<[u8; 3]>> {
     result
 }
 
+/// Like decompose_pattern but preserves trigram order (no sort/dedup).
+/// Used for adjacency filtering with position masks.
+pub fn decompose_pattern_ordered(pattern: &str) -> Vec<Vec<[u8; 3]>> {
+    let alternatives = split_alternatives(pattern);
+    let mut result = Vec::new();
+    for alt in &alternatives {
+        let literals = extract_literal_runs(alt);
+        let mut trigrams = Vec::new();
+        for lit in &literals {
+            let bytes = lit.as_bytes();
+            if bytes.len() >= 3 {
+                for w in bytes.windows(3) {
+                    trigrams.push([w[0], w[1], w[2]]);
+                }
+            }
+        }
+        result.push(trigrams);
+    }
+    if result.iter().any(|v| v.is_empty()) {
+        return vec![vec![]];
+    }
+    result
+}
+
 fn split_alternatives(pattern: &str) -> Vec<String> {
     let mut alts = Vec::new();
     let mut current = String::new();

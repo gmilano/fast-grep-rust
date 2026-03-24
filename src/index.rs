@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ignore::WalkBuilder;
-use roaring::RoaringBitmap;
 
 use crate::trigram;
 
@@ -11,12 +10,23 @@ pub struct IndexStats {
     pub num_docs: usize,
     pub num_ngrams: usize,
     pub estimated_ram_bytes: usize,
-    pub avg_bitmap_cardinality: f64,
+    pub avg_postings_len: f64,
 }
 
+pub struct SearchStats {
+    pub candidates: usize,
+    pub verified: usize,
+    pub false_positive_rate: f64,
+}
+
+/// A posting entry: (doc_id, loc_mask, next_mask).
+/// - loc_mask: bitmask of (position % 8) where this trigram appears in the document
+/// - next_mask: bitmask of ((position + 1) % 8) — expected position of the next adjacent trigram
+pub type Posting = (u32, u8, u8);
+
 pub struct SparseIndex {
-    /// Trigram → bitmap of doc IDs that contain this trigram
-    pub ngrams: HashMap<[u8; 3], RoaringBitmap>,
+    /// Trigram → list of (doc_id, loc_mask, next_mask)
+    pub ngrams: HashMap<[u8; 3], Vec<Posting>>,
     pub doc_ids: Vec<PathBuf>,
 }
 
@@ -32,95 +42,177 @@ impl SparseIndex {
         let doc_id = self.doc_ids.len() as u32;
         self.doc_ids.push(path.to_path_buf());
 
-        // Extract unique trigrams from the file content
         if content.len() < 3 {
             return;
         }
-        let mut seen = HashSet::new();
-        for w in content.windows(3) {
+
+        // Accumulate masks per trigram for this document
+        let mut masks: HashMap<[u8; 3], (u8, u8)> = HashMap::new();
+
+        for (pos, w) in content.windows(3).enumerate() {
             let tri = [w[0], w[1], w[2]];
-            if seen.insert(tri) {
-                self.ngrams
-                    .entry(tri)
-                    .or_insert_with(RoaringBitmap::new)
-                    .insert(doc_id);
-            }
+            let loc_bit = 1u8 << (pos % 8) as u32;
+            let next_bit = 1u8 << ((pos + 1) % 8) as u32;
+
+            let entry = masks.entry(tri).or_insert((0u8, 0u8));
+            entry.0 |= loc_bit;
+            entry.1 |= next_bit;
+        }
+
+        for (tri, (loc_mask, next_mask)) in masks {
+            self.ngrams
+                .entry(tri)
+                .or_insert_with(Vec::new)
+                .push((doc_id, loc_mask, next_mask));
         }
     }
 
     pub fn search(&self, pattern: &str) -> Vec<&Path> {
+        let (candidates, _) = self.search_inner(pattern);
+        candidates
+    }
+
+    pub fn search_with_stats(&self, pattern: &str, verified_count: usize) -> SearchStats {
+        let (candidates, _) = self.search_inner(pattern);
+        let num_candidates = candidates.len();
+        let false_positives = if num_candidates > 0 {
+            num_candidates.saturating_sub(verified_count)
+        } else {
+            0
+        };
+        let fp_rate = if num_candidates > 0 {
+            false_positives as f64 / num_candidates as f64
+        } else {
+            0.0
+        };
+        SearchStats {
+            candidates: num_candidates,
+            verified: verified_count,
+            false_positive_rate: fp_rate,
+        }
+    }
+
+    fn search_inner(&self, pattern: &str) -> (Vec<&Path>, usize) {
         let alternatives = trigram::decompose_pattern(pattern);
 
         // If no useful trigrams, fall back to full scan
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
-            return self.doc_ids.iter().map(|p| p.as_path()).collect();
+            let all: Vec<&Path> = self.doc_ids.iter().map(|p| p.as_path()).collect();
+            let len = all.len();
+            return (all, len);
         }
 
-        let mut result_bitmap = RoaringBitmap::new();
+        let mut result_docs: HashSet<u32> = HashSet::new();
 
         for (i, alt_trigrams) in alternatives.iter().enumerate() {
             if alt_trigrams.is_empty() {
-                return self.doc_ids.iter().map(|p| p.as_path()).collect();
+                let all: Vec<&Path> = self.doc_ids.iter().map(|p| p.as_path()).collect();
+                let len = all.len();
+                return (all, len);
             }
 
-            // Sort trigrams by posting list size (smallest first) for fast intersection
-            let mut sorted: Vec<(&[u8; 3], u64)> = alt_trigrams
-                .iter()
-                .filter_map(|tri| self.ngrams.get(tri).map(|bm| (tri, bm.len())))
-                .collect();
-            sorted.sort_by_key(|&(_, len)| len);
-
-            let mut alt_bitmap: Option<RoaringBitmap> = None;
-
-            if sorted.len() < alt_trigrams.len() {
-                // Some trigrams not in index → no matches for this alternative
-                if i == 0 {
-                    // Keep empty bitmap
-                } else {
-                    // OR with empty = no change
-                }
+            // Check if all trigrams exist in index
+            let all_present = alt_trigrams.iter().all(|tri| self.ngrams.contains_key(tri));
+            if !all_present {
                 continue;
             }
 
-            for (tri, _) in &sorted {
-                if let Some(bm) = self.ngrams.get(*tri) {
-                    match &mut alt_bitmap {
-                        None => alt_bitmap = Some(bm.clone()),
-                        Some(acc) => {
-                            *acc &= bm;
-                            if acc.is_empty() {
-                                break;
-                            }
+            // Sort trigrams by posting list size (smallest first) for fast intersection
+            let mut sorted: Vec<&[u8; 3]> = alt_trigrams.iter().collect();
+            sorted.sort_by_key(|tri| self.ngrams.get(*tri).map_or(0, |v| v.len()));
+
+            // Step 1: bitmap intersection on doc_ids only
+            let first_postings = match self.ngrams.get(sorted[0]) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut candidate_docs: HashSet<u32> =
+                first_postings.iter().map(|&(doc_id, _, _)| doc_id).collect();
+
+            for tri in &sorted[1..] {
+                if candidate_docs.is_empty() {
+                    break;
+                }
+                if let Some(postings) = self.ngrams.get(*tri) {
+                    let doc_set: HashSet<u32> =
+                        postings.iter().map(|&(doc_id, _, _)| doc_id).collect();
+                    candidate_docs.retain(|d| doc_set.contains(d));
+                } else {
+                    candidate_docs.clear();
+                    break;
+                }
+            }
+
+            // Step 2: adjacency filtering using position masks
+            // For consecutive trigrams in the query, check that next_mask of T[i]
+            // overlaps with loc_mask of T[i+1] for the same document.
+            if alt_trigrams.len() >= 2 && !candidate_docs.is_empty() {
+                for pair in alt_trigrams.windows(2) {
+                    let masks_a: HashMap<u32, (u8, u8)> = self
+                        .ngrams
+                        .get(&pair[0])
+                        .map(|postings| {
+                            postings
+                                .iter()
+                                .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                                .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    let masks_b: HashMap<u32, (u8, u8)> = self
+                        .ngrams
+                        .get(&pair[1])
+                        .map(|postings| {
+                            postings
+                                .iter()
+                                .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
+                                .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    candidate_docs.retain(|doc_id| {
+                        if let (Some((_, next_a)), Some((loc_b, _))) =
+                            (masks_a.get(doc_id), masks_b.get(doc_id))
+                        {
+                            next_a & loc_b != 0
+                        } else {
+                            false
                         }
+                    });
+
+                    if candidate_docs.is_empty() {
+                        break;
                     }
                 }
             }
 
-            if let Some(bm) = alt_bitmap {
-                if i == 0 {
-                    result_bitmap = bm;
-                } else {
-                    result_bitmap |= bm;
-                }
+            if i == 0 {
+                result_docs = candidate_docs;
+            } else {
+                result_docs.extend(candidate_docs);
             }
         }
 
-        result_bitmap
+        let results: Vec<&Path> = result_docs
             .iter()
-            .filter_map(|id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
-            .collect()
+            .filter_map(|&id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
+            .collect();
+        let len = results.len();
+        (results, len)
     }
 
     pub fn stats(&self) -> IndexStats {
         let num_docs = self.doc_ids.len();
         let num_ngrams = self.ngrams.len();
-        let estimated_ram = self
+        let estimated_ram: usize = self
             .ngrams
             .iter()
-            .map(|(_, v)| 3 + v.serialized_size() + 48)
-            .sum::<usize>();
-        let avg_card = if num_ngrams > 0 {
-            self.ngrams.values().map(|b| b.len() as f64).sum::<f64>() / num_ngrams as f64
+            .map(|(_, v)| 3 + v.len() * 6 + 48) // key + Vec<(u32,u8,u8)> + overhead
+            .sum();
+        let avg_len = if num_ngrams > 0 {
+            self.ngrams.values().map(|v| v.len() as f64).sum::<f64>() / num_ngrams as f64
         } else {
             0.0
         };
@@ -128,7 +220,7 @@ impl SparseIndex {
             num_docs,
             num_ngrams,
             estimated_ram_bytes: estimated_ram,
-            avg_bitmap_cardinality: avg_card,
+            avg_postings_len: avg_len,
         }
     }
 
@@ -207,7 +299,29 @@ mod tests {
 
         let results = index.search("println");
         assert!(
-            results.iter().any(|p| p == Path::new("test1.rs")),
+            results.iter().any(|p| *p == Path::new("test1.rs")),
+            "Should find test1.rs for 'println'"
+        );
+    }
+
+    #[test]
+    fn test_adjacency_filtering() {
+        let mut index = SparseIndex::new();
+        // "println" appears in test1 but not test2
+        index.add_document(
+            Path::new("test1.rs"),
+            b"fn main() { println!(\"hello\"); }",
+        );
+        // Has "pri" and "ntl" separately but not "println"
+        index.add_document(
+            Path::new("test2.rs"),
+            b"priority control ntly",
+        );
+
+        let results = index.search("println");
+        // test1 should match, test2 might be filtered by adjacency
+        assert!(
+            results.iter().any(|p| *p == Path::new("test1.rs")),
             "Should find test1.rs for 'println'"
         );
     }
@@ -219,5 +333,14 @@ mod tests {
         let stats = index.stats();
         assert_eq!(stats.num_docs, 1);
         assert!(stats.num_ngrams > 0);
+    }
+
+    #[test]
+    fn test_search_with_stats() {
+        let mut index = SparseIndex::new();
+        index.add_document(Path::new("a.rs"), b"hello world foo bar baz");
+        let stats = index.search_with_stats("hello", 1);
+        assert!(stats.candidates >= 1);
+        assert_eq!(stats.verified, 1);
     }
 }

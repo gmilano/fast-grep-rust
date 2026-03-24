@@ -174,7 +174,7 @@ pub fn run() -> Result<()> {
                 println!("  Documents:    {}", stats.num_docs);
                 println!("  N-grams:      {}", stats.num_ngrams);
                 println!("  Estimated RAM: {}MB", stats.estimated_ram_bytes / (1024 * 1024));
-                println!("  Avg bitmap cardinality: {:.1}", stats.avg_bitmap_cardinality);
+                println!("  Avg postings len: {:.1}", stats.avg_postings_len);
             }
         }
     }
@@ -225,6 +225,11 @@ fn run_bench(
 
     // 5. ripgrep (if available)
     let rg_time = bench_external("rg", &["-n", pattern, &dir.to_string_lossy()]);
+
+    // Position mask stats
+    let idx_for_stats =
+        index::SparseIndex::build_from_directory(dir, no_ignore, type_filter, false)?;
+    let inmem_stats = idx_for_stats.search_with_stats(pattern, inmem_matches.len());
 
     // Print results
     println!();
@@ -285,6 +290,16 @@ fn run_bench(
     if let Some(t) = rg_time {
         println!("{:<30} {:>12} {:>10}", "ripgrep (rg)", format_duration(t), "?");
     }
+
+    // Position mask statistics
+    println!();
+    println!("Position Mask Stats (Blackbird):");
+    println!("  Index candidates:     {}", inmem_stats.candidates);
+    println!("  Verified matches:     {}", inmem_stats.verified);
+    println!(
+        "  False positive rate:  {:.2}%",
+        inmem_stats.false_positive_rate * 100.0
+    );
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
