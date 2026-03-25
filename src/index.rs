@@ -231,13 +231,13 @@ impl SparseIndex {
         type_filter: Option<&str>,
         verbose: bool,
     ) -> Result<Self> {
-        let mut index = SparseIndex::new();
+        // Phase 1: collect all file paths
         let walker = WalkBuilder::new(root)
             .git_ignore(!no_ignore)
             .hidden(false)
             .build();
 
-        let mut count = 0u32;
+        let mut paths: Vec<PathBuf> = Vec::new();
         for entry in walker {
             let entry = entry?;
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -252,7 +252,19 @@ impl SparseIndex {
                 }
             }
 
-            // Skip binary files
+            paths.push(path.to_path_buf());
+        }
+
+        // Phase 2: build corpus-adaptive bigram frequency table
+        let _freq = crate::sparse::BigramFreq::from_corpus(&paths, 3000);
+        if verbose {
+            eprintln!("  built bigram freq table from {} file sample", paths.len().min(3000));
+        }
+
+        // Phase 3: index all files
+        let mut index = SparseIndex::new();
+        let mut count = 0u32;
+        for path in &paths {
             let content = match std::fs::read(path) {
                 Ok(c) => c,
                 Err(_) => continue,

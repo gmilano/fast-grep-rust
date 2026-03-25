@@ -11,6 +11,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::index::{Posting, SparseIndex};
+use crate::sparse::BigramFreq;
 use crate::trigram;
 
 // --- Zero-copy read helpers ---
@@ -103,6 +104,9 @@ pub struct IndexMeta {
     /// Number of docs in the main (non-delta) index. Set on full build.
     #[serde(default)]
     pub main_num_docs: Option<usize>,
+    /// Corpus-adaptive bigram frequency table, base64-encoded.
+    #[serde(default)]
+    pub bigram_freq_b64: Option<String>,
 }
 
 #[derive(Clone)]
@@ -130,6 +134,7 @@ pub struct PersistentIndex {
     pub delta_lookup: Vec<LookupEntry>,
     pub delta_postings: Vec<u8>,
     pub main_num_docs: usize,
+    pub freq: BigramFreq,
 }
 
 impl PersistentIndex {
@@ -476,6 +481,13 @@ pub fn build(
 
     fs::create_dir_all(output).context("creating output directory")?;
 
+    // Build corpus-adaptive bigram frequency table
+    let freq = BigramFreq::from_corpus(&index.doc_ids, 5000);
+    let freq_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(freq.to_bytes())
+    };
+
     // Collect file mtimes
     let mut file_mtimes = HashMap::new();
     for path in &index.doc_ids {
@@ -545,6 +557,7 @@ pub fn build(
         built_at: chrono_now(),
         file_mtimes,
         main_num_docs: Some(num_docs),
+        bigram_freq_b64: Some(freq_b64),
     };
     let meta_path = output.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
@@ -661,6 +674,17 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         }
     }
 
+    // Load bigram frequency table from meta (or fall back to flat)
+    let freq = if let Some(ref b64) = meta.bigram_freq_b64 {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) => BigramFreq::from_bytes(&bytes),
+            Err(_) => BigramFreq::flat(),
+        }
+    } else {
+        BigramFreq::flat()
+    };
+
     Ok(PersistentIndex {
         lookup_mmap,
         lookup_count,
@@ -673,6 +697,7 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         delta_lookup,
         delta_postings,
         main_num_docs,
+        freq,
     })
 }
 
@@ -932,6 +957,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         built_at: chrono_now(),
         file_mtimes: new_mtimes,
         main_num_docs: Some(main_num_docs),
+        bigram_freq_b64: meta.bigram_freq_b64,
     };
     let meta_json = serde_json::to_string_pretty(&new_meta)?;
     fs::write(&meta_path, meta_json)?;

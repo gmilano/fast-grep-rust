@@ -1,4 +1,3 @@
-pub mod freq_real;
 pub mod index;
 pub mod persist;
 pub mod searcher;
