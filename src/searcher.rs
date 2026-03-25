@@ -345,6 +345,21 @@ fn is_binary(buf: &[u8]) -> bool {
     memchr::memchr(0, &buf[..check_len]).is_some()
 }
 
+/// Known text extensions — skip binary check for these (major perf win)
+#[inline(always)]
+fn is_known_text_ext(path: &std::path::Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => matches!(e,
+            "rs"|"ts"|"tsx"|"js"|"jsx"|"py"|"go"|"rb"|"java"|"c"|"h"|"cpp"|"cc"|"hpp"|
+            "cs"|"swift"|"kt"|"scala"|"php"|"html"|"css"|"scss"|"less"|"json"|"toml"|
+            "yaml"|"yml"|"md"|"txt"|"sh"|"bash"|"zsh"|"fish"|"vim"|"lua"|"r"|"sql"|
+            "xml"|"svg"|"tf"|"hcl"|"nix"|"ex"|"exs"|"erl"|"hrl"|"ml"|"mli"|"hs"|
+            "clj"|"cljs"|"lisp"|"el"|"dart"|"zig"|"v"|"proto"|"graphql"|"gql"
+        ),
+        None => false,
+    }
+}
+
 pub struct Searcher {
     index: SparseIndex,
 }
@@ -579,14 +594,16 @@ pub fn search_full_scan(
                 }
             }
 
+            // Use metadata from the walk entry (already stat'd, no extra syscall)
+            let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if flen == 0 { return ignore::WalkState::Continue; }
+
             // Read with reusable buffer (fast for small files) or mmap (for large)
             read_buf.clear();
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            let flen = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if flen == 0 { return ignore::WalkState::Continue; }
 
             let _mmap_holder;
             let buf: &[u8] = if flen > 256 * 1024 {
@@ -605,7 +622,7 @@ pub fn search_full_scan(
                 &read_buf[..]
             };
 
-            if is_binary(buf) {
+            if !is_known_text_ext(path) && is_binary(buf) {
                 return ignore::WalkState::Continue;
             }
 
@@ -688,7 +705,7 @@ pub fn search_full_scan_count(
                 Ok(f) => f,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            let flen = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if flen == 0 { return ignore::WalkState::Continue; }
 
             let _mmap_holder;
@@ -708,7 +725,7 @@ pub fn search_full_scan_count(
                 &read_buf[..]
             };
 
-            if is_binary(buf) {
+            if !is_known_text_ext(path) && is_binary(buf) {
                 return ignore::WalkState::Continue;
             }
 
@@ -780,7 +797,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                 Ok(f) => f,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            let flen = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if flen == 0 { return ignore::WalkState::Continue; }
 
             // For files that would bloat our buffer, use mmap
@@ -801,7 +818,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                 &read_buf[..]
             };
 
-            if is_binary(buf) {
+            if !is_known_text_ext(path) && is_binary(buf) {
                 return ignore::WalkState::Continue;
             }
 
