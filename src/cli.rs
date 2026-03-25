@@ -6,12 +6,20 @@ use clap::{Parser, Subcommand};
 
 use crate::{index, persist, searcher};
 
+/// Search options extracted from CLI flags
+struct SearchOpts {
+    count: bool,
+    files_only: bool,
+    quiet: bool,
+    no_ignore: bool,
+    file_type: Option<String>,
+}
+
 #[derive(Parser)]
 #[command(
     name = "fgr",
     version,
     about = "Fast grep with sparse n-gram index — drop-in grep replacement",
-    // Allow `fgr PATTERN [DIR]` without a subcommand
     args_conflicts_with_subcommands = true,
 )]
 pub struct Cli {
@@ -26,9 +34,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    // ── grep-compatible flags ──
+    // -- grep-compatible flags --
 
-    /// Recurse into directories (default: on, for grep compat)
+    /// Recurse into directories (on by default)
     #[arg(short = 'r', long = "recursive", global = true)]
     pub recursive: bool,
 
@@ -40,7 +48,7 @@ pub struct Cli {
     #[arg(short = 'l', long = "files-with-matches", global = true)]
     pub files_only: bool,
 
-    /// Print line numbers with output
+    /// Print line numbers with output (on by default)
     #[arg(short = 'n', long = "line-number", global = true)]
     pub line_number: bool,
 
@@ -88,7 +96,7 @@ pub struct Cli {
     #[arg(long = "exclude", value_name = "GLOB", global = true)]
     pub exclude: Option<String>,
 
-    // ── fast-grep specific flags ──
+    // -- fast-grep specific flags --
 
     /// Use persistent index for searching (path to .fgr dir)
     #[arg(long = "index", value_name = "PATH", global = true)]
@@ -108,33 +116,26 @@ pub enum Commands {
     /// Build a persistent index
     #[command(name = "index")]
     Index {
-        /// Directory to index
         dir: PathBuf,
-        /// Output directory for index files
         #[arg(long, default_value = ".fgr")]
         output: PathBuf,
     },
     /// Benchmark search performance
     #[command(name = "bench")]
     Bench {
-        /// Regex pattern to benchmark
         pattern: String,
-        /// Directory to search
         dir: PathBuf,
     },
     /// Incrementally update a persistent index
     #[command(name = "update")]
     Update {
-        /// Directory that was indexed
         dir: Option<PathBuf>,
-        /// Path to persistent index
         #[arg(long, default_value = ".fgr")]
         index: PathBuf,
     },
     /// Show index statistics
     #[command(name = "stats")]
     Stats {
-        /// Path to persistent index
         #[arg(long, default_value = ".fgr")]
         index: PathBuf,
     },
@@ -143,31 +144,20 @@ pub enum Commands {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // If a subcommand was given, dispatch to it
-    // Destructure to avoid partial move issues
-    let Cli {
-        pattern,
-        path,
-        command,
-        count,
-        files_only,
-        line_number,
-        ignore_case,
-        fixed_strings,
-        quiet,
-        index_path,
-        no_ignore,
-        file_type,
-        ..
-    } = cli;
+    let opts = SearchOpts {
+        count: cli.count,
+        files_only: cli.files_only,
+        quiet: cli.quiet,
+        no_ignore: cli.no_ignore,
+        file_type: cli.file_type.clone(),
+    };
 
-    if let Some(cmd) = command {
-        return run_subcommand(cmd, no_ignore, file_type.as_deref());
+    if let Some(cmd) = cli.command {
+        return run_subcommand(cmd, opts.no_ignore, opts.file_type.as_deref());
     }
 
-    // grep-compatible search mode
-    let pattern = match pattern {
-        Some(p) => p,
+    let pattern = match cli.pattern.as_ref() {
+        Some(p) => p.clone(),
         None => {
             eprintln!("Usage: fgr [OPTIONS] PATTERN [PATH]");
             eprintln!("Try 'fgr --help' for more information.");
@@ -175,103 +165,85 @@ pub fn run() -> Result<()> {
         }
     };
 
-    let dir = path.unwrap_or_else(|| PathBuf::from("."));
+    let dir = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
-    // Build the effective regex pattern
-    let effective_pattern = if fixed_strings {
+    let mut effective = if cli.fixed_strings {
         regex::escape(&pattern)
     } else {
-        pattern.clone()
+        pattern
     };
-    let effective_pattern = if ignore_case {
-        format!("(?i){}", effective_pattern)
-    } else {
-        effective_pattern
-    };
-
-    if let Some(idx_path) = &index_path {
-        // Indexed search
-        let start = Instant::now();
-        let idx = persist::load(idx_path)?;
-        let load_time = start.elapsed();
-
-        let start = Instant::now();
-        if count {
-            let (n, timing) = searcher::search_persistent_count(&idx, &effective_pattern)?;
-            let search_time = start.elapsed();
-            println!("{}", n);
-            if !quiet {
-                eprintln!(
-                    "Load: {:.1}ms | Search: {:.1}ms (ngrams:{:.2}ms lookup:{:.2}ms intersect:{:.2}ms verify:{:.2}ms) | {} candidates -> {} matches | {} trigrams",
-                    load_time.as_secs_f64() * 1000.0,
-                    search_time.as_secs_f64() * 1000.0,
-                    timing.covering_ngrams_ms, timing.lookup_ms,
-                    timing.bitmap_intersect_ms, timing.verify_ms,
-                    timing.candidates, n, timing.ngrams_queried,
-                );
-            }
-        } else {
-            let (matches, timing) = searcher::search_persistent_timed(&idx, &effective_pattern)?;
-            let search_time = start.elapsed();
-
-            if !quiet {
-                if files_only {
-                    let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
-                    files.sort();
-                    files.dedup();
-                    for f in files {
-                        println!("{}", f.display());
-                    }
-                } else {
-                    use std::io::Write;
-                    let stdout = std::io::stdout();
-                    let mut out = std::io::BufWriter::new(stdout.lock());
-                    for m in &matches {
-                        let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
-                    }
-                }
-                eprintln!(
-                    "Load: {:.1}ms | Search: {:.1}ms (ngrams:{:.2}ms lookup:{:.2}ms intersect:{:.2}ms verify:{:.2}ms) | {} candidates -> {} matches | {} trigrams",
-                    load_time.as_secs_f64() * 1000.0,
-                    search_time.as_secs_f64() * 1000.0,
-                    timing.covering_ngrams_ms, timing.lookup_ms,
-                    timing.bitmap_intersect_ms, timing.verify_ms,
-                    timing.candidates, matches.len(), timing.ngrams_queried,
-                );
-            }
-        }
-    } else {
-        // Direct full scan
-        let start = Instant::now();
-        let matches = searcher::search_full_scan(&dir, &effective_pattern, no_ignore, file_type.as_deref())?;
-        let elapsed = start.elapsed();
-
-        if !quiet {
-            if count {
-                println!("{}", matches.len());
-            } else if files_only {
-                let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
-                files.sort();
-                files.dedup();
-                for f in files {
-                    println!("{}", f.display());
-                }
-            } else {
-                use std::io::Write;
-                let stdout = std::io::stdout();
-                let mut out = std::io::BufWriter::new(stdout.lock());
-                for m in &matches {
-                    let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
-                }
-            }
-            eprintln!("Full scan: {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, matches.len());
-        }
-
-        if quiet && matches.is_empty() {
-            std::process::exit(1);
-        }
+    if cli.ignore_case {
+        effective = format!("(?i){}", effective);
     }
 
+    if let Some(ref idx_path) = cli.index_path {
+        run_indexed_search(&effective, idx_path, &opts)?;
+    } else {
+        run_direct_search(&effective, &dir, &opts)?;
+    }
+
+    Ok(())
+}
+
+fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    let start = Instant::now();
+    let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+    let elapsed = start.elapsed();
+    output_matches(&matches, opts)?;
+    if !opts.quiet {
+        eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, matches.len());
+    }
+    if opts.quiet && matches.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    let start = Instant::now();
+    let idx = persist::load(idx_path)?;
+    let load_time = start.elapsed();
+    let start = Instant::now();
+    if opts.count {
+        let (n, _) = searcher::search_persistent_count(&idx, pattern)?;
+        let search_time = start.elapsed();
+        println!("{}", n);
+        if !opts.quiet {
+            eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
+        }
+    } else {
+        let (matches, _) = searcher::search_persistent_timed(&idx, pattern)?;
+        let search_time = start.elapsed();
+        output_matches(&matches, opts)?;
+        if !opts.quiet {
+            eprintln!("Load: {:.1}ms, Search: {:.1}ms, {} matches", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0, matches.len());
+        }
+    }
+    Ok(())
+}
+
+fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> {
+    if opts.quiet { return Ok(()); }
+    if opts.count {
+        let mut counts: std::collections::HashMap<&PathBuf, usize> = std::collections::HashMap::new();
+        for m in matches { *counts.entry(&m.path).or_insert(0) += 1; }
+        let mut pairs: Vec<_> = counts.into_iter().collect();
+        pairs.sort_by_key(|(p, _)| p.clone());
+        for (path, count) in pairs { println!("{}:{}", path.display(), count); }
+        return Ok(());
+    }
+    if opts.files_only {
+        let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
+        files.sort(); files.dedup();
+        for f in files { println!("{}", f.display()); }
+        return Ok(());
+    }
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for m in matches {
+        let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
+    }
     Ok(())
 }
 
@@ -282,18 +254,11 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
             persist::build(&dir, &output, no_ignore, type_filter, true)?;
             eprintln!("Index built in {:.2}s", start.elapsed().as_secs_f64());
         }
-
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, type_filter)?;
         }
-
-        Commands::Update {
-            dir,
-            index: idx_path,
-        } => {
-            let root = if let Some(d) = dir {
-                d
-            } else {
+        Commands::Update { dir, index: idx_path } => {
+            let root = if let Some(d) = dir { d } else {
                 let probe = persist::load(&idx_path)?;
                 PathBuf::from(&probe.meta.root_dir)
             };
@@ -301,13 +266,10 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
-                eprintln!(
-                    "Updated index: +{} added, {} modified, {} deleted (unchanged: {}) in {}ms",
-                    stats.added, stats.modified, stats.deleted, stats.unchanged, stats.duration_ms
-                );
+                eprintln!("Updated index: +{} added, {} modified, {} deleted (unchanged: {}) in {}ms",
+                    stats.added, stats.modified, stats.deleted, stats.unchanged, stats.duration_ms);
             }
         }
-
         Commands::Stats { index: index_path } => {
             if index_path.exists() {
                 let idx = persist::load(&index_path)?;
@@ -319,43 +281,27 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 println!("  Stale:        {}", idx.is_stale());
                 println!("  Postings size: {}KB", idx.postings_mmap.len() / 1024);
             } else {
-                let idx = index::SparseIndex::build_from_directory(
-                    &index_path,
-                    no_ignore,
-                    type_filter,
-                    false,
-                )?;
+                let idx = index::SparseIndex::build_from_directory(&index_path, no_ignore, type_filter, false)?;
                 let stats = idx.stats();
                 println!("In-memory Index Stats:");
                 println!("  Documents:    {}", stats.num_docs);
                 println!("  N-grams:      {}", stats.num_ngrams);
-                println!(
-                    "  Estimated RAM: {}MB",
-                    stats.estimated_ram_bytes / (1024 * 1024)
-                );
+                println!("  Estimated RAM: {}MB", stats.estimated_ram_bytes / (1024 * 1024));
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
             }
         }
     }
-
     Ok(())
 }
 
-fn run_bench(
-    pattern: &str,
-    dir: &std::path::Path,
-    no_ignore: bool,
-    type_filter: Option<&str>,
-) -> Result<()> {
+fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
     println!("Benchmarking pattern '{}' in {:?}", pattern, dir);
     println!("{}", "=".repeat(70));
 
-    // 1. Full scan (our optimized path)
     let start = Instant::now();
     let full_scan_matches = searcher::search_full_scan(dir, pattern, no_ignore, type_filter)?;
     let full_scan_time = start.elapsed();
 
-    // 2. Persistent: build + search
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let start = Instant::now();
@@ -367,89 +313,27 @@ fn run_bench(
     let persist_load_time = start.elapsed();
 
     let start = Instant::now();
-    let (persist_matches, _timing) = searcher::search_persistent_timed(&pidx, pattern)?;
+    let (persist_matches, _) = searcher::search_persistent_timed(&pidx, pattern)?;
     let persist_search_time = start.elapsed();
 
-    // 3. External tools
     let grep_time = bench_external("grep", &["-rn", pattern, &dir.to_string_lossy()]);
     let ag_time = bench_external("ag", &["--nocolor", pattern, &dir.to_string_lossy()]);
     let rg_time = bench_external("rg", &["-n", pattern, &dir.to_string_lossy()]);
     let ugrep_time = bench_external("ugrep", &["-rn", pattern, &dir.to_string_lossy()]);
 
-    // Print results
     println!();
-    println!(
-        "{:<35} {:>10} {:>10} {:>8}",
-        "Tool", "Time", "Matches", "Index?"
-    );
+    println!("{:<35} {:>10} {:>10} {:>8}", "Tool", "Time", "Matches", "Index?");
     println!("{}", "-".repeat(67));
-
-    // fast-grep variants
-    println!(
-        "{:<35} {:>10} {:>10} {:>8}",
-        "fgr (no index)",
-        format_duration(full_scan_time),
-        full_scan_matches.len(),
-        "no"
-    );
-    println!(
-        "{:<35} {:>10} {:>10} {:>8}",
-        "fgr --index (load+search)",
-        format_duration(persist_load_time + persist_search_time),
-        persist_matches.len(),
-        "yes"
-    );
-    println!(
-        "{:<35} {:>10} {:>10} {:>8}",
-        "  index build (one-time cost)",
-        format_duration(persist_build_time),
-        "-",
-        "-"
-    );
-
+    println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), full_scan_matches.len(), "no");
+    println!("{:<35} {:>10} {:>10} {:>8}", "fgr --index (load+search)", format_duration(persist_load_time + persist_search_time), persist_matches.len(), "yes");
+    println!("{:<35} {:>10} {:>10} {:>8}", "  index build (one-time cost)", format_duration(persist_build_time), "-", "-");
     println!("{}", "-".repeat(67));
+    if let Some(t) = grep_time { println!("{:<35} {:>10} {:>10} {:>8}", "grep -rn", format_duration(t), "?", "no"); }
+    if let Some(t) = ag_time { println!("{:<35} {:>10} {:>10} {:>8}", "ag (the_silver_searcher)", format_duration(t), "?", "no"); }
+    if let Some(t) = rg_time { println!("{:<35} {:>10} {:>10} {:>8}", "rg (ripgrep)", format_duration(t), "?", "no"); }
+    if let Some(t) = ugrep_time { println!("{:<35} {:>10} {:>10} {:>8}", "ugrep", format_duration(t), "?", "no"); }
 
-    // External tools
-    if let Some(t) = grep_time {
-        println!(
-            "{:<35} {:>10} {:>10} {:>8}",
-            "grep -rn",
-            format_duration(t),
-            "?",
-            "no"
-        );
-    }
-    if let Some(t) = ag_time {
-        println!(
-            "{:<35} {:>10} {:>10} {:>8}",
-            "ag (the_silver_searcher)",
-            format_duration(t),
-            "?",
-            "no"
-        );
-    }
-    if let Some(t) = rg_time {
-        println!(
-            "{:<35} {:>10} {:>10} {:>8}",
-            "rg (ripgrep)",
-            format_duration(t),
-            "?",
-            "no"
-        );
-    }
-    if let Some(t) = ugrep_time {
-        println!(
-            "{:<35} {:>10} {:>10} {:>8}",
-            "ugrep",
-            format_duration(t),
-            "?",
-            "no"
-        );
-    }
-
-    // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
-
     Ok(())
 }
 
@@ -468,11 +352,7 @@ fn bench_external(cmd: &str, args: &[&str]) -> Option<std::time::Duration> {
 
 fn format_duration(d: std::time::Duration) -> String {
     let ms = d.as_secs_f64() * 1000.0;
-    if ms < 1.0 {
-        format!("{:.1}us", ms * 1000.0)
-    } else if ms < 1000.0 {
-        format!("{:.1}ms", ms)
-    } else {
-        format!("{:.2}s", ms / 1000.0)
-    }
+    if ms < 1.0 { format!("{:.1}us", ms * 1000.0) }
+    else if ms < 1000.0 { format!("{:.1}ms", ms) }
+    else { format!("{:.2}s", ms / 1000.0) }
 }
