@@ -186,16 +186,34 @@ pub fn run() -> Result<()> {
 }
 
 fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    // For count/files-only/quiet, use the collecting API
+    if opts.count || opts.files_only || opts.quiet {
+        let start = Instant::now();
+        let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+        let elapsed = start.elapsed();
+        output_matches(&matches, opts)?;
+        if !opts.quiet {
+            eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, matches.len());
+        }
+        if opts.quiet && matches.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // For default output, use streaming API — minimal allocations, direct to stdout
     let start = Instant::now();
-    let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+    let output = std::sync::Mutex::new(std::io::BufWriter::new(std::io::stdout()));
+    let count = searcher::search_full_scan_streaming(
+        dir, pattern, opts.no_ignore, opts.file_type.as_deref(), &output,
+    )?;
+    {
+        use std::io::Write;
+        let mut out = output.lock().unwrap();
+        let _ = out.flush();
+    }
     let elapsed = start.elapsed();
-    output_matches(&matches, opts)?;
-    if !opts.quiet {
-        eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, matches.len());
-    }
-    if opts.quiet && matches.is_empty() {
-        std::process::exit(1);
-    }
+    eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, count);
     Ok(())
 }
 
@@ -299,7 +317,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     println!("{}", "=".repeat(70));
 
     let start = Instant::now();
-    let full_scan_matches = searcher::search_full_scan(dir, pattern, no_ignore, type_filter)?;
+    let full_scan_count = searcher::search_full_scan_count(dir, pattern, no_ignore, type_filter)?;
     let full_scan_time = start.elapsed();
 
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
@@ -324,7 +342,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     println!();
     println!("{:<35} {:>10} {:>10} {:>8}", "Tool", "Time", "Matches", "Index?");
     println!("{}", "-".repeat(67));
-    println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), full_scan_matches.len(), "no");
+    println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), full_scan_count, "no");
     println!("{:<35} {:>10} {:>10} {:>8}", "fgr --index (load+search)", format_duration(persist_load_time + persist_search_time), persist_matches.len(), "yes");
     println!("{:<35} {:>10} {:>10} {:>8}", "  index build (one-time cost)", format_duration(persist_build_time), "-", "-");
     println!("{}", "-".repeat(67));

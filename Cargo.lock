@@ -306,6 +306,7 @@ dependencies = [
 name = "fast-grep"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "base64",
  "byteorder",
