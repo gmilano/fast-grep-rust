@@ -1,34 +1,57 @@
 # fast-grep
 
-> Regex search with a sparse n-gram inverted index. Beats ripgrep on filtered patterns by 5–14×.
+> Regex search with a sparse n-gram inverted index. Beats ripgrep by 4–9x on indexed corpora.
 
 ## How it works
 
 Instead of scanning every file, fast-grep builds a **sparse n-gram inverted index** over your codebase. When you search, it narrows the candidate set to a small fraction of files before running the regex engine.
 
-Three layers of filtering:
+### Filtering pipeline
 
-1. **Sparse n-grams** — variable-length substrings weighted by bigram rarity (rare pairs → longer, more specific n-grams → fewer false positives)
-2. **Roaring Bitmaps** — compressed posting lists; intersection is a bitwise AND, not a set walk
-3. **Position masks** (Blackbird algorithm) — two 8-bit bloom filters per (n-gram, document) entry: one for position mod 8, one for the following character. Eliminates false positives caused by non-adjacent n-gram matches.
+1. **Sparse n-grams** — variable-length substrings weighted by corpus-adaptive bigram rarity. Rare character pairs produce longer, more specific n-grams with fewer false positives than fixed trigrams.
+2. **Roaring Bitmaps** — compressed posting lists; candidate intersection is a bitwise AND, not a linear scan.
+3. **Position masks** (Blackbird algorithm) — two 8-bit bloom filters per (n-gram, document) entry encode position and successor character. Eliminates false positives from non-adjacent n-gram matches.
+4. **Literal pre-filter** — SIMD-accelerated `memchr`/`memmem` and Aho-Corasick multi-pattern matching skip the regex engine entirely for literal patterns.
+5. **Parallel verification** — Rayon work-stealing pool verifies candidates using the `regex` crate (Teddy SIMD, auto-enabled with `target-cpu=native`).
 
-The index is persisted to disk as two binary files (`ngrams.lookup` + `ngrams.postings`) and memory-mapped at query time — load latency is ~20ms regardless of corpus size.
-
-Verification of candidates runs in parallel via Rayon using the `regex` crate (Teddy SIMD algorithm, auto-enabled with `target-cpu=native`).
+The index is persisted to disk as two binary files (`ngrams.lookup` + `ngrams.postings`) and memory-mapped at query time — load latency is ~18ms regardless of corpus size.
 
 ## Benchmark — Linux kernel 6.6 (81,690 files)
 
-| Pattern | ripgrep | fast-grep persistent | Speedup |
-|---------|---------|----------------------|---------|
-| `TODO` | 1.80s | **130ms** | **13.9×** |
-| `EXPORT_SYMBOL` | 1.50s | **163ms** | **9.2×** |
-| `int main` | 1.86s | **391ms** | **4.8×** |
-| `static.*inline` | 2.12s | **411ms** | **5.2×** |
-| `printk` | 1.84s | **192ms** | **9.6×** |
+**Hardware:** Apple M1 Pro, 32 GB RAM | **Date:** 2026-04-06
 
-> `printk` is the worst case — it appears in ~40k files, so the index can't filter much. The position mask filter closes this gap significantly.
+### With persistent index
 
-Index build is a one-time cost (~66s for the Linux kernel). Subsequent searches load in ~22ms.
+| Pattern | ripgrep | fast-grep | Speedup |
+|---------|---------|-----------|---------|
+| `EXPORT_SYMBOL` | 2.13s | **269ms** | **7.9x** |
+| `TODO` | 2.24s | **254ms** | **8.8x** |
+| `printk` | 2.25s | **304ms** | **7.4x** |
+| `static.*inline` | 1.91s | **444ms** | **4.3x** |
+| `int main` | 2.64s | **339ms** | **7.8x** |
+
+### Time breakdown (typical query)
+
+| Phase | Time | Description |
+|-------|------|-------------|
+| Lookup | 0.38ms | Hash n-grams → fetch posting lists from mmap'd file |
+| Intersection | 3.6ms | Roaring bitmap AND + position mask filtering |
+| Verify | ~220ms | Parallel regex match on candidate files |
+| **Total** | **~254ms** | vs ripgrep ~2.2s |
+
+> ~98% of time is spent in verification. The index reduces candidates to <1% of files (false positive rate: 0.42%).
+
+### Without index (full scan)
+
+Without an index, fast-grep performs comparably to ripgrep (0.8–1.1x). The walker and regex engine dominate, and there's no filtering advantage.
+
+### Index operations
+
+| Operation | Time |
+|-----------|------|
+| Full build | ~60s (81,690 files) |
+| Index load (mmap) | 18ms |
+| Incremental update (10 files changed) | 707ms vs 53s rebuild (**75x faster**) |
 
 ## Install
 
@@ -36,12 +59,12 @@ Index build is a one-time cost (~66s for the Linux kernel). Subsequent searches 
 git clone https://github.com/gmilano/fast-grep-rust
 cd fast-grep-rust
 cargo build --release
-# Binary at ./target/release/fast-grep
 ```
 
-For maximum performance (enables AVX2/NEON automatically):
+The binary is at `./target/release/fgr`. For maximum performance (AVX2/NEON auto-enabled):
+
 ```bash
-# Already set in .cargo/config.toml:
+# Already configured in .cargo/config.toml:
 # rustflags = ["-C", "target-cpu=native"]
 cargo build --release
 ```
@@ -49,20 +72,20 @@ cargo build --release
 ## Usage
 
 ```bash
-# Search (builds in-memory index on first run)
-fast-grep search "EXPORT_SYMBOL" /path/to/codebase
-
 # Build persistent index
-fast-grep index /path/to/codebase --output .fgr
+fgr index /path/to/codebase --output .fgr
 
-# Search using persistent index (fast load)
-fast-grep search "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+# Search using persistent index
+fgr search "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+
+# Search without index (full scan, ripgrep-like)
+fgr search "EXPORT_SYMBOL" /path/to/codebase
 
 # Benchmark: compare full scan vs in-memory vs persistent vs ripgrep
-fast-grep bench "static.*inline" /path/to/codebase
+fgr bench "static.*inline" /path/to/codebase
 
 # Index stats
-fast-grep stats --index .fgr
+fgr stats --index .fgr
 ```
 
 ### Flags
@@ -85,7 +108,8 @@ src/
 ├── sparse.rs        # Sparse n-gram extraction (build_all + covering modes)
 ├── index.rs         # SparseIndex with Roaring Bitmaps + position masks
 ├── persist.rs       # Binary index format, mmap loading, staleness check
-├── searcher.rs      # Rayon parallel verify, full-scan baseline
+├── searcher.rs      # Rayon parallel verify, full-scan baseline, SIMD pre-filter
+├── freq_real.rs     # Corpus-adaptive bigram frequency table
 └── lib.rs           # Public API
 ```
 
@@ -99,29 +123,29 @@ src/
 └── meta.json        # version, doc count, root dir, file mtimes
 ```
 
-The lookup table is loaded into memory (~a few MB). The postings file is mmap'd — only the accessed posting lists are paged in by the OS.
+The lookup table is loaded into memory (~a few MB). The postings file is mmap'd — only accessed posting lists are paged in by the OS.
 
-## Algorithm details
+## Techniques
 
-### Sparse n-grams
+See [docs/techniques.md](docs/techniques.md) for detailed descriptions of:
+- Sparse n-grams vs classical trigrams
+- Corpus-adaptive bigram frequency table
+- Position masks (Blackbird algorithm)
+- Persistent index with mmap
+- SIMD literal pre-filtering
+- Incremental index updates
 
-A sparse n-gram starts and ends at a **local maximum** of the bigram weight function. Bigram weight = `1 - normalized_frequency`, so rare pairs (e.g. `_Z`, `>>`) have high weight and act as natural boundaries.
+See [docs/vs-ripgrep.md](docs/vs-ripgrep.md) for a detailed comparison with ripgrep.
 
-This produces fewer, longer, more specific n-grams than trigrams — especially useful for patterns with `.*` wildcards that would otherwise break trigram extraction.
+## Roadmap
 
-### Position masks (Blackbird)
-
-For each `(n-gram, document)` pair we store:
-- `loc_mask: u8` — bit `i` set if the n-gram appears at position `pos % 8 == i`
-- `next_mask: u8` — bit `next_char % 8` set for each character following the n-gram
-
-When searching for a query that decomposes into consecutive n-grams T1, T2:
-1. Load entries for T1 and T2
-2. For each document in T1: check that `next_mask(T1)` has bit `T2[0] % 8` set
-3. Check that `(loc_mask(T1) << 1) & loc_mask(T2) != 0` (must be adjacent positions)
-4. Only documents passing both filters are candidates
-
-False positives are still possible (bloom filter collisions) but the false positive rate drops dramatically for common n-grams like those in `printk`.
+- [ ] **SIMD-accelerated bitmap intersection** — AVX2/NEON intrinsics for Roaring bitmap AND operations
+- [ ] **Query plan optimizer** — choose n-gram decomposition based on posting list sizes, not just bigram rarity
+- [ ] **Multi-pattern search** — batch multiple queries in a single index pass
+- [ ] **File-type aware indexing** — separate indexes per language for type-filtered searches
+- [ ] **Daemon mode** — long-running process with filesystem watcher for instant incremental updates
+- [ ] **Compressed postings** — variable-byte or PFOR-delta encoding for smaller index files
+- [ ] **GPU verification** — offload regex matching to GPU for very large candidate sets
 
 ## Comparison with related work
 

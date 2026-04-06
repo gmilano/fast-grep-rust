@@ -170,10 +170,17 @@ impl Matcher {
 
     /// Search a buffer and return (line_number, line_text) for each match.
     /// Uses whole-buffer searching, computes line numbers only for hits.
+    /// For pure literals, SIMD memmem pre-filter skips non-matching files in O(n/32).
     #[inline]
     fn search_buffer(&self, buf: &[u8]) -> Vec<(usize, String)> {
         match self {
-            Matcher::Literal(finder) => search_literal(buf, finder),
+            Matcher::Literal(finder) => {
+                // Fast pre-filter: single SIMD scan to reject non-matching files
+                if finder.find(buf).is_none() {
+                    return Vec::new();
+                }
+                search_literal(buf, finder)
+            }
             Matcher::Regex(re) => search_regex(buf, re),
             Matcher::LiteralThenRegex { finder, regex } => {
                 if finder.find(buf).is_none() {
@@ -210,6 +217,10 @@ impl Matcher {
     fn count_lines(&self, buf: &[u8]) -> usize {
         match self {
             Matcher::Literal(finder) => {
+                // Fast pre-filter: single SIMD scan rejects non-matching files
+                if finder.find(buf).is_none() {
+                    return 0;
+                }
                 let mut count = 0;
                 let mut offset = 0;
                 while let Some(pos) = finder.find(&buf[offset..]) {
@@ -377,14 +388,15 @@ impl Searcher {
         let matches: Vec<Match> = candidates
             .par_iter()
             .flat_map(|path| {
-                let buf = match std::fs::read(path) {
-                    Ok(b) => b,
-                    Err(_) => return Vec::new(),
+                let mmap = match open_mmap(path) {
+                    Some(m) => m,
+                    None => return Vec::new(),
                 };
-                if is_binary(&buf) {
+                let buf = &*mmap;
+                if !is_known_text_ext(path) && is_binary(buf) {
                     return Vec::new();
                 }
-                let hits = matcher.search_buffer(&buf);
+                let hits = matcher.search_buffer(buf);
                 if hits.is_empty() {
                     return Vec::new();
                 }
@@ -409,14 +421,15 @@ impl Searcher {
         let files: Vec<PathBuf> = candidates
             .par_iter()
             .filter(|path| {
-                if let Ok(buf) = std::fs::read(path) {
-                    if is_binary(&buf) {
-                        return false;
-                    }
-                    matcher.has_match(&buf)
-                } else {
-                    false
+                let mmap = match open_mmap(path) {
+                    Some(m) => m,
+                    None => return false,
+                };
+                let buf = &*mmap;
+                if !is_known_text_ext(path) && is_binary(buf) {
+                    return false;
                 }
+                matcher.has_match(buf)
             })
             .map(|p| p.to_path_buf())
             .collect();
@@ -444,32 +457,15 @@ pub fn search_persistent_count(
     }
 
     let t_verify = std::time::Instant::now();
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let chunk_size = (candidates.len() / nthreads).max(64);
-
+    // Persistent index already skips binary files at build time — no binary check needed.
     let count: usize = candidates
-        .par_chunks(chunk_size)
-        .map(|chunk| {
-            let mut total = 0usize;
-            let mut buf = Vec::with_capacity(128 * 1024);
-            for path in chunk {
-                buf.clear();
-                let mut f = match std::fs::File::open(path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                use std::io::Read;
-                if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
-                    continue;
-                }
-                if is_binary(&buf) {
-                    continue;
-                }
-                total += matcher.count_lines(&buf);
-            }
-            total
+        .par_iter()
+        .map(|path| {
+            let mmap = match open_mmap(path) {
+                Some(m) => m,
+                None => return 0,
+            };
+            matcher.count_lines(&mmap)
         })
         .sum();
 
@@ -513,18 +509,19 @@ pub fn search_persistent_timed(
     }
 
     let t_verify = std::time::Instant::now();
-    let matches: Vec<Match> = candidates
+    // Persistent index already skips binary files at build time — no binary check needed.
+    // Sort candidates by path for better filesystem I/O locality.
+    let mut sorted_candidates = candidates;
+    sorted_candidates.sort_unstable();
+
+    let matches: Vec<Match> = sorted_candidates
         .par_iter()
         .flat_map(|path| {
             let mmap = match open_mmap(path) {
                 Some(m) => m,
                 None => return Vec::new(),
             };
-            let buf = &*mmap;
-            if is_binary(buf) {
-                return Vec::new();
-            }
-            let hits = matcher.search_buffer(buf);
+            let hits = matcher.search_buffer(&mmap);
             if hits.is_empty() {
                 return Vec::new();
             }
