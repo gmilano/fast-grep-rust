@@ -334,23 +334,43 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern)?;
     let persist_search_time = start.elapsed();
 
+    // Get rg match count for correctness comparison
+    let rg_count = bench_external_count("rg", &["-c", "--no-filename", pattern, &dir.to_string_lossy()]);
     let grep_time = bench_external("grep", &["-rn", pattern, &dir.to_string_lossy()]);
     let ag_time = bench_external("ag", &["--nocolor", pattern, &dir.to_string_lossy()]);
     let rg_time = bench_external("rg", &["-n", pattern, &dir.to_string_lossy()]);
     let ugrep_time = bench_external("ugrep", &["-rn", pattern, &dir.to_string_lossy()]);
 
+    // Strategy info
+    let strategy_label = if timing.strategy.is_empty() { "unknown".to_string() } else { timing.strategy.clone() };
+    println!();
+    println!("  Strategy: {} (density={:.1} lines/file)", strategy_label, timing.density);
+
+    // Match correctness vs rg
+    let fg_count = persist_matches.len();
+    if let Some(rg_c) = rg_count {
+        if fg_count == rg_c {
+            println!("  Matches: {} \u{2713} (matches rg count)", format_num(fg_count));
+        } else {
+            println!("  MISMATCH: fg={} rg={}", format_num(fg_count), format_num(rg_c));
+        }
+    } else {
+        println!("  Matches: {} (rg not available for comparison)", format_num(fg_count));
+    }
+
     println!();
     println!("{:<35} {:>10} {:>10} {:>8}", "Tool", "Time", "Matches", "Index?");
     println!("{}", "-".repeat(67));
-    println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), full_scan_count, "no");
-    println!("{:<35} {:>10} {:>10} {:>8}", "fgr --index (line-level)", format_duration(persist_load_time + persist_search_time), persist_matches.len(), "yes");
+    println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), format_num(full_scan_count), "no");
+    let index_label = format!("fgr --index ({})", strategy_label);
+    println!("{:<35} {:>10} {:>10} {:>8}", index_label, format_duration(persist_load_time + persist_search_time), format_num(fg_count), "yes");
     println!("{:<35} {:>10} {:>10} {:>8}", "  index build (one-time cost)", format_duration(persist_build_time), "-", "-");
     println!("  Timing breakdown: lookup={:.1}ms intersect={:.1}ms verify={:.1}ms candidates={}",
         timing.lookup_ms, timing.bitmap_intersect_ms, timing.verify_ms, timing.candidates);
     println!("{}", "-".repeat(67));
     if let Some(t) = grep_time { println!("{:<35} {:>10} {:>10} {:>8}", "grep -rn", format_duration(t), "?", "no"); }
     if let Some(t) = ag_time { println!("{:<35} {:>10} {:>10} {:>8}", "ag (the_silver_searcher)", format_duration(t), "?", "no"); }
-    if let Some(t) = rg_time { println!("{:<35} {:>10} {:>10} {:>8}", "rg (ripgrep)", format_duration(t), "?", "no"); }
+    if let Some(t) = rg_time { println!("{:<35} {:>10} {:>10} {:>8}", "rg (ripgrep)", format_duration(t), rg_count.map(|c| format_num(c)).unwrap_or("?".into()), "no"); }
     if let Some(t) = ugrep_time { println!("{:<35} {:>10} {:>10} {:>8}", "ugrep", format_duration(t), "?", "no"); }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -368,6 +388,41 @@ fn bench_external(cmd: &str, args: &[&str]) -> Option<std::time::Duration> {
         Ok(_) => Some(start.elapsed()),
         Err(_) => None,
     }
+}
+
+/// Run rg -c and sum the per-file counts to get total match count.
+fn bench_external_count(cmd: &str, args: &[&str]) -> Option<usize> {
+    let output = std::process::Command::new(cmd)
+        .args(args)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    let total: usize = output.stdout
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            if line.is_empty() { return None; }
+            std::str::from_utf8(line).ok()?.trim().parse::<usize>().ok()
+        })
+        .sum();
+    Some(total)
+}
+
+fn format_num(n: usize) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
 
 fn format_duration(d: std::time::Duration) -> String {

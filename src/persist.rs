@@ -100,6 +100,10 @@ pub struct SearchTiming {
     pub candidates: usize,
     pub matches: usize,
     pub ngrams_queried: usize,
+    /// Verify strategy used: "line-level", "file-level", or "file-level (fallback)"
+    pub strategy: String,
+    /// Match density (lines per file) that drove the strategy decision
+    pub density: f64,
 }
 
 // --- Line-level search result ---
@@ -327,6 +331,8 @@ impl PersistentIndex {
                     candidates: n,
                     matches: 0,
                     ngrams_queried: 0,
+                    strategy: String::new(),
+                    density: 0.0,
                 },
             );
         }
@@ -350,6 +356,8 @@ impl PersistentIndex {
                         candidates: n,
                         matches: 0,
                         ngrams_queried: 0,
+                        strategy: String::new(),
+                        density: 0.0,
                     },
                 );
             }
@@ -420,6 +428,8 @@ impl PersistentIndex {
                 candidates: num_candidates,
                 matches: 0,
                 ngrams_queried,
+                strategy: String::new(),
+                density: 0.0,
             },
         )
     }

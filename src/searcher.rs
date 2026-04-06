@@ -449,42 +449,68 @@ pub fn search_persistent_count(
         SearchResult::LineHits(hits) => {
             if hits.is_empty() {
                 timing.matches = 0;
+                timing.strategy = "line-level".into();
+                timing.density = 0.0;
                 return Ok((0, timing));
             }
-            // Group by file path for efficient mmap
             let mut by_file: HashMap<&Path, Vec<u32>> = HashMap::new();
             for hit in &hits {
                 by_file.entry(hit.path).or_default().push(hit.byte_offset);
             }
+            let total_line_hits = hits.len();
+            let unique_files = by_file.len();
+            let density = total_line_hits as f64 / unique_files.max(1) as f64;
+            timing.density = density;
+
             let file_groups: Vec<_> = by_file.into_iter().collect();
-            file_groups
-                .par_iter()
-                .map(|(path, offsets)| {
-                    let mmap = match open_mmap(path) {
-                        Some(m) => m,
-                        None => return 0,
-                    };
-                    offsets
-                        .iter()
-                        .filter(|&&byte_offset| {
-                            let start = byte_offset as usize;
-                            if start >= mmap.len() {
-                                return false;
-                            }
-                            let end = memchr::memchr(b'\n', &mmap[start..])
-                                .map(|p| start + p)
-                                .unwrap_or(mmap.len());
-                            matcher.has_match(&mmap[start..end])
-                        })
-                        .count()
-                })
-                .sum()
+
+            if density > 10.0 {
+                timing.strategy = "file-level".into();
+                file_groups
+                    .par_iter()
+                    .map(|(path, _offsets)| {
+                        let mmap = match open_mmap(path) {
+                            Some(m) => m,
+                            None => return 0,
+                        };
+                        matcher.count_lines(&mmap)
+                    })
+                    .sum()
+            } else {
+                timing.strategy = "line-level".into();
+                file_groups
+                    .par_iter()
+                    .map(|(path, offsets)| {
+                        let mmap = match open_mmap(path) {
+                            Some(m) => m,
+                            None => return 0,
+                        };
+                        offsets
+                            .iter()
+                            .filter(|&&byte_offset| {
+                                let start = byte_offset as usize;
+                                if start >= mmap.len() {
+                                    return false;
+                                }
+                                let end = memchr::memchr(b'\n', &mmap[start..])
+                                    .map(|p| start + p)
+                                    .unwrap_or(mmap.len());
+                                matcher.has_match(&mmap[start..end])
+                            })
+                            .count()
+                    })
+                    .sum()
+            }
         }
         SearchResult::AllFiles(paths) => {
             if paths.is_empty() {
                 timing.matches = 0;
+                timing.strategy = "file-level (fallback)".into();
+                timing.density = 0.0;
                 return Ok((0, timing));
             }
+            timing.strategy = "file-level (fallback)".into();
+            timing.density = 0.0;
             paths
                 .par_iter()
                 .map(|path| {
@@ -536,6 +562,8 @@ pub fn search_persistent_timed(
         SearchResult::LineHits(hits) => {
             if hits.is_empty() {
                 timing.matches = 0;
+                timing.strategy = "line-level".into();
+                timing.density = 0.0;
                 return Ok((Vec::new(), timing));
             }
             // Group by file path for efficient mmap (one mmap per file)
@@ -546,46 +574,83 @@ pub fn search_persistent_timed(
                     .or_default()
                     .push((hit.line_no, hit.byte_offset));
             }
+            let total_line_hits = hits.len();
+            let unique_files = by_file.len();
+            let density = total_line_hits as f64 / unique_files.max(1) as f64;
+            timing.density = density;
+
             let file_groups: Vec<_> = by_file.into_iter().collect();
 
-            file_groups
-                .par_iter()
-                .flat_map(|(path, lines)| {
-                    let mmap = match open_mmap(path) {
-                        Some(m) => m,
-                        None => return Vec::new(),
-                    };
-                    let path_buf = path.to_path_buf();
-                    let mut file_matches = Vec::new();
-                    for &(line_no, byte_offset) in lines {
-                        let start = byte_offset as usize;
-                        if start >= mmap.len() {
-                            continue;
+            if density > 10.0 {
+                // High density: file-level verify (read whole file once)
+                timing.strategy = "file-level".into();
+                file_groups
+                    .par_iter()
+                    .flat_map(|(path, _lines)| {
+                        let mmap = match open_mmap(path) {
+                            Some(m) => m,
+                            None => return Vec::new(),
+                        };
+                        let hits = matcher.search_buffer(&mmap);
+                        if hits.is_empty() {
+                            return Vec::new();
                         }
-                        let end = memchr::memchr(b'\n', &mmap[start..])
-                            .map(|p| start + p)
-                            .unwrap_or(mmap.len());
-                        let line_bytes = &mmap[start..end];
-                        if matcher.has_match(line_bytes) {
-                            let line =
-                                String::from_utf8_lossy(line_bytes).into_owned();
-                            file_matches.push(Match {
+                        let path_buf = path.to_path_buf();
+                        hits.into_iter()
+                            .map(|(ln, line)| Match {
                                 path: path_buf.clone(),
-                                line_number: line_no as usize,
+                                line_number: ln,
                                 line,
-                            });
+                            })
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                // Low density: line-level verify (read only candidate lines)
+                timing.strategy = "line-level".into();
+                file_groups
+                    .par_iter()
+                    .flat_map(|(path, lines)| {
+                        let mmap = match open_mmap(path) {
+                            Some(m) => m,
+                            None => return Vec::new(),
+                        };
+                        let path_buf = path.to_path_buf();
+                        let mut file_matches = Vec::new();
+                        for &(line_no, byte_offset) in lines {
+                            let start = byte_offset as usize;
+                            if start >= mmap.len() {
+                                continue;
+                            }
+                            let end = memchr::memchr(b'\n', &mmap[start..])
+                                .map(|p| start + p)
+                                .unwrap_or(mmap.len());
+                            let line_bytes = &mmap[start..end];
+                            if matcher.has_match(line_bytes) {
+                                let line =
+                                    String::from_utf8_lossy(line_bytes).into_owned();
+                                file_matches.push(Match {
+                                    path: path_buf.clone(),
+                                    line_number: line_no as usize,
+                                    line,
+                                });
+                            }
                         }
-                    }
-                    file_matches
-                })
-                .collect()
+                        file_matches
+                    })
+                    .collect()
+            }
         }
         SearchResult::AllFiles(paths) => {
             if paths.is_empty() {
                 timing.matches = 0;
+                timing.strategy = "file-level (fallback)".into();
+                timing.density = 0.0;
                 return Ok((Vec::new(), timing));
             }
             // Fallback: full-file verify (pattern too short for trigrams)
+            timing.strategy = "file-level (fallback)".into();
+            timing.density = 0.0;
             paths
                 .par_iter()
                 .flat_map(|path| {
