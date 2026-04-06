@@ -19,10 +19,11 @@ pub struct SearchStats {
     pub false_positive_rate: f64,
 }
 
-/// A posting entry: (doc_id, line_no, byte_offset).
+/// A posting entry: (doc_id, line_no, byte_offset, line_prefix).
 /// - line_no: 1-based line number where this trigram appears
 /// - byte_offset: byte offset of the start of that line in the file
-pub type Posting = (u32, u32, u32);
+/// - line_prefix: first 4 bytes of the line (zero-padded if shorter)
+pub type Posting = (u32, u32, u32, [u8; 4]);
 
 pub struct SparseIndex {
     /// Trigram → list of (doc_id, line_no, byte_offset)
@@ -61,15 +62,18 @@ impl SparseIndex {
 
             if line.len() >= 3 {
                 let byte_offset = line_start as u32;
+                let mut prefix = [0u8; 4];
+                let copy_len = line.len().min(4);
+                prefix[..copy_len].copy_from_slice(&line[..copy_len]);
                 for w in line.windows(3) {
                     let tri = [w[0], w[1], w[2]];
                     let entry = self.ngrams.entry(tri).or_default();
                     // Dedup: only one posting per (doc_id, line_no) per trigram
                     if entry
                         .last()
-                        .map_or(true, |&(d, l, _)| d != doc_id || l != line_no)
+                        .map_or(true, |&(d, l, _, _)| d != doc_id || l != line_no)
                     {
-                        entry.push((doc_id, line_no, byte_offset));
+                        entry.push((doc_id, line_no, byte_offset, prefix));
                     }
                 }
             }
@@ -143,7 +147,7 @@ impl SparseIndex {
             };
             let mut candidates: HashSet<(u32, u32)> = first_postings
                 .iter()
-                .map(|&(doc_id, line_no, _)| (doc_id, line_no))
+                .map(|&(doc_id, line_no, _, _)| (doc_id, line_no))
                 .collect();
 
             for tri in &sorted[1..] {
@@ -153,7 +157,7 @@ impl SparseIndex {
                 if let Some(postings) = self.ngrams.get(*tri) {
                     let line_set: HashSet<(u32, u32)> = postings
                         .iter()
-                        .map(|&(doc_id, line_no, _)| (doc_id, line_no))
+                        .map(|&(doc_id, line_no, _, _)| (doc_id, line_no))
                         .collect();
                     candidates.retain(|k| line_set.contains(k));
                 } else {
@@ -185,7 +189,7 @@ impl SparseIndex {
         let estimated_ram: usize = self
             .ngrams
             .iter()
-            .map(|(_, v)| 3 + v.len() * 12 + 48) // key + Vec<(u32,u32,u32)> + overhead
+            .map(|(_, v)| 3 + v.len() * 16 + 48) // key + Vec<(u32,u32,u32,[u8;4])> + overhead
             .sum();
         let avg_len = if num_ngrams > 0 {
             self.ngrams.values().map(|v| v.len() as f64).sum::<f64>() / num_ngrams as f64

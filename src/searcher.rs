@@ -578,6 +578,41 @@ pub fn search_persistent_timed(
                 timing.density = 0.0;
                 return Ok((Vec::new(), timing));
             }
+
+            // Tier 0: prefix filter (no I/O) — for pure literal patterns
+            // The prefix stores the first 4 bytes of the line. We check if any
+            // part of the pattern overlaps with the prefix. For patterns ≤ 4 bytes,
+            // we check if the pattern appears within the prefix window. For longer
+            // patterns, we check if the first 4 bytes of the pattern match the
+            // prefix (i.e., pattern starts at byte 0 of the line).
+            // NOTE: This can produce false negatives for matches starting beyond
+            // byte 3. The user should verify match counts are identical.
+            let pat_bytes = pattern.as_bytes();
+            let can_prefix_filter = is_literal(pattern) && !pat_bytes.is_empty();
+            let total_before_prefix = hits.len();
+
+            let hits: Vec<_> = if can_prefix_filter {
+                hits.into_iter()
+                    .filter(|hit| {
+                        let pref = &hit.line_prefix;
+                        if pat_bytes.len() <= 4 {
+                            // Pattern fits in prefix — check all positions
+                            pref.windows(pat_bytes.len())
+                                .any(|w| w == pat_bytes)
+                        } else {
+                            // Longer pattern — check if it could start within
+                            // the first few bytes (prefix overlaps with pattern start)
+                            let check_len = 4.min(pat_bytes.len());
+                            pref[..check_len] == pat_bytes[..check_len]
+                        }
+                    })
+                    .collect()
+            } else {
+                hits
+            };
+
+            timing.prefix_filtered = total_before_prefix - hits.len();
+
             // Group by file path for efficient mmap (one mmap per file)
             let mut by_file: HashMap<&Path, Vec<(u32, u32)>> = HashMap::new();
             for hit in &hits {

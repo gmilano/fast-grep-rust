@@ -38,11 +38,11 @@ fn read_u64_le(data: &[u8], off: usize) -> u64 {
 }
 
 /// Sorted merge intersection of two sorted line-posting slices.
-/// Intersects on (doc_id, line_no), keeps byte_offset from `a`.
+/// Intersects on (doc_id, line_no), keeps byte_offset and prefix from `a`.
 fn sorted_intersect_lines(
-    a: &[(u32, u32, u32)],
-    b: &[(u32, u32, u32)],
-) -> Vec<(u32, u32, u32)> {
+    a: &[(u32, u32, u32, [u8; 4])],
+    b: &[(u32, u32, u32, [u8; 4])],
+) -> Vec<(u32, u32, u32, [u8; 4])> {
     let mut result = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -63,9 +63,9 @@ fn sorted_intersect_lines(
 
 /// Merge two sorted line-posting slices into a new sorted Vec (union).
 fn merge_sorted_lines(
-    a: &[(u32, u32, u32)],
-    b: &[(u32, u32, u32)],
-) -> Vec<(u32, u32, u32)> {
+    a: &[(u32, u32, u32, [u8; 4])],
+    b: &[(u32, u32, u32, [u8; 4])],
+) -> Vec<(u32, u32, u32, [u8; 4])> {
     let mut result = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -106,6 +106,8 @@ pub struct SearchTiming {
     pub strategy: String,
     /// Match density (lines per file) that drove the strategy decision
     pub density: f64,
+    /// Number of candidates eliminated by the 4-byte line prefix filter (no I/O)
+    pub prefix_filtered: usize,
 }
 
 // --- Line-level search result ---
@@ -114,6 +116,7 @@ pub struct LineHit<'a> {
     pub path: &'a Path,
     pub line_no: u32,
     pub byte_offset: u32,
+    pub line_prefix: [u8; 4],
 }
 
 /// Search result from the index: either precise line-level hits or fallback to all files.
@@ -152,7 +155,7 @@ pub struct LookupEntry {
 }
 
 const LOOKUP_ENTRY_SIZE: usize = 4 + 8 + 4; // 16 bytes
-const POSTING_ENTRY_SIZE: usize = 12; // doc_id(u32) + line_no(u32) + byte_offset(u32)
+const POSTING_ENTRY_SIZE: usize = 16; // doc_id(u32) + line_no(u32) + byte_offset(u32) + prefix([u8;4])
 
 pub struct PersistentIndex {
     /// Main lookup table — memory-mapped for zero-copy binary search
@@ -300,7 +303,7 @@ impl PersistentIndex {
     }
 
     /// Extract sorted line postings from raw posting bytes, excluding deleted docs.
-    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32)> {
+    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32, [u8; 4])> {
         let num = data.len() / POSTING_ENTRY_SIZE;
         let mut postings = Vec::with_capacity(num);
         for i in 0..num {
@@ -309,7 +312,9 @@ impl PersistentIndex {
             if !self.deleted_docs.contains(&doc_id) {
                 let line_no = read_u32_le(data, base + 4);
                 let byte_offset = read_u32_le(data, base + 8);
-                postings.push((doc_id, line_no, byte_offset));
+                let mut prefix = [0u8; 4];
+                prefix.copy_from_slice(&data[base + 12..base + 16]);
+                postings.push((doc_id, line_no, byte_offset, prefix));
             }
         }
         postings
@@ -320,7 +325,7 @@ impl PersistentIndex {
         &self,
         data: &[u8],
         filter: &RoaringBitmap,
-    ) -> Vec<(u32, u32, u32)> {
+    ) -> Vec<(u32, u32, u32, [u8; 4])> {
         let num = data.len() / POSTING_ENTRY_SIZE;
         let mut postings = Vec::with_capacity(num / 4); // expect significant filtering
         for i in 0..num {
@@ -329,7 +334,9 @@ impl PersistentIndex {
             if filter.contains(doc_id) && !self.deleted_docs.contains(&doc_id) {
                 let line_no = read_u32_le(data, base + 4);
                 let byte_offset = read_u32_le(data, base + 8);
-                postings.push((doc_id, line_no, byte_offset));
+                let mut prefix = [0u8; 4];
+                prefix.copy_from_slice(&data[base + 12..base + 16]);
+                postings.push((doc_id, line_no, byte_offset, prefix));
             }
         }
         postings
@@ -341,7 +348,7 @@ impl PersistentIndex {
         &self,
         hash: u32,
         filter: &RoaringBitmap,
-    ) -> Option<Vec<(u32, u32, u32)>> {
+    ) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
         let main = self.main_posting_data(hash);
         let delta = self.delta_posting_data(hash);
 
@@ -372,7 +379,7 @@ impl PersistentIndex {
     }
 
     /// Get merged (main + delta) sorted line postings for a trigram hash.
-    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32)>> {
+    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
         let main = self.main_posting_data(hash);
         let delta = self.delta_posting_data(hash);
 
@@ -437,12 +444,13 @@ impl PersistentIndex {
                     ngrams_queried: 0,
                     strategy: String::new(),
                     density: 0.0,
+                    prefix_filtered: 0,
                 },
             );
         }
 
         let mut ngrams_queried = 0usize;
-        let mut result_lines: Vec<(u32, u32, u32)> = Vec::new();
+        let mut result_lines: Vec<(u32, u32, u32, [u8; 4])> = Vec::new();
         let mut bitmap_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
         let has_bitmaps = self.bitmap_mmap.is_some();
@@ -463,6 +471,7 @@ impl PersistentIndex {
                         ngrams_queried: 0,
                         strategy: String::new(),
                         density: 0.0,
+                        prefix_filtered: 0,
                     },
                 );
             }
@@ -528,6 +537,7 @@ impl PersistentIndex {
                             ngrams_queried,
                             strategy: String::new(),
                             density: 0.0,
+                            prefix_filtered: 0,
                         },
                     );
                 }
@@ -537,7 +547,7 @@ impl PersistentIndex {
                 let bm_selectivity =
                     bm_card as f64 / self.num_docs().max(1) as f64;
 
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = if bm_selectivity < 0.5 {
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = if bm_selectivity < 0.5 {
                     // Bitmap is selective — use filtered extraction
                     hashes
                         .par_iter()
@@ -556,7 +566,7 @@ impl PersistentIndex {
                     continue;
                 }
 
-                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -573,7 +583,7 @@ impl PersistentIndex {
                 // === Fallback: original sorted merge approach (no bitmap files) ===
 
                 let t_lookup = Instant::now();
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
                     .par_iter()
                     .map(|&h| self.trigram_line_postings(h))
                     .collect();
@@ -584,7 +594,7 @@ impl PersistentIndex {
                 }
 
                 let t_intersect = Instant::now();
-                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -607,11 +617,12 @@ impl PersistentIndex {
         let num_candidates = result_lines.len();
         let hits: Vec<LineHit<'_>> = result_lines
             .iter()
-            .filter_map(|&(doc_id, line_no, byte_offset)| {
+            .filter_map(|&(doc_id, line_no, byte_offset, line_prefix)| {
                 self.doc_path(doc_id).map(|path| LineHit {
                     path,
                     line_no,
                     byte_offset,
+                    line_prefix,
                 })
             })
             .collect();
@@ -628,6 +639,7 @@ impl PersistentIndex {
                 ngrams_queried,
                 strategy: String::new(),
                 density: 0.0,
+                prefix_filtered: 0,
             },
         )
     }
@@ -710,10 +722,11 @@ pub fn build(
 
     for (tri, postings) in &trigram_list {
         let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-        for &(doc_id, line_no, byte_offset) in *postings {
+        for &(doc_id, line_no, byte_offset, prefix) in *postings {
             buf.write_u32::<LittleEndian>(doc_id)?;
             buf.write_u32::<LittleEndian>(line_no)?;
             buf.write_u32::<LittleEndian>(byte_offset)?;
+            buf.write_all(&prefix)?;
         }
         let len = buf.len() as u32;
         postings_file.write_all(&buf)?;
@@ -740,7 +753,7 @@ pub fn build(
 
     for (tri, postings) in &trigram_list {
         let mut bitmap = RoaringBitmap::new();
-        for &(doc_id, _, _) in *postings {
+        for &(doc_id, _, _, _) in *postings {
             bitmap.insert(doc_id);
         }
         let mut bm_buf = Vec::new();
@@ -1100,6 +1113,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             if line.len() >= 3 {
                 seen_on_line.clear();
                 let byte_offset = line_start as u32;
+                let mut prefix = [0u8; 4];
+                let copy_len = line.len().min(4);
+                prefix[..copy_len].copy_from_slice(&line[..copy_len]);
                 for w in line.windows(3) {
                     let tri = [w[0], w[1], w[2]];
                     if seen_on_line.insert(tri) {
@@ -1107,7 +1123,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
                         delta_ngrams
                             .entry(hash)
                             .or_default()
-                            .push((doc_id, line_no, byte_offset));
+                            .push((doc_id, line_no, byte_offset, prefix));
                     }
                 }
             }
@@ -1158,10 +1174,11 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
         for (hash, postings) in &sorted_ngrams {
             let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-            for &(doc_id, line_no, byte_offset) in postings {
+            for &(doc_id, line_no, byte_offset, prefix) in postings {
                 buf.write_u32::<LittleEndian>(doc_id)?;
                 buf.write_u32::<LittleEndian>(line_no)?;
                 buf.write_u32::<LittleEndian>(byte_offset)?;
+                buf.write_all(&prefix)?;
             }
             let len = buf.len() as u32;
             postings_file.write_all(&buf)?;
