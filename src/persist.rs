@@ -35,12 +35,18 @@ fn read_u64_le(data: &[u8], off: usize) -> u64 {
     ])
 }
 
-/// Sorted merge intersection of two sorted slices.
-fn sorted_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+/// Sorted merge intersection of two sorted line-posting slices.
+/// Intersects on (doc_id, line_no), keeps byte_offset from `a`.
+fn sorted_intersect_lines(
+    a: &[(u32, u32, u32)],
+    b: &[(u32, u32, u32)],
+) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+        let ka = (a[i].0, a[i].1);
+        let kb = (b[j].0, b[j].1);
+        match ka.cmp(&kb) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
@@ -53,12 +59,17 @@ fn sorted_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
-/// Merge two sorted slices into a new sorted Vec (union).
-fn merge_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+/// Merge two sorted line-posting slices into a new sorted Vec (union).
+fn merge_sorted_lines(
+    a: &[(u32, u32, u32)],
+    b: &[(u32, u32, u32)],
+) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
+        let ka = (a[i].0, a[i].1);
+        let kb = (b[j].0, b[j].1);
+        match ka.cmp(&kb) {
             std::cmp::Ordering::Less => {
                 result.push(a[i]);
                 i += 1;
@@ -91,6 +102,22 @@ pub struct SearchTiming {
     pub ngrams_queried: usize,
 }
 
+// --- Line-level search result ---
+
+pub struct LineHit<'a> {
+    pub path: &'a Path,
+    pub line_no: u32,
+    pub byte_offset: u32,
+}
+
+/// Search result from the index: either precise line-level hits or fallback to all files.
+pub enum SearchResult<'a> {
+    /// Line-level candidates from trigram intersection
+    LineHits(Vec<LineHit<'a>>),
+    /// Fallback: all files (pattern too short for trigrams)
+    AllFiles(Vec<&'a Path>),
+}
+
 // --- Index structures ---
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -117,6 +144,7 @@ pub struct LookupEntry {
 }
 
 const LOOKUP_ENTRY_SIZE: usize = 4 + 8 + 4; // 16 bytes
+const POSTING_ENTRY_SIZE: usize = 12; // doc_id(u32) + line_no(u32) + byte_offset(u32)
 
 pub struct PersistentIndex {
     /// Main lookup table — memory-mapped for zero-copy binary search
@@ -192,7 +220,7 @@ impl PersistentIndex {
         let (offset, len) = self.find_in_main_lookup(hash)?;
         let start = offset as usize;
         let end = start + len as usize;
-        if end <= self.postings_mmap.len() && (end - start) % 6 == 0 {
+        if end <= self.postings_mmap.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
             Some(&self.postings_mmap[start..end])
         } else {
             None
@@ -212,28 +240,31 @@ impl PersistentIndex {
         let entry = &self.delta_lookup[idx];
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
-        if end <= self.delta_postings.len() && (end - start) % 6 == 0 {
+        if end <= self.delta_postings.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
             Some(&self.delta_postings[start..end])
         } else {
             None
         }
     }
 
-    /// Extract sorted doc_ids from raw posting bytes, excluding deleted docs.
-    fn extract_doc_ids(&self, data: &[u8]) -> Vec<u32> {
-        let num = data.len() / 6;
-        let mut ids = Vec::with_capacity(num);
+    /// Extract sorted line postings from raw posting bytes, excluding deleted docs.
+    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32)> {
+        let num = data.len() / POSTING_ENTRY_SIZE;
+        let mut postings = Vec::with_capacity(num);
         for i in 0..num {
-            let doc_id = read_u32_le(data, i * 6);
+            let base = i * POSTING_ENTRY_SIZE;
+            let doc_id = read_u32_le(data, base);
             if !self.deleted_docs.contains(&doc_id) {
-                ids.push(doc_id);
+                let line_no = read_u32_le(data, base + 4);
+                let byte_offset = read_u32_le(data, base + 8);
+                postings.push((doc_id, line_no, byte_offset));
             }
         }
-        ids
+        postings
     }
 
-    /// Get merged (main + delta) sorted doc_ids for a trigram hash.
-    fn trigram_doc_ids(&self, hash: u32) -> Option<Vec<u32>> {
+    /// Get merged (main + delta) sorted line postings for a trigram hash.
+    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32)>> {
         let main = self.main_posting_data(hash);
         let delta = self.delta_posting_data(hash);
 
@@ -241,68 +272,53 @@ impl PersistentIndex {
             return None;
         }
 
-        let main_ids = main.map(|d| self.extract_doc_ids(d)).unwrap_or_default();
-        let delta_ids = delta.map(|d| self.extract_doc_ids(d)).unwrap_or_default();
+        let main_postings = main
+            .map(|d| self.extract_line_postings(d))
+            .unwrap_or_default();
+        let delta_postings = delta
+            .map(|d| self.extract_line_postings(d))
+            .unwrap_or_default();
 
-        let ids = if delta_ids.is_empty() {
-            main_ids
-        } else if main_ids.is_empty() {
-            delta_ids
+        let postings = if delta_postings.is_empty() {
+            main_postings
+        } else if main_postings.is_empty() {
+            delta_postings
         } else {
-            merge_sorted(&main_ids, &delta_ids)
+            merge_sorted_lines(&main_postings, &delta_postings)
         };
 
-        if ids.is_empty() {
+        if postings.is_empty() {
             None
         } else {
-            Some(ids)
+            Some(postings)
         }
-    }
-
-    /// Extract position masks for sorted candidates from raw posting data (both main + delta).
-    fn trigram_masks(&self, hash: u32, candidates: &[u32]) -> HashMap<u32, (u8, u8)> {
-        let mut masks = HashMap::with_capacity(candidates.len());
-
-        for data in [self.main_posting_data(hash), self.delta_posting_data(hash)] {
-            if let Some(data) = data {
-                let num = data.len() / 6;
-                for i in 0..num {
-                    let doc_id = read_u32_le(data, i * 6);
-                    if self.deleted_docs.contains(&doc_id) {
-                        continue;
-                    }
-                    if candidates.binary_search(&doc_id).is_ok() {
-                        let loc = data[i * 6 + 4];
-                        let next = data[i * 6 + 5];
-                        let entry = masks.entry(doc_id).or_insert((0u8, 0u8));
-                        entry.0 |= loc;
-                        entry.1 |= next;
-                    }
-                }
-            }
-        }
-
-        masks
     }
 
     // --- Search methods ---
 
     pub fn search(&self, pattern: &str) -> Vec<&Path> {
-        self.search_timed(pattern).0
+        match self.search_timed(pattern).0 {
+            SearchResult::LineHits(hits) => {
+                let mut paths: Vec<&Path> = hits.iter().map(|h| h.path).collect();
+                paths.sort();
+                paths.dedup();
+                paths
+            }
+            SearchResult::AllFiles(paths) => paths,
+        }
     }
 
-    pub fn search_timed(&self, pattern: &str) -> (Vec<&Path>, SearchTiming) {
+    pub fn search_timed(&self, pattern: &str) -> (SearchResult<'_>, SearchTiming) {
         let t0 = Instant::now();
 
         let alternatives = trigram::decompose_pattern(pattern);
-        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
         let covering_ngrams_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
             let docs = self.live_doc_ids();
             let n = docs.len();
             return (
-                docs,
+                SearchResult::AllFiles(docs),
                 SearchTiming {
                     covering_ngrams_ms,
                     lookup_ms: 0.0,
@@ -316,16 +332,16 @@ impl PersistentIndex {
         }
 
         let mut ngrams_queried = 0usize;
-        let mut result_docs: Vec<u32> = Vec::new();
+        let mut result_lines: Vec<(u32, u32, u32)> = Vec::new();
         let mut lookup_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
 
-        for (i, alt_trigrams) in alternatives.iter().enumerate() {
+        for alt_trigrams in &alternatives {
             if alt_trigrams.is_empty() {
                 let docs = self.live_doc_ids();
                 let n = docs.len();
                 return (
-                    docs,
+                    SearchResult::AllFiles(docs),
                     SearchTiming {
                         covering_ngrams_ms,
                         lookup_ms: 0.0,
@@ -344,9 +360,11 @@ impl PersistentIndex {
             let t_lookup = Instant::now();
             let hashes: Vec<u32> = alt_trigrams.iter().map(|tri| crc32fast::hash(tri)).collect();
 
-            // Parallel lookup of all trigram posting lists (Opt 3)
-            let posting_lists: Vec<Option<Vec<u32>>> =
-                hashes.par_iter().map(|&h| self.trigram_doc_ids(h)).collect();
+            // Parallel lookup of all trigram posting lists
+            let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
+                .par_iter()
+                .map(|&h| self.trigram_line_postings(h))
+                .collect();
 
             lookup_dur += t_lookup.elapsed();
 
@@ -355,75 +373,45 @@ impl PersistentIndex {
                 continue;
             }
 
-            // Phase 2: Intersection (sorted merge instead of HashSet)
+            // Phase 2: Intersection on (doc_id, line_no)
             let t_intersect = Instant::now();
-            let mut posting_lists: Vec<Vec<u32>> =
+            let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                 posting_lists.into_iter().map(|p| p.unwrap()).collect();
 
             // Sort by posting list size (smallest first for fast intersection)
             posting_lists.sort_by_key(|v| v.len());
 
-            // Intersect all lists using sorted merge
+            // Intersect all lists using sorted merge on (doc_id, line_no)
             let mut candidates = posting_lists.swap_remove(0);
             for other in &posting_lists {
                 if candidates.is_empty() {
                     break;
                 }
-                candidates = sorted_intersect(&candidates, other);
-            }
-
-            // Adjacency filtering with position masks (ordered trigrams)
-            let ordered = &ordered_alternatives[i];
-            if ordered.len() >= 2 && !candidates.is_empty() {
-                let ordered_hashes: Vec<u32> =
-                    ordered.iter().map(|tri| crc32fast::hash(tri)).collect();
-
-                // Cache masks_b from previous pair as masks_a for next pair
-                let mut prev_masks: Option<HashMap<u32, (u8, u8)>> = None;
-
-                for pair_idx in 0..ordered.len() - 1 {
-                    let masks_a = if let Some(prev) = prev_masks.take() {
-                        prev
-                    } else {
-                        self.trigram_masks(ordered_hashes[pair_idx], &candidates)
-                    };
-                    let masks_b =
-                        self.trigram_masks(ordered_hashes[pair_idx + 1], &candidates);
-
-                    candidates.retain(|doc_id| {
-                        if let (Some((_, next_a)), Some((loc_b, _))) =
-                            (masks_a.get(doc_id), masks_b.get(doc_id))
-                        {
-                            next_a & loc_b != 0
-                        } else {
-                            false
-                        }
-                    });
-
-                    prev_masks = Some(masks_b);
-
-                    if candidates.is_empty() {
-                        break;
-                    }
-                }
+                candidates = sorted_intersect_lines(&candidates, other);
             }
 
             intersect_dur += t_intersect.elapsed();
-            result_docs.extend(candidates);
+            result_lines.extend(candidates);
         }
 
-        // Dedup result docs (needed when multiple alternatives)
-        result_docs.sort();
-        result_docs.dedup();
+        // Dedup result lines on (doc_id, line_no)
+        result_lines.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        result_lines.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
-        let num_candidates = result_docs.len();
-        let paths: Vec<&Path> = result_docs
+        let num_candidates = result_lines.len();
+        let hits: Vec<LineHit<'_>> = result_lines
             .iter()
-            .filter_map(|&id| self.doc_path(id))
+            .filter_map(|&(doc_id, line_no, byte_offset)| {
+                self.doc_path(doc_id).map(|path| LineHit {
+                    path,
+                    line_no,
+                    byte_offset,
+                })
+            })
             .collect();
 
         (
-            paths,
+            SearchResult::LineHits(hits),
             SearchTiming {
                 covering_ngrams_ms,
                 lookup_ms: lookup_dur.as_secs_f64() * 1000.0,
@@ -502,7 +490,7 @@ pub fn build(
         }
     }
 
-    // Write postings and build lookup
+    // Write postings and build lookup (12 bytes per entry: doc_id + line_no + byte_offset)
     let postings_path = output.join("ngrams.postings");
     let mut postings_file = BufWriter::new(File::create(&postings_path)?);
     let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
@@ -513,11 +501,11 @@ pub fn build(
     trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
 
     for (tri, postings) in &trigram_list {
-        let mut buf = Vec::with_capacity(postings.len() * 6);
-        for &(doc_id, loc_mask, next_mask) in *postings {
+        let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
+        for &(doc_id, line_no, byte_offset) in *postings {
             buf.write_u32::<LittleEndian>(doc_id)?;
-            buf.write_u8(loc_mask)?;
-            buf.write_u8(next_mask)?;
+            buf.write_u32::<LittleEndian>(line_no)?;
+            buf.write_u32::<LittleEndian>(byte_offset)?;
         }
         let len = buf.len() as u32;
         postings_file.write_all(&buf)?;
@@ -550,7 +538,7 @@ pub fn build(
     // Write meta
     let num_docs = index.doc_ids.len();
     let meta = IndexMeta {
-        version: 2,
+        version: 3, // bump version for line-level index format
         num_docs,
         num_ngrams: index.ngrams.len(),
         root_dir: root.to_string_lossy().into_owned(),
@@ -776,7 +764,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // 5. Load existing index to get doc_ids and current delta/deleted state
     let pidx = load(index_path)?;
 
-    // Build path → doc_id mapping
+    // Build path -> doc_id mapping
     let path_to_docid: HashMap<String, u32> = (0..pidx.num_docs() as u32)
         .filter_map(|id| pidx.doc_path(id).map(|p| (p.to_string_lossy().into_owned(), id)))
         .collect();
@@ -790,8 +778,6 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     }
 
     // 7. Determine which files go in the new delta.
-    //    Delta = (existing delta files still valid) + (newly added/modified)
-    //    "Still valid" = delta doc that's not deleted/modified in this update.
     let mut delta_files_to_index: Vec<String> = Vec::new();
 
     // Keep existing delta files that haven't changed
@@ -811,7 +797,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // Drop the loaded index (releases mmap)
     drop(pidx);
 
-    // 8. Index all delta files (small set — only changed files + carried-over delta)
+    // 8. Index all delta files with line-level postings
     let mut delta_ngrams: HashMap<u32, Vec<Posting>> = HashMap::new();
     let mut delta_doc_ids: Vec<PathBuf> = Vec::new();
     let mut actual_added = 0usize;
@@ -837,34 +823,50 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         } else if modified_set.contains(path_str) {
             actual_modified += 1;
         }
-        // else: carried-over delta file, not counted as change
 
         if content.len() < 3 {
             continue;
         }
 
-        let mut masks: HashMap<[u8; 3], (u8, u8)> = HashMap::new();
-        for (pos, w) in content.windows(3).enumerate() {
-            let tri = [w[0], w[1], w[2]];
-            let loc_bit = 1u8 << (pos % 8) as u32;
-            let next_bit = 1u8 << ((pos + 1) % 8) as u32;
-            let entry = masks.entry(tri).or_insert((0u8, 0u8));
-            entry.0 |= loc_bit;
-            entry.1 |= next_bit;
-        }
+        // Line-level trigram indexing (same as SparseIndex::add_document)
+        let mut line_no = 1u32;
+        let mut line_start = 0usize;
+        let mut seen_on_line: HashSet<[u8; 3]> = HashSet::new();
 
-        for (tri, (loc_mask, next_mask)) in masks {
-            let hash = crc32fast::hash(&tri);
-            delta_ngrams
-                .entry(hash)
-                .or_default()
-                .push((doc_id, loc_mask, next_mask));
+        loop {
+            let line_end = content[line_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| line_start + p)
+                .unwrap_or(content.len());
+
+            let line = &content[line_start..line_end];
+            if line.len() >= 3 {
+                seen_on_line.clear();
+                let byte_offset = line_start as u32;
+                for w in line.windows(3) {
+                    let tri = [w[0], w[1], w[2]];
+                    if seen_on_line.insert(tri) {
+                        let hash = crc32fast::hash(&tri);
+                        delta_ngrams
+                            .entry(hash)
+                            .or_default()
+                            .push((doc_id, line_no, byte_offset));
+                    }
+                }
+            }
+
+            if line_end >= content.len() {
+                break;
+            }
+            line_start = line_end + 1;
+            line_no += 1;
         }
     }
 
-    // 9. Write delta files (small — only changed files)
+    // 9. Write delta files (small -- only changed files)
 
-    // Write deleted.bin: only main doc_ids that are deleted (delta docs are just absent)
+    // Write deleted.bin: only main doc_ids that are deleted
     let deleted_path = index_path.join("deleted.bin");
     let main_deleted: Vec<u32> = new_deleted
         .iter()
@@ -881,7 +883,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         f.flush()?;
     }
 
-    // Write delta postings + lookup
+    // Write delta postings + lookup (12 bytes per entry)
     let mut sorted_ngrams: Vec<(u32, Vec<Posting>)> = delta_ngrams.into_iter().collect();
     sorted_ngrams.sort_by_key(|(hash, _)| *hash);
 
@@ -899,11 +901,11 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         let mut offset: u64 = 0;
 
         for (hash, postings) in &sorted_ngrams {
-            let mut buf = Vec::with_capacity(postings.len() * 6);
-            for &(doc_id, loc_mask, next_mask) in postings {
+            let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
+            for &(doc_id, line_no, byte_offset) in postings {
                 buf.write_u32::<LittleEndian>(doc_id)?;
-                buf.write_u8(loc_mask)?;
-                buf.write_u8(next_mask)?;
+                buf.write_u32::<LittleEndian>(line_no)?;
+                buf.write_u32::<LittleEndian>(byte_offset)?;
             }
             let len = buf.len() as u32;
             postings_file.write_all(&buf)?;
@@ -933,7 +935,6 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
     // 10. Update meta.json with current file_mtimes
     let mut new_mtimes: HashMap<String, u64> = HashMap::with_capacity(saved_mtimes.len());
-    // Start from saved, remove deleted, update modified, add new
     for (path, &mtime) in &saved_mtimes {
         if !deleted_set.contains(path) && !modified_set.contains(path) {
             new_mtimes.insert(path.clone(), mtime);
@@ -941,8 +942,10 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     }
     for path_str in added_set.iter().chain(modified_set.iter()) {
         if let Some(&mtime) = current_files.get(path_str) {
-            // Only add if it was actually indexed (not binary)
-            if delta_doc_ids.iter().any(|p| p.to_string_lossy() == *path_str) {
+            if delta_doc_ids
+                .iter()
+                .any(|p| p.to_string_lossy() == *path_str)
+            {
                 new_mtimes.insert(path_str.clone(), mtime);
             }
         }
@@ -950,9 +953,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
     let total_docs = main_num_docs - main_deleted.len() + delta_doc_ids.len();
     let new_meta = IndexMeta {
-        version: 2,
+        version: 3,
         num_docs: total_docs,
-        num_ngrams: meta.num_ngrams, // approximate (main ngrams, not including delta)
+        num_ngrams: meta.num_ngrams,
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes: new_mtimes,

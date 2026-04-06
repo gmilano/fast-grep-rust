@@ -19,13 +19,13 @@ pub struct SearchStats {
     pub false_positive_rate: f64,
 }
 
-/// A posting entry: (doc_id, loc_mask, next_mask).
-/// - loc_mask: bitmask of (position % 8) where this trigram appears in the document
-/// - next_mask: bitmask of ((position + 1) % 8) — expected position of the next adjacent trigram
-pub type Posting = (u32, u8, u8);
+/// A posting entry: (doc_id, line_no, byte_offset).
+/// - line_no: 1-based line number where this trigram appears
+/// - byte_offset: byte offset of the start of that line in the file
+pub type Posting = (u32, u32, u32);
 
 pub struct SparseIndex {
-    /// Trigram → list of (doc_id, loc_mask, next_mask)
+    /// Trigram → list of (doc_id, line_no, byte_offset)
     pub ngrams: HashMap<[u8; 3], Vec<Posting>>,
     pub doc_ids: Vec<PathBuf>,
 }
@@ -46,24 +46,39 @@ impl SparseIndex {
             return;
         }
 
-        // Accumulate masks per trigram for this document
-        let mut masks: HashMap<[u8; 3], (u8, u8)> = HashMap::new();
+        // Index trigrams per line: one posting per (trigram, doc_id, line)
+        let mut line_no = 1u32;
+        let mut line_start = 0usize;
 
-        for (pos, w) in content.windows(3).enumerate() {
-            let tri = [w[0], w[1], w[2]];
-            let loc_bit = 1u8 << (pos % 8) as u32;
-            let next_bit = 1u8 << ((pos + 1) % 8) as u32;
+        loop {
+            let line_end = content[line_start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| line_start + p)
+                .unwrap_or(content.len());
 
-            let entry = masks.entry(tri).or_insert((0u8, 0u8));
-            entry.0 |= loc_bit;
-            entry.1 |= next_bit;
-        }
+            let line = &content[line_start..line_end];
 
-        for (tri, (loc_mask, next_mask)) in masks {
-            self.ngrams
-                .entry(tri)
-                .or_insert_with(Vec::new)
-                .push((doc_id, loc_mask, next_mask));
+            if line.len() >= 3 {
+                let byte_offset = line_start as u32;
+                for w in line.windows(3) {
+                    let tri = [w[0], w[1], w[2]];
+                    let entry = self.ngrams.entry(tri).or_default();
+                    // Dedup: only one posting per (doc_id, line_no) per trigram
+                    if entry
+                        .last()
+                        .map_or(true, |&(d, l, _)| d != doc_id || l != line_no)
+                    {
+                        entry.push((doc_id, line_no, byte_offset));
+                    }
+                }
+            }
+
+            if line_end >= content.len() {
+                break;
+            }
+            line_start = line_end + 1;
+            line_no += 1;
         }
     }
 
@@ -94,7 +109,6 @@ impl SparseIndex {
 
     fn search_inner(&self, pattern: &str) -> (Vec<&Path>, usize) {
         let alternatives = trigram::decompose_pattern(pattern);
-        let ordered_alternatives = trigram::decompose_pattern_ordered(pattern);
 
         // If no useful trigrams, fall back to full scan
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
@@ -103,9 +117,9 @@ impl SparseIndex {
             return (all, len);
         }
 
-        let mut result_docs: HashSet<u32> = HashSet::new();
+        let mut result_lines: HashSet<(u32, u32)> = HashSet::new();
 
-        for (i, alt_trigrams) in alternatives.iter().enumerate() {
+        for alt_trigrams in &alternatives {
             if alt_trigrams.is_empty() {
                 let all: Vec<&Path> = self.doc_ids.iter().map(|p| p.as_path()).collect();
                 let len = all.len();
@@ -122,81 +136,42 @@ impl SparseIndex {
             let mut sorted: Vec<&[u8; 3]> = alt_trigrams.iter().collect();
             sorted.sort_by_key(|tri| self.ngrams.get(*tri).map_or(0, |v| v.len()));
 
-            // Step 1: bitmap intersection on doc_ids only
+            // Intersect on (doc_id, line_no) — trigrams must appear on the same line
             let first_postings = match self.ngrams.get(sorted[0]) {
                 Some(p) => p,
                 None => continue,
             };
-            let mut candidate_docs: HashSet<u32> =
-                first_postings.iter().map(|&(doc_id, _, _)| doc_id).collect();
+            let mut candidates: HashSet<(u32, u32)> = first_postings
+                .iter()
+                .map(|&(doc_id, line_no, _)| (doc_id, line_no))
+                .collect();
 
             for tri in &sorted[1..] {
-                if candidate_docs.is_empty() {
+                if candidates.is_empty() {
                     break;
                 }
                 if let Some(postings) = self.ngrams.get(*tri) {
-                    let doc_set: HashSet<u32> =
-                        postings.iter().map(|&(doc_id, _, _)| doc_id).collect();
-                    candidate_docs.retain(|d| doc_set.contains(d));
+                    let line_set: HashSet<(u32, u32)> = postings
+                        .iter()
+                        .map(|&(doc_id, line_no, _)| (doc_id, line_no))
+                        .collect();
+                    candidates.retain(|k| line_set.contains(k));
                 } else {
-                    candidate_docs.clear();
+                    candidates.clear();
                     break;
                 }
             }
 
-            // Step 2: adjacency filtering using position masks (ordered trigrams)
-            // Use the ordered (non-sorted) trigrams so consecutive pairs are truly adjacent.
-            let ordered = &ordered_alternatives[i];
-            if ordered.len() >= 2 && !candidate_docs.is_empty() {
-                for pair in ordered.windows(2) {
-                    let masks_a: HashMap<u32, (u8, u8)> = self
-                        .ngrams
-                        .get(&pair[0])
-                        .map(|postings| {
-                            postings
-                                .iter()
-                                .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                                .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    let masks_b: HashMap<u32, (u8, u8)> = self
-                        .ngrams
-                        .get(&pair[1])
-                        .map(|postings| {
-                            postings
-                                .iter()
-                                .filter(|(doc_id, _, _)| candidate_docs.contains(doc_id))
-                                .map(|&(doc_id, loc, next)| (doc_id, (loc, next)))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    candidate_docs.retain(|doc_id| {
-                        if let (Some((_, next_a)), Some((loc_b, _))) =
-                            (masks_a.get(doc_id), masks_b.get(doc_id))
-                        {
-                            next_a & loc_b != 0
-                        } else {
-                            false
-                        }
-                    });
-
-                    if candidate_docs.is_empty() {
-                        break;
-                    }
-                }
-            }
-
-            if i == 0 {
-                result_docs = candidate_docs;
-            } else {
-                result_docs.extend(candidate_docs);
-            }
+            result_lines.extend(candidates);
         }
 
-        let results: Vec<&Path> = result_docs
+        // Extract unique doc_ids and map to paths
+        let mut unique_docs: HashSet<u32> = HashSet::new();
+        for &(doc_id, _) in &result_lines {
+            unique_docs.insert(doc_id);
+        }
+
+        let results: Vec<&Path> = unique_docs
             .iter()
             .filter_map(|&id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
             .collect();
@@ -210,7 +185,7 @@ impl SparseIndex {
         let estimated_ram: usize = self
             .ngrams
             .iter()
-            .map(|(_, v)| 3 + v.len() * 6 + 48) // key + Vec<(u32,u8,u8)> + overhead
+            .map(|(_, v)| 3 + v.len() * 12 + 48) // key + Vec<(u32,u32,u32)> + overhead
             .sum();
         let avg_len = if num_ngrams > 0 {
             self.ngrams.values().map(|v| v.len() as f64).sum::<f64>() / num_ngrams as f64
@@ -258,7 +233,10 @@ impl SparseIndex {
         // Phase 2: build corpus-adaptive bigram frequency table
         let _freq = crate::sparse::BigramFreq::from_corpus(&paths, 3000);
         if verbose {
-            eprintln!("  built bigram freq table from {} file sample", paths.len().min(3000));
+            eprintln!(
+                "  built bigram freq table from {} file sample",
+                paths.len().min(3000)
+            );
         }
 
         // Phase 3: index all files
@@ -297,8 +275,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    // --- TrigramIndex-equivalent tests (ported from index.test.ts) ---
-
     #[test]
     fn finds_documents_containing_a_literal_pattern() {
         let mut idx = SparseIndex::new();
@@ -327,7 +303,6 @@ mod tests {
         idx.add_document(Path::new("a.ts"), b"abc");
         idx.add_document(Path::new("b.ts"), b"def");
 
-        // Short pattern = no trigrams = fallback to all docs
         let results = idx.search("xy");
         assert_eq!(results.len(), 2);
     }
@@ -364,17 +339,14 @@ mod tests {
         idx.add_document(Path::new("b.ts"), b"import Vue from 'vue'");
         idx.add_document(Path::new("c.ts"), b"React component here");
 
-        // "React" trigrams: Rea, eac, act — should match a.ts and c.ts
         let results = idx.search("React");
         assert!(results.contains(&&*Path::new("a.ts")));
         assert!(results.contains(&&*Path::new("c.ts")));
         assert!(!results.contains(&&*Path::new("b.ts")));
     }
 
-    // --- adjacency filtering ---
-
     #[test]
-    fn adjacency_filtering_finds_real_match() {
+    fn line_level_intersection_finds_real_match() {
         let mut idx = SparseIndex::new();
         idx.add_document(
             Path::new("test1.rs"),
@@ -385,8 +357,6 @@ mod tests {
         let results = idx.search("println");
         assert!(results.contains(&&*Path::new("test1.rs")));
     }
-
-    // --- search_with_stats ---
 
     #[test]
     fn search_with_stats_returns_valid_metrics() {

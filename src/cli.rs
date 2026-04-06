@@ -331,7 +331,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let persist_load_time = start.elapsed();
 
     let start = Instant::now();
-    let (persist_matches, _) = searcher::search_persistent_timed(&pidx, pattern)?;
+    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern)?;
     let persist_search_time = start.elapsed();
 
     let grep_time = bench_external("grep", &["-rn", pattern, &dir.to_string_lossy()]);
@@ -343,8 +343,10 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     println!("{:<35} {:>10} {:>10} {:>8}", "Tool", "Time", "Matches", "Index?");
     println!("{}", "-".repeat(67));
     println!("{:<35} {:>10} {:>10} {:>8}", "fgr (no index)", format_duration(full_scan_time), full_scan_count, "no");
-    println!("{:<35} {:>10} {:>10} {:>8}", "fgr --index (load+search)", format_duration(persist_load_time + persist_search_time), persist_matches.len(), "yes");
+    println!("{:<35} {:>10} {:>10} {:>8}", "fgr --index (line-level)", format_duration(persist_load_time + persist_search_time), persist_matches.len(), "yes");
     println!("{:<35} {:>10} {:>10} {:>8}", "  index build (one-time cost)", format_duration(persist_build_time), "-", "-");
+    println!("  Timing breakdown: lookup={:.1}ms intersect={:.1}ms verify={:.1}ms candidates={}",
+        timing.lookup_ms, timing.bitmap_intersect_ms, timing.verify_ms, timing.candidates);
     println!("{}", "-".repeat(67));
     if let Some(t) = grep_time { println!("{:<35} {:>10} {:>10} {:>8}", "grep -rn", format_duration(t), "?", "no"); }
     if let Some(t) = ag_time { println!("{:<35} {:>10} {:>10} {:>8}", "ag (the_silver_searcher)", format_duration(t), "?", "no"); }

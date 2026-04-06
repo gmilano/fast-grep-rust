@@ -8,7 +8,10 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::bytes::Regex as BytesRegex;
 
+use std::collections::HashMap;
+
 use crate::index::SparseIndex;
+use crate::persist::SearchResult;
 
 #[derive(Debug, Clone)]
 pub struct Match {
@@ -174,13 +177,7 @@ impl Matcher {
     #[inline]
     fn search_buffer(&self, buf: &[u8]) -> Vec<(usize, String)> {
         match self {
-            Matcher::Literal(finder) => {
-                // Fast pre-filter: single SIMD scan to reject non-matching files
-                if finder.find(buf).is_none() {
-                    return Vec::new();
-                }
-                search_literal(buf, finder)
-            }
+            Matcher::Literal(finder) => search_literal(buf, finder),
             Matcher::Regex(re) => search_regex(buf, re),
             Matcher::LiteralThenRegex { finder, regex } => {
                 if finder.find(buf).is_none() {
@@ -217,10 +214,6 @@ impl Matcher {
     fn count_lines(&self, buf: &[u8]) -> usize {
         match self {
             Matcher::Literal(finder) => {
-                // Fast pre-filter: single SIMD scan rejects non-matching files
-                if finder.find(buf).is_none() {
-                    return 0;
-                }
                 let mut count = 0;
                 let mut offset = 0;
                 while let Some(pos) = finder.find(&buf[offset..]) {
@@ -443,31 +436,67 @@ impl Searcher {
     }
 }
 
-/// Count-optimized search: chunked parallel with buffer reuse, no String allocation.
+/// Count-optimized search: line-level verify for indexed, full-file for fallback.
 pub fn search_persistent_count(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
-    let (candidates, mut timing) = index.search_timed(pattern);
-
-    if candidates.is_empty() {
-        timing.matches = 0;
-        return Ok((0, timing));
-    }
+    let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
-    // Persistent index already skips binary files at build time — no binary check needed.
-    let count: usize = candidates
-        .par_iter()
-        .map(|path| {
-            let mmap = match open_mmap(path) {
-                Some(m) => m,
-                None => return 0,
-            };
-            matcher.count_lines(&mmap)
-        })
-        .sum();
+    let count = match result {
+        SearchResult::LineHits(hits) => {
+            if hits.is_empty() {
+                timing.matches = 0;
+                return Ok((0, timing));
+            }
+            // Group by file path for efficient mmap
+            let mut by_file: HashMap<&Path, Vec<u32>> = HashMap::new();
+            for hit in &hits {
+                by_file.entry(hit.path).or_default().push(hit.byte_offset);
+            }
+            let file_groups: Vec<_> = by_file.into_iter().collect();
+            file_groups
+                .par_iter()
+                .map(|(path, offsets)| {
+                    let mmap = match open_mmap(path) {
+                        Some(m) => m,
+                        None => return 0,
+                    };
+                    offsets
+                        .iter()
+                        .filter(|&&byte_offset| {
+                            let start = byte_offset as usize;
+                            if start >= mmap.len() {
+                                return false;
+                            }
+                            let end = memchr::memchr(b'\n', &mmap[start..])
+                                .map(|p| start + p)
+                                .unwrap_or(mmap.len());
+                            matcher.has_match(&mmap[start..end])
+                        })
+                        .count()
+                })
+                .sum()
+        }
+        SearchResult::AllFiles(paths) => {
+            if paths.is_empty() {
+                timing.matches = 0;
+                return Ok((0, timing));
+            }
+            paths
+                .par_iter()
+                .map(|path| {
+                    let mmap = match open_mmap(path) {
+                        Some(m) => m,
+                        None => return 0,
+                    };
+                    matcher.count_lines(&mmap)
+                })
+                .sum()
+        }
+    };
 
     timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
     timing.matches = count;
@@ -494,47 +523,92 @@ pub fn search_persistent(
     Ok(search_persistent_timed(index, pattern)?.0)
 }
 
-/// Search with detailed timing breakdown.
+/// Search with detailed timing breakdown. Uses line-level verify when index provides line hits.
 pub fn search_persistent_timed(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
-    let (candidates, mut timing) = index.search_timed(pattern);
-
-    // Opt 4: skip verify if 0 candidates
-    if candidates.is_empty() {
-        timing.matches = 0;
-        return Ok((Vec::new(), timing));
-    }
+    let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
-    // Persistent index already skips binary files at build time — no binary check needed.
-    // Sort candidates by path for better filesystem I/O locality.
-    let mut sorted_candidates = candidates;
-    sorted_candidates.sort_unstable();
-
-    let matches: Vec<Match> = sorted_candidates
-        .par_iter()
-        .flat_map(|path| {
-            let mmap = match open_mmap(path) {
-                Some(m) => m,
-                None => return Vec::new(),
-            };
-            let hits = matcher.search_buffer(&mmap);
+    let matches: Vec<Match> = match result {
+        SearchResult::LineHits(hits) => {
             if hits.is_empty() {
-                return Vec::new();
+                timing.matches = 0;
+                return Ok((Vec::new(), timing));
             }
-            let path_buf = path.to_path_buf();
-            hits.into_iter()
-                .map(|(ln, line)| Match {
-                    path: path_buf.clone(),
-                    line_number: ln,
-                    line,
+            // Group by file path for efficient mmap (one mmap per file)
+            let mut by_file: HashMap<&Path, Vec<(u32, u32)>> = HashMap::new();
+            for hit in &hits {
+                by_file
+                    .entry(hit.path)
+                    .or_default()
+                    .push((hit.line_no, hit.byte_offset));
+            }
+            let file_groups: Vec<_> = by_file.into_iter().collect();
+
+            file_groups
+                .par_iter()
+                .flat_map(|(path, lines)| {
+                    let mmap = match open_mmap(path) {
+                        Some(m) => m,
+                        None => return Vec::new(),
+                    };
+                    let path_buf = path.to_path_buf();
+                    let mut file_matches = Vec::new();
+                    for &(line_no, byte_offset) in lines {
+                        let start = byte_offset as usize;
+                        if start >= mmap.len() {
+                            continue;
+                        }
+                        let end = memchr::memchr(b'\n', &mmap[start..])
+                            .map(|p| start + p)
+                            .unwrap_or(mmap.len());
+                        let line_bytes = &mmap[start..end];
+                        if matcher.has_match(line_bytes) {
+                            let line =
+                                String::from_utf8_lossy(line_bytes).into_owned();
+                            file_matches.push(Match {
+                                path: path_buf.clone(),
+                                line_number: line_no as usize,
+                                line,
+                            });
+                        }
+                    }
+                    file_matches
                 })
                 .collect()
-        })
-        .collect();
+        }
+        SearchResult::AllFiles(paths) => {
+            if paths.is_empty() {
+                timing.matches = 0;
+                return Ok((Vec::new(), timing));
+            }
+            // Fallback: full-file verify (pattern too short for trigrams)
+            paths
+                .par_iter()
+                .flat_map(|path| {
+                    let mmap = match open_mmap(path) {
+                        Some(m) => m,
+                        None => return Vec::new(),
+                    };
+                    let hits = matcher.search_buffer(&mmap);
+                    if hits.is_empty() {
+                        return Vec::new();
+                    }
+                    let path_buf = path.to_path_buf();
+                    hits.into_iter()
+                        .map(|(ln, line)| Match {
+                            path: path_buf.clone(),
+                            line_number: ln,
+                            line,
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+    };
 
     timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
     timing.matches = matches.len();
