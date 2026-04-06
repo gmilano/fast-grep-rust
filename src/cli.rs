@@ -298,6 +298,9 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 println!("  Built at:     {}", idx.meta.built_at);
                 println!("  Stale:        {}", idx.is_stale());
                 println!("  Postings size: {}KB", idx.postings_mmap.len() / 1024);
+                if let Some(ref bm) = idx.bitmap_mmap {
+                    println!("  Bitmaps size:  {}KB", bm.len() / 1024);
+                }
             } else {
                 let idx = index::SparseIndex::build_from_directory(&index_path, no_ignore, type_filter, false)?;
                 let stats = idx.stats();
@@ -365,7 +368,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let index_label = format!("fgr --index ({})", strategy_label);
     println!("{:<35} {:>10} {:>10} {:>8}", index_label, format_duration(persist_load_time + persist_search_time), format_num(fg_count), "yes");
     println!("{:<35} {:>10} {:>10} {:>8}", "  index build (one-time cost)", format_duration(persist_build_time), "-", "-");
-    println!("  Timing breakdown: lookup={:.1}ms intersect={:.1}ms verify={:.1}ms candidates={}",
+    println!("  Timing breakdown: bitmap={:.1}ms postings+intersect={:.1}ms verify={:.1}ms candidates={}",
         timing.lookup_ms, timing.bitmap_intersect_ms, timing.verify_ms, timing.candidates);
     println!("{}", "-".repeat(67));
     if let Some(t) = grep_time { println!("{:<35} {:>10} {:>10} {:>8}", "grep -rn", format_duration(t), "?", "no"); }

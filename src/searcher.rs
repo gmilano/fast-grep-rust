@@ -502,31 +502,43 @@ pub fn search_persistent_count(
                     .sum()
             }
         }
+        SearchResult::BitmapFiles(paths) => {
+            count_file_level(&matcher, &paths, &mut timing, "bitmap-only")
+        }
         SearchResult::AllFiles(paths) => {
-            if paths.is_empty() {
-                timing.matches = 0;
-                timing.strategy = "file-level (fallback)".into();
-                timing.density = 0.0;
-                return Ok((0, timing));
-            }
-            timing.strategy = "file-level (fallback)".into();
-            timing.density = 0.0;
-            paths
-                .par_iter()
-                .map(|path| {
-                    let mmap = match open_mmap(path) {
-                        Some(m) => m,
-                        None => return 0,
-                    };
-                    matcher.count_lines(&mmap)
-                })
-                .sum()
+            count_file_level(&matcher, &paths, &mut timing, "file-level (fallback)")
         }
     };
 
     timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
     timing.matches = count;
     Ok((count, timing))
+}
+
+fn count_file_level(
+    matcher: &Matcher,
+    paths: &[&Path],
+    timing: &mut crate::persist::SearchTiming,
+    strategy: &str,
+) -> usize {
+    if paths.is_empty() {
+        timing.matches = 0;
+        timing.strategy = strategy.into();
+        timing.density = 0.0;
+        return 0;
+    }
+    timing.strategy = strategy.into();
+    timing.density = 0.0;
+    paths
+        .par_iter()
+        .map(|path| {
+            let mmap = match open_mmap(path) {
+                Some(m) => m,
+                None => return 0,
+            };
+            matcher.count_lines(&mmap)
+        })
+        .sum()
 }
 
 /// mmap a file for zero-copy read. Returns None on error or empty file.
@@ -641,37 +653,11 @@ pub fn search_persistent_timed(
                     .collect()
             }
         }
+        SearchResult::BitmapFiles(paths) => {
+            verify_file_level(&matcher, &paths, &mut timing, "bitmap-only")
+        }
         SearchResult::AllFiles(paths) => {
-            if paths.is_empty() {
-                timing.matches = 0;
-                timing.strategy = "file-level (fallback)".into();
-                timing.density = 0.0;
-                return Ok((Vec::new(), timing));
-            }
-            // Fallback: full-file verify (pattern too short for trigrams)
-            timing.strategy = "file-level (fallback)".into();
-            timing.density = 0.0;
-            paths
-                .par_iter()
-                .flat_map(|path| {
-                    let mmap = match open_mmap(path) {
-                        Some(m) => m,
-                        None => return Vec::new(),
-                    };
-                    let hits = matcher.search_buffer(&mmap);
-                    if hits.is_empty() {
-                        return Vec::new();
-                    }
-                    let path_buf = path.to_path_buf();
-                    hits.into_iter()
-                        .map(|(ln, line)| Match {
-                            path: path_buf.clone(),
-                            line_number: ln,
-                            line,
-                        })
-                        .collect()
-                })
-                .collect()
+            verify_file_level(&matcher, &paths, &mut timing, "file-level (fallback)")
         }
     };
 
@@ -682,6 +668,43 @@ pub fn search_persistent_timed(
 
 /// Fast full scan — optimized hot path:
 /// - Raw bytes (no UTF-8 validation)
+fn verify_file_level(
+    matcher: &Matcher,
+    paths: &[&Path],
+    timing: &mut crate::persist::SearchTiming,
+    strategy: &str,
+) -> Vec<Match> {
+    if paths.is_empty() {
+        timing.matches = 0;
+        timing.strategy = strategy.into();
+        timing.density = 0.0;
+        return Vec::new();
+    }
+    timing.strategy = strategy.into();
+    timing.density = 0.0;
+    paths
+        .par_iter()
+        .flat_map(|path| {
+            let mmap = match open_mmap(path) {
+                Some(m) => m,
+                None => return Vec::new(),
+            };
+            let hits = matcher.search_buffer(&mmap);
+            if hits.is_empty() {
+                return Vec::new();
+            }
+            let path_buf = path.to_path_buf();
+            hits.into_iter()
+                .map(|(ln, line)| Match {
+                    path: path_buf.clone(),
+                    line_number: ln,
+                    line,
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// - SIMD memmem for literal patterns
 /// - Parallel file walking + searching
 /// - Buffer reuse per thread (no allocation per file)

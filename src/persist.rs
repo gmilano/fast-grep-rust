@@ -10,6 +10,8 @@ use ignore::WalkBuilder;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
+use roaring::RoaringBitmap;
+
 use crate::index::{Posting, SparseIndex};
 use crate::sparse::BigramFreq;
 use crate::trigram;
@@ -118,6 +120,8 @@ pub struct LineHit<'a> {
 pub enum SearchResult<'a> {
     /// Line-level candidates from trigram intersection
     LineHits(Vec<LineHit<'a>>),
+    /// Bitmap-only candidates: selective bitmap AND produced few files, skip posting load
+    BitmapFiles(Vec<&'a Path>),
     /// Fallback: all files (pattern too short for trigrams)
     AllFiles(Vec<&'a Path>),
 }
@@ -156,6 +160,11 @@ pub struct PersistentIndex {
     pub lookup_count: usize,
     /// Main postings — memory-mapped
     pub postings_mmap: Mmap,
+    /// Roaring bitmap file — memory-mapped (one serialized bitmap per trigram)
+    pub bitmap_mmap: Option<Mmap>,
+    /// Bitmap lookup table — memory-mapped (hash → offset/len into bitmap_mmap)
+    pub bitmap_lookup_mmap: Option<Mmap>,
+    pub bitmap_lookup_count: usize,
     /// Doc IDs: mmap'd flat buffer + offset table for zero-alloc load
     pub docids_mmap: Mmap,
     pub docid_offsets: Vec<(u32, u16)>, // (offset, length) for main docs
@@ -251,6 +260,45 @@ impl PersistentIndex {
         }
     }
 
+    // --- Roaring bitmap lookup (Tier 1) ---
+
+    /// Binary search in mmap'd bitmap lookup table.
+    #[inline]
+    fn find_in_bitmap_lookup(&self, hash: u32) -> Option<(u64, u32)> {
+        let data = self.bitmap_lookup_mmap.as_ref()?;
+        let count = self.bitmap_lookup_count;
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
+            match h.cmp(&hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = read_u64_le(data, mid * LOOKUP_ENTRY_SIZE + 4);
+                    let len = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE + 12);
+                    return Some((off, len));
+                }
+            }
+        }
+        None
+    }
+
+    /// Deserialize a RoaringBitmap for a trigram hash from the bitmap mmap.
+    /// Uses unchecked deserialization for speed (data was written by us).
+    #[inline]
+    fn lookup_bitmap(&self, hash: u32) -> Option<RoaringBitmap> {
+        let (offset, len) = self.find_in_bitmap_lookup(hash)?;
+        let bm_data = self.bitmap_mmap.as_ref()?;
+        let start = offset as usize;
+        let end = start + len as usize;
+        if end > bm_data.len() {
+            return None;
+        }
+        RoaringBitmap::deserialize_unchecked_from(&bm_data[start..end]).ok()
+    }
+
     /// Extract sorted line postings from raw posting bytes, excluding deleted docs.
     fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32)> {
         let num = data.len() / POSTING_ENTRY_SIZE;
@@ -265,6 +313,62 @@ impl PersistentIndex {
             }
         }
         postings
+    }
+
+    /// Extract sorted line postings, filtering to only doc_ids in the bitmap.
+    fn extract_line_postings_filtered(
+        &self,
+        data: &[u8],
+        filter: &RoaringBitmap,
+    ) -> Vec<(u32, u32, u32)> {
+        let num = data.len() / POSTING_ENTRY_SIZE;
+        let mut postings = Vec::with_capacity(num / 4); // expect significant filtering
+        for i in 0..num {
+            let base = i * POSTING_ENTRY_SIZE;
+            let doc_id = read_u32_le(data, base);
+            if filter.contains(doc_id) && !self.deleted_docs.contains(&doc_id) {
+                let line_no = read_u32_le(data, base + 4);
+                let byte_offset = read_u32_le(data, base + 8);
+                postings.push((doc_id, line_no, byte_offset));
+            }
+        }
+        postings
+    }
+
+    /// Get merged (main + delta) sorted line postings for a trigram hash,
+    /// filtered to only doc_ids in the candidate bitmap.
+    fn trigram_line_postings_filtered(
+        &self,
+        hash: u32,
+        filter: &RoaringBitmap,
+    ) -> Option<Vec<(u32, u32, u32)>> {
+        let main = self.main_posting_data(hash);
+        let delta = self.delta_posting_data(hash);
+
+        if main.is_none() && delta.is_none() {
+            return None;
+        }
+
+        let main_postings = main
+            .map(|d| self.extract_line_postings_filtered(d, filter))
+            .unwrap_or_default();
+        let delta_postings = delta
+            .map(|d| self.extract_line_postings_filtered(d, filter))
+            .unwrap_or_default();
+
+        let postings = if delta_postings.is_empty() {
+            main_postings
+        } else if main_postings.is_empty() {
+            delta_postings
+        } else {
+            merge_sorted_lines(&main_postings, &delta_postings)
+        };
+
+        if postings.is_empty() {
+            None
+        } else {
+            Some(postings)
+        }
     }
 
     /// Get merged (main + delta) sorted line postings for a trigram hash.
@@ -308,7 +412,7 @@ impl PersistentIndex {
                 paths.dedup();
                 paths
             }
-            SearchResult::AllFiles(paths) => paths,
+            SearchResult::BitmapFiles(paths) | SearchResult::AllFiles(paths) => paths,
         }
     }
 
@@ -339,8 +443,9 @@ impl PersistentIndex {
 
         let mut ngrams_queried = 0usize;
         let mut result_lines: Vec<(u32, u32, u32)> = Vec::new();
-        let mut lookup_dur = Duration::ZERO;
+        let mut bitmap_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
+        let has_bitmaps = self.bitmap_mmap.is_some();
 
         for alt_trigrams in &alternatives {
             if alt_trigrams.is_empty() {
@@ -363,43 +468,136 @@ impl PersistentIndex {
             }
 
             ngrams_queried += alt_trigrams.len();
-
-            // Phase 1: Lookup — parallel hash + posting list extraction
-            let t_lookup = Instant::now();
             let hashes: Vec<u32> = alt_trigrams.iter().map(|tri| crc32fast::hash(tri)).collect();
 
-            // Parallel lookup of all trigram posting lists
-            let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
-                .par_iter()
-                .map(|&h| self.trigram_line_postings(h))
-                .collect();
+            if has_bitmaps {
+                // === Two-tier search: Roaring Bitmap → filtered postings ===
 
-            lookup_dur += t_lookup.elapsed();
+                // Phase 1: Bitmap intersection (parallel load, then serial AND)
+                let t_bitmap = Instant::now();
 
-            // Check all trigrams exist
-            if posting_lists.iter().any(|p| p.is_none()) {
-                continue;
-            }
+                // Parallel deserialization of all bitmaps
+                let mut bitmaps: Vec<Option<RoaringBitmap>> = hashes
+                    .par_iter()
+                    .map(|&h| self.lookup_bitmap(h))
+                    .collect();
 
-            // Phase 2: Intersection on (doc_id, line_no)
-            let t_intersect = Instant::now();
-            let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
-                posting_lists.into_iter().map(|p| p.unwrap()).collect();
-
-            // Sort by posting list size (smallest first for fast intersection)
-            posting_lists.sort_by_key(|v| v.len());
-
-            // Intersect all lists using sorted merge on (doc_id, line_no)
-            let mut candidates = posting_lists.swap_remove(0);
-            for other in &posting_lists {
-                if candidates.is_empty() {
-                    break;
+                // Check all trigrams exist
+                if bitmaps.iter().any(|b| b.is_none()) {
+                    bitmap_dur += t_bitmap.elapsed();
+                    continue;
                 }
-                candidates = sorted_intersect_lines(&candidates, other);
-            }
 
-            intersect_dur += t_intersect.elapsed();
-            result_lines.extend(candidates);
+                // Sort by cardinality (smallest first) for faster AND
+                bitmaps.sort_by_key(|b| b.as_ref().map_or(0, |bm| bm.len()));
+
+                // Sequential AND with early termination
+                let mut candidate_docs = bitmaps.swap_remove(0).unwrap();
+                for bm in bitmaps.into_iter().flatten() {
+                    candidate_docs &= bm;
+                    if candidate_docs.is_empty() {
+                        break;
+                    }
+                }
+
+                if candidate_docs.is_empty() {
+                    bitmap_dur += t_bitmap.elapsed();
+                    continue;
+                }
+
+                let bm_card = candidate_docs.len() as usize;
+                bitmap_dur += t_bitmap.elapsed();
+
+                // Fast path: if bitmap is very selective (< 500 files),
+                // skip posting load entirely — just verify the candidate files.
+                if bm_card <= 500 {
+                    let paths: Vec<&Path> = candidate_docs
+                        .iter()
+                        .filter_map(|id| self.doc_path(id))
+                        .collect();
+                    let n = paths.len();
+                    return (
+                        SearchResult::BitmapFiles(paths),
+                        SearchTiming {
+                            covering_ngrams_ms,
+                            lookup_ms: bitmap_dur.as_secs_f64() * 1000.0,
+                            bitmap_intersect_ms: 0.0,
+                            verify_ms: 0.0,
+                            candidates: n,
+                            matches: 0,
+                            ngrams_queried,
+                            strategy: String::new(),
+                            density: 0.0,
+                        },
+                    );
+                }
+
+                // Phase 2: Load line postings (filtered by bitmap if selective), then intersect
+                let t_intersect = Instant::now();
+                let bm_selectivity =
+                    bm_card as f64 / self.num_docs().max(1) as f64;
+
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = if bm_selectivity < 0.5 {
+                    // Bitmap is selective — use filtered extraction
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
+                        .collect()
+                } else {
+                    // Bitmap isn't selective — full extraction is faster
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings(h))
+                        .collect()
+                };
+
+                if posting_lists.iter().any(|p| p.is_none()) {
+                    intersect_dur += t_intersect.elapsed();
+                    continue;
+                }
+
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
+                    posting_lists.into_iter().map(|p| p.unwrap()).collect();
+                posting_lists.sort_by_key(|v| v.len());
+
+                let mut candidates = posting_lists.swap_remove(0);
+                for other in &posting_lists {
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    candidates = sorted_intersect_lines(&candidates, other);
+                }
+                intersect_dur += t_intersect.elapsed();
+                result_lines.extend(candidates);
+            } else {
+                // === Fallback: original sorted merge approach (no bitmap files) ===
+
+                let t_lookup = Instant::now();
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
+                    .par_iter()
+                    .map(|&h| self.trigram_line_postings(h))
+                    .collect();
+                bitmap_dur += t_lookup.elapsed();
+
+                if posting_lists.iter().any(|p| p.is_none()) {
+                    continue;
+                }
+
+                let t_intersect = Instant::now();
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
+                    posting_lists.into_iter().map(|p| p.unwrap()).collect();
+                posting_lists.sort_by_key(|v| v.len());
+
+                let mut candidates = posting_lists.swap_remove(0);
+                for other in &posting_lists {
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    candidates = sorted_intersect_lines(&candidates, other);
+                }
+                intersect_dur += t_intersect.elapsed();
+                result_lines.extend(candidates);
+            }
         }
 
         // Dedup result lines on (doc_id, line_no)
@@ -422,7 +620,7 @@ impl PersistentIndex {
             SearchResult::LineHits(hits),
             SearchTiming {
                 covering_ngrams_ms,
-                lookup_ms: lookup_dur.as_secs_f64() * 1000.0,
+                lookup_ms: bitmap_dur.as_secs_f64() * 1000.0,
                 bitmap_intersect_ms: intersect_dur.as_secs_f64() * 1000.0,
                 verify_ms: 0.0,
                 candidates: num_candidates,
@@ -534,6 +732,35 @@ pub fn build(
     }
     lookup_file.flush()?;
 
+    // Write Roaring Bitmaps (Tier 1: doc_id sets per trigram)
+    let bitmaps_path = output.join("ngrams.bitmaps");
+    let mut bitmaps_file = BufWriter::new(File::create(&bitmaps_path)?);
+    let mut bitmap_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut bm_offset: u64 = 0;
+
+    for (tri, postings) in &trigram_list {
+        let mut bitmap = RoaringBitmap::new();
+        for &(doc_id, _, _) in *postings {
+            bitmap.insert(doc_id);
+        }
+        let mut bm_buf = Vec::new();
+        bitmap.serialize_into(&mut bm_buf)?;
+        let bm_len = bm_buf.len() as u32;
+        bitmaps_file.write_all(&bm_buf)?;
+        bitmap_lookup_entries.push((crc32fast::hash(*tri), bm_offset, bm_len));
+        bm_offset += bm_len as u64;
+    }
+    bitmaps_file.flush()?;
+
+    let bitmaps_lookup_path = output.join("ngrams.bitmaps.lookup");
+    let mut bm_lookup_file = BufWriter::new(File::create(&bitmaps_lookup_path)?);
+    for (hash, off, len) in &bitmap_lookup_entries {
+        bm_lookup_file.write_u32::<LittleEndian>(*hash)?;
+        bm_lookup_file.write_u64::<LittleEndian>(*off)?;
+        bm_lookup_file.write_u32::<LittleEndian>(*len)?;
+    }
+    bm_lookup_file.flush()?;
+
     // Write docids
     let docids_path = output.join("docids.bin");
     let mut docids_file = BufWriter::new(File::create(&docids_path)?);
@@ -566,6 +793,7 @@ pub fn build(
     let _ = fs::remove_file(output.join("delta.lookup"));
     let _ = fs::remove_file(output.join("delta.docids"));
     let _ = fs::remove_file(output.join("deleted.bin"));
+    // Old bitmap files are overwritten by the new ones above
 
     if verbose {
         eprintln!(
@@ -594,6 +822,21 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     let postings_path = index_path.join("ngrams.postings");
     let postings_file = File::open(&postings_path).context("opening ngrams.postings")?;
     let postings_mmap = unsafe { Mmap::map(&postings_file)? };
+
+    // Load Roaring Bitmap files (optional — backward compatible with older indexes)
+    let bitmaps_path = index_path.join("ngrams.bitmaps");
+    let bitmaps_lookup_path = index_path.join("ngrams.bitmaps.lookup");
+    let (bitmap_mmap, bitmap_lookup_mmap, bitmap_lookup_count) =
+        if bitmaps_path.exists() && bitmaps_lookup_path.exists() {
+            let bf = File::open(&bitmaps_path).context("opening ngrams.bitmaps")?;
+            let bm = unsafe { Mmap::map(&bf)? };
+            let blf = File::open(&bitmaps_lookup_path).context("opening ngrams.bitmaps.lookup")?;
+            let blm = unsafe { Mmap::map(&blf)? };
+            let count = blm.len() / LOOKUP_ENTRY_SIZE;
+            (Some(bm), Some(blm), count)
+        } else {
+            (None, None, 0)
+        };
 
     // Load main doc_ids via mmap (zero-alloc offset table)
     let docids_path = index_path.join("docids.bin");
@@ -687,6 +930,9 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         lookup_mmap,
         lookup_count,
         postings_mmap,
+        bitmap_mmap,
+        bitmap_lookup_mmap,
+        bitmap_lookup_count,
         docids_mmap,
         docid_offsets,
         delta_doc_ids,
