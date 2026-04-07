@@ -140,6 +140,18 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                     }
                 }
             }
+        } else if ch == '[' {
+            // Skip entire character class — contents are not literals
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    chars.next(); // skip escaped char inside class
+                } else if c == ']' {
+                    break;
+                }
+            }
         } else if is_meta(ch) {
             if !current.is_empty() {
                 runs.push(std::mem::take(&mut current));
@@ -277,5 +289,16 @@ mod tests {
         let result = decompose_pattern("(foo|bar)baz");
         // Should not panic; result depends on implementation details
         assert!(result.len() >= 1);
+    }
+
+
+    #[test]
+    fn char_class_not_treated_as_literal() {
+        // [A-Z]olland should only produce trigrams from "olland", not from "A-Z"
+        let result = decompose_pattern("[A-Z]olland");
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains(&[b'o', b'l', b'l']));
+        assert!(result[0].contains(&[b'l', b'l', b'a']));
+        assert!(!result[0].contains(&[b'A', b'-', b'Z']));
     }
 }
