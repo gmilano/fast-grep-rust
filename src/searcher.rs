@@ -962,8 +962,8 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                 match_count.fetch_add(file_count, std::sync::atomic::Ordering::Relaxed);
             }
 
-            // Flush output buffer when large enough
-            if out_buf.len() >= 32 * 1024 {
+            // Flush output buffer after each file with matches
+            if !out_buf.is_empty() {
                 use std::io::Write;
                 let mut out = output.lock().unwrap();
                 let _ = out.write_all(&out_buf);
