@@ -127,12 +127,20 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             // Escaped character — check if it's a literal
             if let Some(&next) = chars.peek() {
                 match next {
-                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z' => {
-                        // Not a literal
+                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z'
+                    | 'p' | 'P' => {
+                        // Not a literal — regex escape class
                         if !current.is_empty() {
                             runs.push(std::mem::take(&mut current));
                         }
                         chars.next();
+                        // \p{...} and \P{...} — skip the brace-delimited property name
+                        if (next == 'p' || next == 'P') && chars.peek() == Some(&'{') {
+                            chars.next(); // skip '{'
+                            while let Some(c) = chars.next() {
+                                if c == '}' { break; }
+                            }
+                        }
                     }
                     _ => {
                         // Escaped literal (e.g., \. \* etc)
@@ -145,11 +153,74 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             if !current.is_empty() {
                 runs.push(std::mem::take(&mut current));
             }
+            // Handle '^' and ']' as first char in class (e.g., [^]b] or []b])
+            let mut first = true;
+            if chars.peek() == Some(&'^') {
+                chars.next();
+            }
             while let Some(c) = chars.next() {
                 if c == '\\' {
-                    chars.next(); // skip escaped char inside class
-                } else if c == ']' {
+                    chars.next();
+                    first = false;
+                } else if c == '[' && chars.peek() == Some(&':') {
+                    // POSIX class like [:alnum:] — skip to :]
+                    while let Some(p) = chars.next() {
+                        if p == ']' { break; }
+                    }
+                    first = false;
+                } else if c == ']' && !first {
                     break;
+                } else {
+                    first = false;
+                }
+            }
+        } else if ch == '{' {
+            // Skip repetition quantifier {n}, {n,}, {n,m}
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            while let Some(c) = chars.next() {
+                if c == '}' { break; }
+            }
+        } else if ch == '(' {
+            // Skip entire group if it contains alternation — extracting literals
+            // from inside would produce AND constraints from OR alternatives.
+            // For groups without alternation, just skip the group syntax.
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            // Scan ahead to find matching ')' and check for '|'
+            let mut depth = 1i32;
+            let mut has_alt = false;
+            let saved = chars.clone();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => { chars.next(); }
+                    '(' => depth += 1,
+                    ')' => { depth -= 1; if depth == 0 { break; } }
+                    '|' if depth == 1 => has_alt = true,
+                    _ => {}
+                }
+            }
+            if !has_alt {
+                // No alternation — re-parse group contents for literals
+                chars = saved;
+                // Skip non-capturing group syntax (?:, (?P<, etc.)
+                if chars.peek() == Some(&'?') {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if let Some(&after) = lookahead.peek() {
+                        if ":PimsxuU-<!=".contains(after) {
+                            chars.next();
+                            while let Some(&c) = chars.peek() {
+                                if c == ':' || c == ')' {
+                                    chars.next();
+                                    break;
+                                }
+                                chars.next();
+                            }
+                        }
+                    }
                 }
             }
         } else if is_meta(ch) {

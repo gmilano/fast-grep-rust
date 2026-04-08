@@ -50,11 +50,18 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
             if let Some(&next) = chars.peek() {
                 chars.next();
                 if next.is_ascii_alphanumeric() {
-                    // Regex escape class (\d, \w, \s, \n, \1, etc.) — break segment
+                    // Regex escape class (\d, \w, \s, \n, \p, \P, \1, etc.) — break segment
                     if current.len() > best.len() {
                         best = std::mem::take(&mut current);
                     } else {
                         current.clear();
+                    }
+                    // \p{...} and \P{...} — skip property name in braces
+                    if (next == 'p' || next == 'P') && chars.peek() == Some(&'{') {
+                        chars.next();
+                        while let Some(c) = chars.next() {
+                            if c == '}' { break; }
+                        }
                     }
                 } else {
                     // Escaped punctuation (\., \*, etc.) — literal character
@@ -62,7 +69,100 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                     current.extend_from_slice(next.encode_utf8(&mut buf).as_bytes());
                 }
             }
-        } else if ".+*?[]{}()|^$".contains(ch) {
+        } else if ch == '[' {
+            // Skip entire character class — contents are not literals
+            if current.len() > best.len() {
+                best = std::mem::take(&mut current);
+            } else {
+                current.clear();
+            }
+            // Handle '^' after '[' and ']' as first char in class (e.g., [^]b] or []b])
+            let mut first = true;
+            if chars.peek() == Some(&'^') {
+                chars.next();
+            }
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    chars.next();
+                    first = false;
+                } else if c == '[' && chars.peek() == Some(&':') {
+                    // POSIX class like [:alnum:] — skip to :]
+                    while let Some(p) = chars.next() {
+                        if p == ']' { break; }
+                    }
+                    first = false;
+                } else if c == ']' && !first {
+                    break;
+                } else {
+                    first = false;
+                }
+            }
+        } else if ch == '(' {
+            // Skip entire group if it contains alternation — literals from one
+            // branch of an OR cannot be used as a required pre-filter
+            if current.len() > best.len() {
+                best = std::mem::take(&mut current);
+            } else {
+                current.clear();
+            }
+            let mut depth = 1i32;
+            let mut has_alt = false;
+            let saved = chars.clone();
+            {
+                let mut scan = chars.clone();
+                while let Some(c) = scan.next() {
+                    match c {
+                        '\\' => { scan.next(); }
+                        '(' => depth += 1,
+                        ')' => { depth -= 1; if depth == 0 { break; } }
+                        '|' if depth == 1 => has_alt = true,
+                        _ => {}
+                    }
+                }
+            }
+            if has_alt {
+                // Skip to matching ')' — don't extract literals from alternation
+                depth = 1;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => { chars.next(); }
+                        '(' => depth += 1,
+                        ')' => { depth -= 1; if depth == 0 { break; } }
+                        _ => {}
+                    }
+                }
+            } else {
+                // No alternation — skip group syntax but parse contents
+                if chars.peek() == Some(&'?') {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if let Some(&after) = lookahead.peek() {
+                        if ":PimsxuU-<!=".contains(after) {
+                            chars.next();
+                            while let Some(&c) = chars.peek() {
+                                if c == ':' || c == ')' {
+                                    chars.next();
+                                    break;
+                                }
+                                chars.next();
+                            }
+                        }
+                    }
+                }
+            }
+        } else if ch == '{' {
+            // Skip repetition quantifier {n}, {n,}, {n,m} — contents are not literals
+            if current.len() > best.len() {
+                best = std::mem::take(&mut current);
+            } else {
+                current.clear();
+            }
+            while let Some(c) = chars.next() {
+                if c == '}' {
+                    break;
+                }
+            }
+        } else if ".+*?})|^$".contains(ch) {
             // Regex metachar — break segment
             if current.len() > best.len() {
                 best = std::mem::take(&mut current);
