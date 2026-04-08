@@ -491,9 +491,29 @@ impl PersistentIndex {
                     .map(|&h| self.lookup_bitmap(h))
                     .collect();
 
-                // Check all trigrams exist
+                // If any trigram is missing from bitmaps, fall back to full posting list search
                 if bitmaps.iter().any(|b| b.is_none()) {
                     bitmap_dur += t_bitmap.elapsed();
+                    // Fallback: load postings directly without bitmap pre-filter
+                    let t_fallback = Instant::now();
+                    let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings(h))
+                        .collect();
+                    if posting_lists.iter().any(|p| p.is_none()) {
+                        intersect_dur += t_fallback.elapsed();
+                        continue;
+                    }
+                    let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                        posting_lists.into_iter().map(|p| p.unwrap()).collect();
+                    posting_lists.sort_by_key(|v| v.len());
+                    let mut candidates = posting_lists.swap_remove(0);
+                    for other in &posting_lists {
+                        if candidates.is_empty() { break; }
+                        candidates = sorted_intersect_lines(&candidates, other);
+                    }
+                    intersect_dur += t_fallback.elapsed();
+                    result_lines.extend(candidates);
                     continue;
                 }
 

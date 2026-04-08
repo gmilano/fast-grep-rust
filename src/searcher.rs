@@ -685,10 +685,11 @@ pub fn search_persistent_timed(
             // we check if the pattern appears within the prefix window. For longer
             // patterns, we check if the first 4 bytes of the pattern match the
             // prefix (i.e., pattern starts at byte 0 of the line).
-            // NOTE: This can produce false negatives for matches starting beyond
-            // byte 3. The user should verify match counts are identical.
+            // NOTE: line_prefix stores the first 4 bytes of the LINE, not the match
+            // position. Filtering on prefix produces false negatives for patterns
+            // that appear mid-line (e.g. "TODO" in "// TODO:"). Disabled.
             let pat_bytes = pattern.as_bytes();
-            let can_prefix_filter = is_literal(pattern) && !pat_bytes.is_empty();
+            let can_prefix_filter = false; // disabled: causes false negatives
             let total_before_prefix = hits.len();
 
             let hits: Vec<_> = if can_prefix_filter {
