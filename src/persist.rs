@@ -139,6 +139,10 @@ pub struct IndexMeta {
     pub root_dir: String,
     pub built_at: String,
     pub file_mtimes: HashMap<String, u64>,
+    /// Directory mtimes — used for fast stale detection without walking the tree.
+    /// A changed dir mtime means files were added, deleted, or renamed in that dir.
+    #[serde(default)]
+    pub dir_mtimes: HashMap<String, u64>,
     /// Number of docs in the main (non-delta) index. Set on full build.
     #[serde(default)]
     pub main_num_docs: Option<usize>,
@@ -673,17 +677,25 @@ impl PersistentIndex {
     }
 
     pub fn is_stale(&self) -> bool {
+        // Phase 1: Check directory mtimes (no walk needed).
+        // Detects file additions, deletions, and renames.
+        for (path_str, &stored_mtime) in &self.meta.dir_mtimes {
+            let path = Path::new(path_str);
+            match fs::metadata(path) {
+                Ok(m) => {
+                    if mtime_secs(&m) != stored_mtime {
+                        return true;
+                    }
+                }
+                Err(_) => return true, // directory was removed
+            }
+        }
+        // Phase 2: Sample file mtimes to detect content modifications.
         for (path_str, &stored_mtime) in self.meta.file_mtimes.iter().take(100) {
             let path = Path::new(path_str);
             match fs::metadata(path) {
-                Ok(meta) => {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if mtime != stored_mtime {
+                Ok(m) => {
+                    if mtime_secs(&m) != stored_mtime {
                         return true;
                     }
                 }
@@ -719,16 +731,13 @@ pub fn build(
     // Collect file mtimes
     let mut file_mtimes = HashMap::new();
     for path in &index.doc_ids {
-        if let Ok(meta) = fs::metadata(path) {
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            file_mtimes.insert(path.to_string_lossy().into_owned(), mtime);
+        if let Ok(m) = fs::metadata(path) {
+            file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
         }
     }
+
+    // Collect directory mtimes for fast stale detection
+    let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
     // Write postings and build lookup (12 bytes per entry: doc_id + line_no + byte_offset)
     let postings_path = output.join("ngrams.postings");
@@ -814,6 +823,7 @@ pub fn build(
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes,
+        dir_mtimes,
         main_num_docs: Some(num_docs),
         bigram_freq_b64: Some(freq_b64),
     };
@@ -821,11 +831,12 @@ pub fn build(
     let meta_json = serde_json::to_string_pretty(&meta)?;
     fs::write(&meta_path, meta_json)?;
 
-    // Clean up any delta files from previous incremental updates
+    // Clean up any delta files and stale lock from previous runs
     let _ = fs::remove_file(output.join("delta.postings"));
     let _ = fs::remove_file(output.join("delta.lookup"));
     let _ = fs::remove_file(output.join("delta.docids"));
     let _ = fs::remove_file(output.join("deleted.bin"));
+    let _ = fs::remove_file(output.join("lock"));
     // Old bitmap files are overwritten by the new ones above
 
     if verbose {
@@ -996,25 +1007,33 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
-    // 2. Walk root — get current file mtimes
+    // 2. Walk root — get current file mtimes and directory mtimes
     let walker = WalkBuilder::new(root)
         .git_ignore(true)
         .hidden(false)
         .build();
     let mut current_files: HashMap<String, u64> = HashMap::new();
+    let mut new_dir_mtimes: HashMap<String, u64> = HashMap::new();
     for entry in walker.flatten() {
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            // Exclude the index directory itself to avoid self-invalidation
+            if !entry.path().starts_with(index_path) {
+                if let Ok(m) = entry.metadata() {
+                    new_dir_mtimes.insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
+                }
+            }
+            continue;
+        }
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
+        // Skip files inside the index directory
+        if path.starts_with(index_path) {
+            continue;
+        }
         if let Ok(m) = fs::metadata(path) {
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            current_files.insert(path.to_string_lossy().into_owned(), mtime);
+            current_files.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
         }
     }
 
@@ -1252,6 +1271,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes: new_mtimes,
+        dir_mtimes: new_dir_mtimes,
         main_num_docs: Some(main_num_docs),
         bigram_freq_b64: meta.bigram_freq_b64,
     };
@@ -1274,6 +1294,42 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         unchanged,
         duration_ms: start.elapsed().as_millis() as u64,
     })
+}
+
+/// Extract mtime from filesystem metadata, truncated to 2-second granularity.
+/// This avoids false stale detection from sub-second timestamp jitter on NTFS.
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    let secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs / 2 * 2
+}
+
+/// Walk a directory tree and collect mtime for each directory (not files).
+/// Uses the `ignore` crate to respect .gitignore rules.
+/// Excludes `exclude_dir` (the index directory itself) to avoid self-invalidation.
+fn collect_dir_mtimes(root: &Path, no_ignore: bool, exclude_dir: Option<&Path>) -> HashMap<String, u64> {
+    let mut dir_mtimes = HashMap::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(!no_ignore)
+        .build();
+    for entry in walker.filter_map(|e| e.ok()) {
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if let Some(excl) = exclude_dir {
+                if entry.path().starts_with(excl) {
+                    continue;
+                }
+            }
+            if let Ok(m) = entry.metadata() {
+                dir_mtimes.insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
+            }
+        }
+    }
+    dir_mtimes
 }
 
 fn chrono_now() -> String {

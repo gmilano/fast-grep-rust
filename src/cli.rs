@@ -177,7 +177,7 @@ pub fn run() -> Result<()> {
     }
 
     if let Some(ref idx_path) = cli.index_path {
-        run_indexed_search(&effective, idx_path, &opts)?;
+        run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
     } else {
         run_direct_search(&effective, &dir, &opts)?;
     }
@@ -217,20 +217,30 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     Ok(())
 }
 
-fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
     let start = Instant::now();
     let idx = persist::load(idx_path)?;
+
+    // Resolve path filter: only return results under search_path.
+    // Compare using the same path form as stored in the index (relative from cwd).
+    let root_dir = PathBuf::from(&idx.meta.root_dir);
+    let path_filter = if search_path != root_dir && search_path != std::path::Path::new(".") {
+        Some(search_path.to_path_buf())
+    } else {
+        None
+    };
+
     let load_time = start.elapsed();
     let start = Instant::now();
     if opts.count {
-        let (n, _) = searcher::search_persistent_count(&idx, pattern)?;
+        let (n, _) = searcher::search_persistent_count(&idx, pattern, path_filter.as_deref())?;
         let search_time = start.elapsed();
         println!("{}", n);
         if !opts.quiet {
             eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
         }
     } else {
-        let (matches, _) = searcher::search_persistent_timed(&idx, pattern)?;
+        let (matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref())?;
         let search_time = start.elapsed();
         output_matches(&matches, opts)?;
         if !opts.quiet {
@@ -265,6 +275,38 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
     Ok(())
 }
 
+/// Acquire an exclusive lock on the index directory for updates.
+/// Returns the lock file handle and a flag indicating whether we had to wait
+/// (true = another process was holding the lock when we arrived). Callers can
+/// use that flag to re-check whether the work the other process just finished
+/// already covers what they were going to do.
+fn acquire_index_lock(idx_path: &std::path::Path) -> Result<(std::fs::File, bool)> {
+    use std::io::ErrorKind;
+    let lock_path = idx_path.join("lock");
+    let mut waited = false;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => return Ok((f, waited)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if !waited {
+                    eprintln!("Waiting for another process to finish updating index...");
+                    waited = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn release_index_lock(idx_path: &std::path::Path) {
+    let _ = std::fs::remove_file(idx_path.join("lock"));
+}
+
 fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
     match cmd {
         Commands::Index { dir, output } => {
@@ -280,7 +322,19 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 let probe = persist::load(&idx_path)?;
                 PathBuf::from(&probe.meta.root_dir)
             };
+            let (_lock, waited) = acquire_index_lock(&idx_path)?;
+            // If we waited for another process, reload and re-check — it may
+            // have already done the work we were going to do.
+            if waited {
+                let idx = persist::load(&idx_path)?;
+                if !idx.is_stale() {
+                    release_index_lock(&idx_path);
+                    eprintln!("Index already up to date (updated by another process)");
+                    return Ok(());
+                }
+            }
             let stats = persist::update_incremental(&idx_path, &root, true)?;
+            release_index_lock(&idx_path);
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
@@ -334,7 +388,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let persist_load_time = start.elapsed();
 
     let start = Instant::now();
-    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern)?;
+    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern, None)?;
     let persist_search_time = start.elapsed();
 
     // Get rg match count for correctness comparison
