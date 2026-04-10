@@ -113,20 +113,25 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Build a persistent index
+    /// Build a persistent index for DIR
     #[command(name = "index")]
     Index {
+        /// Directory to index
         dir: PathBuf,
+        /// Index output directory (created inside DIR)
         #[arg(long, default_value = ".fgr")]
         output: PathBuf,
+        /// Start daemon after building index
+        #[arg(short = 'D', long)]
+        daemon: bool,
     },
-    /// Benchmark search performance
+    /// Benchmark PATTERN search in DIR
     #[command(name = "bench")]
     Bench {
         pattern: String,
         dir: PathBuf,
     },
-    /// Incrementally update a persistent index
+    /// Incrementally update an existing index
     #[command(name = "update")]
     Update {
         dir: Option<PathBuf>,
@@ -138,6 +143,36 @@ pub enum Commands {
     Stats {
         #[arg(long, default_value = ".fgr")]
         index: PathBuf,
+    },
+    /// Watch DIR for changes and keep index up-to-date
+    #[command(name = "daemon")]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Subcommand)]
+pub enum DaemonAction {
+    /// Start the daemon (runs in foreground)
+    Start {
+        /// Directory to watch (default: current dir)
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
+    },
+    /// Stop a running daemon
+    Stop {
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
+    },
+    /// Check daemon status
+    Status {
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
     },
 }
 
@@ -177,7 +212,7 @@ pub fn run() -> Result<()> {
     }
 
     if let Some(ref idx_path) = cli.index_path {
-        run_indexed_search(&effective, idx_path, &opts)?;
+        run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
     } else {
         run_direct_search(&effective, &dir, &opts)?;
     }
@@ -217,20 +252,40 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     Ok(())
 }
 
-fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    // If a daemon is managing this index, ensure it's up-to-date before searching
+    #[cfg(feature = "daemon")]
+    if crate::daemon::is_daemon_running(idx_path) {
+        if let Ok(status) = crate::daemon::send_command(idx_path, "status") {
+            if status == "dirty" {
+                let _ = crate::daemon::send_command(idx_path, "flush");
+            }
+        }
+    }
+
     let start = Instant::now();
     let idx = persist::load(idx_path)?;
+
+    // Resolve path filter: only return results under search_path.
+    // Compare using the same path form as stored in the index (relative from cwd).
+    let root_dir = PathBuf::from(&idx.meta.root_dir);
+    let path_filter = if search_path != root_dir && search_path != std::path::Path::new(".") {
+        Some(search_path.to_path_buf())
+    } else {
+        None
+    };
+
     let load_time = start.elapsed();
     let start = Instant::now();
     if opts.count {
-        let (n, _) = searcher::search_persistent_count(&idx, pattern)?;
+        let (n, _) = searcher::search_persistent_count(&idx, pattern, path_filter.as_deref())?;
         let search_time = start.elapsed();
         println!("{}", n);
         if !opts.quiet {
             eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
         }
     } else {
-        let (matches, _) = searcher::search_persistent_timed(&idx, pattern)?;
+        let (matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref())?;
         let search_time = start.elapsed();
         output_matches(&matches, opts)?;
         if !opts.quiet {
@@ -267,10 +322,19 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
 
 fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
     match cmd {
-        Commands::Index { dir, output } => {
+        Commands::Index { dir, output, daemon } => {
+            let idx_path = dir.join(&output);
             let start = Instant::now();
-            persist::build(&dir, &output, no_ignore, type_filter, true)?;
+            persist::build(&dir, &idx_path, no_ignore, type_filter, true)?;
             eprintln!("Index built in {:.2}s", start.elapsed().as_secs_f64());
+            #[cfg(feature = "daemon")]
+            if daemon {
+                crate::daemon::start_daemon(&idx_path)?;
+            }
+            #[cfg(not(feature = "daemon"))]
+            if daemon {
+                eprintln!("Daemon feature not enabled. Rebuild with --features daemon");
+            }
         }
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, type_filter)?;
@@ -280,7 +344,19 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 let probe = persist::load(&idx_path)?;
                 PathBuf::from(&probe.meta.root_dir)
             };
+            let (_lock, waited) = persist::acquire_index_lock(&idx_path)?;
+            // If we waited for another process, reload and re-check — it may
+            // have already done the work we were going to do.
+            if waited {
+                let idx = persist::load(&idx_path)?;
+                if !idx.is_stale() {
+                    persist::release_index_lock(&idx_path);
+                    eprintln!("Index already up to date (updated by another process)");
+                    return Ok(());
+                }
+            }
             let stats = persist::update_incremental(&idx_path, &root, true)?;
+            persist::release_index_lock(&idx_path);
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
@@ -311,6 +387,35 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
             }
         }
+        #[cfg(feature = "daemon")]
+        Commands::Daemon { action } => {
+            match action {
+                DaemonAction::Start { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    crate::daemon::start_daemon(&idx_path)?;
+                }
+                DaemonAction::Stop { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    let resp = crate::daemon::send_command(&idx_path, "stop")?;
+                    eprintln!("Daemon: {}", resp);
+                }
+                DaemonAction::Status { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    if crate::daemon::is_daemon_running(&idx_path) {
+                        match crate::daemon::send_command(&idx_path, "status") {
+                            Ok(resp) => eprintln!("Daemon running, state: {}", resp),
+                            Err(e) => eprintln!("Daemon running but not responding: {}", e),
+                        }
+                    } else {
+                        eprintln!("No daemon running");
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "daemon"))]
+        Commands::Daemon { .. } => {
+            eprintln!("Daemon feature not enabled. Rebuild with --features daemon");
+        }
     }
     Ok(())
 }
@@ -334,7 +439,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let persist_load_time = start.elapsed();
 
     let start = Instant::now();
-    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern)?;
+    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern, None)?;
     let persist_search_time = start.elapsed();
 
     // Get rg match count for correctness comparison

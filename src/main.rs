@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(feature = "daemon")]
+mod daemon;
 mod index;
 mod persist;
 mod searcher;
