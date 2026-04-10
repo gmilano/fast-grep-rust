@@ -113,20 +113,25 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Build a persistent index
+    /// Build a persistent index for DIR
     #[command(name = "index")]
     Index {
+        /// Directory to index
         dir: PathBuf,
+        /// Index output directory (created inside DIR)
         #[arg(long, default_value = ".fgr")]
         output: PathBuf,
+        /// Start daemon after building index
+        #[arg(short = 'D', long)]
+        daemon: bool,
     },
-    /// Benchmark search performance
+    /// Benchmark PATTERN search in DIR
     #[command(name = "bench")]
     Bench {
         pattern: String,
         dir: PathBuf,
     },
-    /// Incrementally update a persistent index
+    /// Incrementally update an existing index
     #[command(name = "update")]
     Update {
         dir: Option<PathBuf>,
@@ -138,6 +143,36 @@ pub enum Commands {
     Stats {
         #[arg(long, default_value = ".fgr")]
         index: PathBuf,
+    },
+    /// Watch DIR for changes and keep index up-to-date
+    #[command(name = "daemon")]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Subcommand)]
+pub enum DaemonAction {
+    /// Start the daemon (runs in foreground)
+    Start {
+        /// Directory to watch (default: current dir)
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
+    },
+    /// Stop a running daemon
+    Stop {
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
+    },
+    /// Check daemon status
+    Status {
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = ".fgr")]
+        output: PathBuf,
     },
 }
 
@@ -218,6 +253,16 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
 }
 
 fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    // If a daemon is managing this index, ensure it's up-to-date before searching
+    #[cfg(feature = "daemon")]
+    if crate::daemon::is_daemon_running(idx_path) {
+        if let Ok(status) = crate::daemon::send_command(idx_path, "status") {
+            if status == "dirty" {
+                let _ = crate::daemon::send_command(idx_path, "flush");
+            }
+        }
+    }
+
     let start = Instant::now();
     let idx = persist::load(idx_path)?;
 
@@ -275,44 +320,21 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
     Ok(())
 }
 
-/// Acquire an exclusive lock on the index directory for updates.
-/// Returns the lock file handle and a flag indicating whether we had to wait
-/// (true = another process was holding the lock when we arrived). Callers can
-/// use that flag to re-check whether the work the other process just finished
-/// already covers what they were going to do.
-fn acquire_index_lock(idx_path: &std::path::Path) -> Result<(std::fs::File, bool)> {
-    use std::io::ErrorKind;
-    let lock_path = idx_path.join("lock");
-    let mut waited = false;
-    loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(f) => return Ok((f, waited)),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                if !waited {
-                    eprintln!("Waiting for another process to finish updating index...");
-                    waited = true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
-fn release_index_lock(idx_path: &std::path::Path) {
-    let _ = std::fs::remove_file(idx_path.join("lock"));
-}
-
 fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
     match cmd {
-        Commands::Index { dir, output } => {
+        Commands::Index { dir, output, daemon } => {
+            let idx_path = dir.join(&output);
             let start = Instant::now();
-            persist::build(&dir, &output, no_ignore, type_filter, true)?;
+            persist::build(&dir, &idx_path, no_ignore, type_filter, true)?;
             eprintln!("Index built in {:.2}s", start.elapsed().as_secs_f64());
+            #[cfg(feature = "daemon")]
+            if daemon {
+                crate::daemon::start_daemon(&idx_path)?;
+            }
+            #[cfg(not(feature = "daemon"))]
+            if daemon {
+                eprintln!("Daemon feature not enabled. Rebuild with --features daemon");
+            }
         }
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, type_filter)?;
@@ -322,19 +344,19 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 let probe = persist::load(&idx_path)?;
                 PathBuf::from(&probe.meta.root_dir)
             };
-            let (_lock, waited) = acquire_index_lock(&idx_path)?;
+            let (_lock, waited) = persist::acquire_index_lock(&idx_path)?;
             // If we waited for another process, reload and re-check — it may
             // have already done the work we were going to do.
             if waited {
                 let idx = persist::load(&idx_path)?;
                 if !idx.is_stale() {
-                    release_index_lock(&idx_path);
+                    persist::release_index_lock(&idx_path);
                     eprintln!("Index already up to date (updated by another process)");
                     return Ok(());
                 }
             }
             let stats = persist::update_incremental(&idx_path, &root, true)?;
-            release_index_lock(&idx_path);
+            persist::release_index_lock(&idx_path);
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
@@ -364,6 +386,35 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
                 println!("  Estimated RAM: {}MB", stats.estimated_ram_bytes / (1024 * 1024));
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
             }
+        }
+        #[cfg(feature = "daemon")]
+        Commands::Daemon { action } => {
+            match action {
+                DaemonAction::Start { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    crate::daemon::start_daemon(&idx_path)?;
+                }
+                DaemonAction::Stop { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    let resp = crate::daemon::send_command(&idx_path, "stop")?;
+                    eprintln!("Daemon: {}", resp);
+                }
+                DaemonAction::Status { dir, output } => {
+                    let idx_path = dir.unwrap_or_else(|| PathBuf::from(".")).join(&output);
+                    if crate::daemon::is_daemon_running(&idx_path) {
+                        match crate::daemon::send_command(&idx_path, "status") {
+                            Ok(resp) => eprintln!("Daemon running, state: {}", resp),
+                            Err(e) => eprintln!("Daemon running but not responding: {}", e),
+                        }
+                    } else {
+                        eprintln!("No daemon running");
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "daemon"))]
+        Commands::Daemon { .. } => {
+            eprintln!("Daemon feature not enabled. Rebuild with --features daemon");
         }
     }
     Ok(())

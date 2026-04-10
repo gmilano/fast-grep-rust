@@ -533,6 +533,16 @@ impl PersistentIndex {
                     }
                 }
 
+                // Delta docs don't have bitmap entries — add all live delta
+                // doc_ids so incremental updates are never invisible.
+                let main_count = self.main_num_docs as u32;
+                for delta_idx in 0..self.delta_doc_ids.len() as u32 {
+                    let doc_id = main_count + delta_idx;
+                    if !self.deleted_docs.contains(&doc_id) {
+                        candidate_docs.insert(doc_id);
+                    }
+                }
+
                 if candidate_docs.is_empty() {
                     bitmap_dur += t_bitmap.elapsed();
                     continue;
@@ -1338,4 +1348,79 @@ fn chrono_now() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}s_since_epoch", dur.as_secs())
+}
+
+/// Full staleness check: walks ALL files and directories, comparing every mtime
+/// against the index metadata. Expensive (~850ms for 79K files) but zero false
+/// negatives. Used by the daemon at startup.
+pub fn full_stale_check(index: &PersistentIndex, index_path: &Path) -> bool {
+    let root = Path::new(&index.meta.root_dir);
+    let walker = ignore::WalkBuilder::new(root)
+        .git_ignore(true)
+        .hidden(false)
+        .build();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path.starts_with(index_path) {
+            continue;
+        }
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let key = path.to_string_lossy();
+            if let Some(&stored) = index.meta.dir_mtimes.get(key.as_ref()) {
+                if let Ok(m) = entry.metadata() {
+                    if mtime_secs(&m) != stored {
+                        return true;
+                    }
+                }
+            } else {
+                return true; // new directory
+            }
+        } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let key = path.to_string_lossy();
+            if let Some(&stored) = index.meta.file_mtimes.get(key.as_ref()) {
+                if let Ok(m) = fs::metadata(path) {
+                    if mtime_secs(&m) != stored {
+                        return true;
+                    }
+                }
+            } else {
+                return true; // new file
+            }
+        }
+    }
+    // Also check for deleted files (in index but not on disk)
+    for path_str in index.meta.file_mtimes.keys() {
+        if !Path::new(path_str).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Acquire an exclusive lock on the index directory for updates.
+/// Returns the lock file handle and a flag indicating whether we had to wait.
+pub fn acquire_index_lock(idx_path: &Path) -> anyhow::Result<(fs::File, bool)> {
+    let lock_path = idx_path.join("lock");
+    let mut waited = false;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => return Ok((f, waited)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !waited {
+                    eprintln!("Waiting for another process to finish updating index...");
+                    waited = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+pub fn release_index_lock(idx_path: &Path) {
+    let _ = fs::remove_file(idx_path.join("lock"));
 }
