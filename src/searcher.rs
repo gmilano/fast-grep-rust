@@ -12,6 +12,9 @@ use std::collections::HashMap;
 
 use crate::index::SparseIndex;
 use crate::persist::SearchResult;
+#[cfg(target_os = "macos")]
+use crate::metal::metal_impl::global_verifier;
+
 
 #[derive(Debug, Clone)]
 pub struct Match {
@@ -755,7 +758,35 @@ pub fn search_persistent_timed(
                     .collect()
             } else {
                 // Low density: line-level verify (read only candidate lines)
-                timing.strategy = "line-level".into();
+                // On macOS, try Metal GPU pre-filter first for literal patterns
+                // (only when FGR_METAL=1 is set).
+                let use_metal = cfg!(target_os = "macos")
+                    && std::env::var("FGR_METAL").map(|v| v == "1").unwrap_or(false);
+
+                let metal_literal: Option<Vec<u8>> = if use_metal {
+                    #[cfg(target_os = "macos")]
+                    { extract_longest_literal(pattern) }
+                    #[cfg(not(target_os = "macos"))]
+                    { None }
+                } else {
+                    None
+                };
+
+                #[cfg(target_os = "macos")]
+                let metal_verifier = if use_metal {
+                    metal_literal.as_ref().and_then(|_| global_verifier())
+                } else {
+                    None
+                };
+                #[cfg(not(target_os = "macos"))]
+                let metal_verifier: Option<&()> = None;
+
+                if metal_verifier.is_some() {
+                    timing.strategy = "line-level (metal)".into();
+                } else {
+                    timing.strategy = "line-level".into();
+                }
+
                 file_groups
                     .par_iter()
                     .flat_map(|(path, lines)| {
@@ -764,19 +795,47 @@ pub fn search_persistent_timed(
                             None => return Vec::new(),
                         };
                         let path_buf = path.to_path_buf();
-                        let mut file_matches = Vec::new();
+
+                        // --- Extract all candidate line bytes for this file ---
+                        let mut line_data: Vec<u8> = Vec::new();
+                        let mut slices: Vec<(u32, u32)> = Vec::new(); // (offset_in_line_data, len)
+                        let mut byte_offsets: Vec<(u32, usize, usize)> = Vec::new(); // (line_no, start, end)
+
                         for &(line_no, byte_offset) in lines {
                             let start = byte_offset as usize;
-                            if start >= mmap.len() {
-                                continue;
-                            }
+                            if start >= mmap.len() { continue; }
                             let end = memchr::memchr(b'\n', &mmap[start..])
                                 .map(|p| start + p)
                                 .unwrap_or(mmap.len());
+                            let off = line_data.len() as u32;
+                            let len = (end - start) as u32;
+                            line_data.extend_from_slice(&mmap[start..end]);
+                            slices.push((off, len));
+                            byte_offsets.push((line_no, start, end));
+                        }
+
+                        // --- Metal GPU pre-filter (macOS, literal patterns only) ---
+                        #[cfg(target_os = "macos")]
+                        let gpu_mask: Option<Vec<bool>> = {
+                            if let (Some(lit), Some(ver)) = (&metal_literal, global_verifier()) {
+                                Some(ver.filter(&line_data, &slices, lit))
+                            } else {
+                                None
+                            }
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let gpu_mask: Option<Vec<bool>> = None;
+
+                        // --- Final verify (regex on GPU-passed candidates) ---
+                        let mut file_matches = Vec::new();
+                        for (i, &(line_no, start, end)) in byte_offsets.iter().enumerate() {
+                            // Skip if GPU said no
+                            if let Some(ref mask) = gpu_mask {
+                                if i < mask.len() && !mask[i] { continue; }
+                            }
                             let line_bytes = &mmap[start..end];
                             if matcher.has_match(line_bytes) {
-                                let line =
-                                    String::from_utf8_lossy(line_bytes).into_owned();
+                                let line = String::from_utf8_lossy(line_bytes).into_owned();
                                 file_matches.push(Match {
                                     path: path_buf.clone(),
                                     line_number: line_no as usize,
