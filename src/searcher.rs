@@ -89,9 +89,17 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                     chars.next();
                     first = false;
                 } else if c == '[' && chars.peek() == Some(&':') {
-                    // POSIX class like [:alnum:] — skip to :]
+                    // POSIX class like [:alnum:] inside a bracket expression.
+                    // Pattern [[:space:]] — inner [:space:] closes at :],
+                    // outer ] remains for the bracket expression.
+                    chars.next(); // consume ':'
                     while let Some(p) = chars.next() {
-                        if p == ']' { break; }
+                        if p == ':' {
+                            if chars.peek() == Some(&']') {
+                                chars.next(); // consume closing ']'
+                            }
+                            break;
+                        }
                     }
                     first = false;
                 } else if c == ']' && !first {
@@ -229,6 +237,31 @@ fn try_literal_alternation(pattern: &str) -> Option<Vec<Vec<u8>>> {
     Some(literals)
 }
 
+
+/// Returns true if the pattern could produce cross-line matches,
+/// meaning we need to search line-by-line to match grep/rg behavior.
+/// This is the case when the pattern uses [[:space:]], \s, or similar
+/// that match \n, but does NOT use explicit (?s) or (?m) multiline flags.
+fn needs_line_by_line(pattern: &str) -> bool {
+    // If pattern explicitly opts into multiline/dotall, respect it
+    if pattern.contains("(?s)") || pattern.contains("(?m)") || pattern.contains("(?is)") {
+        return false;
+    }
+    // If pattern contains a literal \n, it intentionally crosses lines
+    if pattern.contains(r"\n") || pattern.contains("\n") {
+        return false;
+    }
+    // If pattern uses POSIX classes that include \n, force line-by-line
+    if pattern.contains("[[:space:]]") || pattern.contains("[[:blank:]]") {
+        return true;
+    }
+    // \s class also matches \n
+    if pattern.contains(r"\s") {
+        return true;
+    }
+    false
+}
+
 /// Matcher abstraction with SIMD-accelerated pre-filters.
 enum Matcher {
     /// Pure literal — SIMD memmem only, no regex needed
@@ -278,43 +311,54 @@ impl Matcher {
     /// Uses whole-buffer searching, computes line numbers only for hits.
     /// For pure literals, SIMD memmem pre-filter skips non-matching files in O(n/32).
     #[inline]
-    fn search_buffer(&self, buf: &[u8]) -> Vec<(usize, String)> {
+    fn search_buffer(&self, buf: &[u8], lbl: bool) -> Vec<(usize, String)> {
         match self {
             Matcher::Literal(finder) => search_literal(buf, finder),
-            Matcher::Regex(re) => search_regex(buf, re),
+            Matcher::Regex(re) => search_regex(buf, re, lbl),
             Matcher::LiteralThenRegex { finder, regex } => {
                 if finder.find(buf).is_none() {
                     return Vec::new();
                 }
-                search_regex(buf, regex)
+                search_regex(buf, regex, lbl)
             }
             Matcher::AhoCorasickThenRegex { ac, regex } => {
                 if ac.find(buf).is_none() {
                     return Vec::new();
                 }
-                search_regex(buf, regex)
+                search_regex(buf, regex, lbl)
             }
         }
     }
 
     /// Quick check: does the buffer contain any match at all?
+    /// IMPORTANT: We check line-by-line for regex patterns to avoid cross-line
+    /// false positives (e.g. [[:space:]] matching \n between two lines).
     #[inline]
-    fn has_match(&self, buf: &[u8]) -> bool {
+    fn has_match(&self, buf: &[u8], lbl: bool) -> bool {
         match self {
             Matcher::Literal(finder) => finder.find(buf).is_some(),
-            Matcher::Regex(re) => re.is_match(buf),
+            Matcher::Regex(re) => {
+                if lbl { buf.split(|&b| b == b'\n').any(|line| re.is_match(line)) }
+                else { re.is_match(buf) }
+            }
             Matcher::LiteralThenRegex { finder, regex } => {
-                finder.find(buf).is_some() && regex.is_match(buf)
+                finder.find(buf).is_some() && {
+                    if lbl { buf.split(|&b| b == b'\n').any(|line| regex.is_match(line)) }
+                    else { regex.is_match(buf) }
+                }
             }
             Matcher::AhoCorasickThenRegex { ac, regex } => {
-                ac.find(buf).is_some() && regex.is_match(buf)
+                ac.find(buf).is_some() && {
+                    if lbl { buf.split(|&b| b == b'\n').any(|line| regex.is_match(line)) }
+                    else { regex.is_match(buf) }
+                }
             }
         }
     }
 
     /// Count matching lines without allocating Strings.
     #[inline]
-    fn count_lines(&self, buf: &[u8]) -> usize {
+    fn count_lines(&self, buf: &[u8], lbl: bool) -> usize {
         match self {
             Matcher::Literal(finder) => {
                 let mut count = 0;
@@ -330,18 +374,14 @@ impl Matcher {
                 }
                 count
             }
-            Matcher::Regex(re) => count_regex_lines(buf, re),
+            Matcher::Regex(re) => count_regex_lines(buf, re, lbl),
             Matcher::LiteralThenRegex { finder, regex } => {
-                if finder.find(buf).is_none() {
-                    return 0;
-                }
-                count_regex_lines(buf, regex)
+                if finder.find(buf).is_none() { return 0; }
+                count_regex_lines(buf, regex, lbl)
             }
             Matcher::AhoCorasickThenRegex { ac, regex } => {
-                if ac.find(buf).is_none() {
-                    return 0;
-                }
-                count_regex_lines(buf, regex)
+                if ac.find(buf).is_none() { return 0; }
+                count_regex_lines(buf, regex, lbl)
             }
         }
     }
@@ -349,15 +389,24 @@ impl Matcher {
 
 /// Count regex matching lines without allocating Strings.
 #[inline]
-fn count_regex_lines(buf: &[u8], re: &BytesRegex) -> usize {
+fn count_regex_lines(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> usize {
+    if line_by_line {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos <= buf.len() {
+            let end = memchr::memchr(b'\n', &buf[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(buf.len());
+            if re.is_match(&buf[pos..end]) { count += 1; }
+            pos = end + 1;
+        }
+        return count;
+    }
     let mut count = 0;
     let mut last_line_start = usize::MAX;
     for m in re.find_iter(buf) {
         let (line_start, _) = line_bounds(buf, m.start());
-        if line_start != last_line_start {
-            count += 1;
-            last_line_start = line_start;
-        }
+        if line_start != last_line_start { count += 1; last_line_start = line_start; }
     }
     count
 }
@@ -391,31 +440,43 @@ fn search_literal(buf: &[u8], finder: &memmem::Finder) -> Vec<(usize, String)> {
     results
 }
 
-/// Regex search on raw byte buffer. Incremental line counting.
+/// Regex search on raw byte buffer.
+/// line_by_line=true: search per-line (prevents [[:space:]] matching \n).
+/// line_by_line=false: whole-buffer (for (?s)/(?m)/explicit \n patterns).
 #[inline]
-fn search_regex(buf: &[u8], re: &BytesRegex) -> Vec<(usize, String)> {
+fn search_regex(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> Vec<(usize, String)> {
+    if line_by_line {
+        let mut results = Vec::new();
+        let mut line_num: usize = 1;
+        let mut pos = 0;
+        while pos <= buf.len() {
+            let end = memchr::memchr(b'\n', &buf[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(buf.len());
+            let line = &buf[pos..end];
+            if re.is_match(line) {
+                results.push((line_num, String::from_utf8_lossy(line).into_owned()));
+            }
+            line_num += 1;
+            pos = end + 1;
+        }
+        return results;
+    }
     let mut results = Vec::new();
     let mut last_line_start = usize::MAX;
     let mut line_num: usize = 1;
     let mut counted_to: usize = 0;
-
     for m in re.find_iter(buf) {
         let start = m.start();
-
-        // Incrementally count newlines
         line_num += memchr::memchr_iter(b'\n', &buf[counted_to..start]).count();
         counted_to = start;
-
         let (line_start, line_end) = line_bounds(buf, start);
-
-        // Deduplicate: skip if same line
         if line_start != last_line_start {
             let line = String::from_utf8_lossy(&buf[line_start..line_end]).into_owned();
             results.push((line_num, line));
             last_line_start = line_start;
         }
     }
-
     results
 }
 
@@ -492,7 +553,7 @@ impl Searcher {
                 if !is_known_text_ext(path) && is_binary(buf) {
                     return Vec::new();
                 }
-                let hits = matcher.search_buffer(buf);
+                let hits = matcher.search_buffer(buf, needs_line_by_line(pattern));
                 if hits.is_empty() {
                     return Vec::new();
                 }
@@ -525,7 +586,7 @@ impl Searcher {
                 if !is_known_text_ext(path) && is_binary(buf) {
                     return false;
                 }
-                matcher.has_match(buf)
+                matcher.has_match(buf, needs_line_by_line(pattern))
             })
             .map(|p| p.to_path_buf())
             .collect();
@@ -545,6 +606,7 @@ pub fn search_persistent_count(
     pattern: &str,
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
+    let lbl = needs_line_by_line(pattern);
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -576,7 +638,7 @@ pub fn search_persistent_count(
                             Some(m) => m,
                             None => return 0,
                         };
-                        matcher.count_lines(&mmap)
+                        matcher.count_lines(&mmap, lbl)
                     })
                     .sum()
             } else {
@@ -598,7 +660,7 @@ pub fn search_persistent_count(
                                 let end = memchr::memchr(b'\n', &mmap[start..])
                                     .map(|p| start + p)
                                     .unwrap_or(mmap.len());
-                                matcher.has_match(&mmap[start..end])
+                                matcher.has_match(&mmap[start..end], needs_line_by_line(pattern))
                             })
                             .count()
                     })
@@ -606,10 +668,10 @@ pub fn search_persistent_count(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            count_file_level(&matcher, &paths, &mut timing, "bitmap-only")
+            count_file_level(&matcher, &paths, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            count_file_level(&matcher, &paths, &mut timing, "file-level (fallback)")
+            count_file_level(&matcher, &paths, &mut timing, "file-level (fallback)", lbl)
         }
     };
 
@@ -623,6 +685,7 @@ fn count_file_level(
     paths: &[&Path],
     timing: &mut crate::persist::SearchTiming,
     strategy: &str,
+    lbl: bool,
 ) -> usize {
     if paths.is_empty() {
         timing.matches = 0;
@@ -639,7 +702,7 @@ fn count_file_level(
                 Some(m) => m,
                 None => return 0,
             };
-            matcher.count_lines(&mmap)
+            matcher.count_lines(&mmap, lbl)
         })
         .sum()
 }
@@ -670,6 +733,7 @@ pub fn search_persistent_timed(
     pattern: &str,
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
+    let lbl = needs_line_by_line(pattern);
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -742,7 +806,7 @@ pub fn search_persistent_timed(
                             Some(m) => m,
                             None => return Vec::new(),
                         };
-                        let hits = matcher.search_buffer(&mmap);
+                        let hits = matcher.search_buffer(&mmap, lbl);
                         if hits.is_empty() {
                             return Vec::new();
                         }
@@ -834,7 +898,7 @@ pub fn search_persistent_timed(
                                 if i < mask.len() && !mask[i] { continue; }
                             }
                             let line_bytes = &mmap[start..end];
-                            if matcher.has_match(line_bytes) {
+                            if matcher.has_match(line_bytes, needs_line_by_line(pattern)) {
                                 let line = String::from_utf8_lossy(line_bytes).into_owned();
                                 file_matches.push(Match {
                                     path: path_buf.clone(),
@@ -849,10 +913,10 @@ pub fn search_persistent_timed(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            verify_file_level(&matcher, &paths, &mut timing, "bitmap-only")
+            verify_file_level(&matcher, &paths, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            verify_file_level(&matcher, &paths, &mut timing, "file-level (fallback)")
+            verify_file_level(&matcher, &paths, &mut timing, "file-level (fallback)", lbl)
         }
     };
 
@@ -868,6 +932,7 @@ fn verify_file_level(
     paths: &[&Path],
     timing: &mut crate::persist::SearchTiming,
     strategy: &str,
+    lbl: bool,
 ) -> Vec<Match> {
     if paths.is_empty() {
         timing.matches = 0;
@@ -884,7 +949,7 @@ fn verify_file_level(
                 Some(m) => m,
                 None => return Vec::new(),
             };
-            let hits = matcher.search_buffer(&mmap);
+            let hits = matcher.search_buffer(&mmap, lbl);
             if hits.is_empty() {
                 return Vec::new();
             }
@@ -980,7 +1045,7 @@ pub fn search_full_scan(
                 return ignore::WalkState::Continue;
             }
 
-            let hits = matcher.search_buffer(buf);
+            let hits = matcher.search_buffer(buf, needs_line_by_line(pattern));
             if !hits.is_empty() {
                 let path_buf = path.to_path_buf();
                 for (ln, line) in hits {
@@ -1083,7 +1148,7 @@ pub fn search_full_scan_count(
                 return ignore::WalkState::Continue;
             }
 
-            let count = matcher.count_lines(buf);
+            let count = matcher.count_lines(buf, needs_line_by_line(pattern));
             if count > 0 {
                 total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1219,23 +1284,44 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                 Matcher::Regex(ref re)
                 | Matcher::LiteralThenRegex { regex: ref re, .. }
                 | Matcher::AhoCorasickThenRegex { regex: ref re, .. } => {
-                    let mut last_line_start = usize::MAX;
                     let mut line_num: usize = 1;
-                    let mut counted_to: usize = 0;
 
-                    for m in re.find_iter(buf) {
-                        let start = m.start();
-                        line_num += memchr::memchr_iter(b'\n', &buf[counted_to..start]).count();
-                        counted_to = start;
-                        let (line_start, line_end) = line_bounds(buf, start);
-
-                        if line_start != last_line_start {
-                            use std::io::Write;
-                            let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                            out_buf.extend_from_slice(&buf[line_start..line_end]);
-                            out_buf.push(b'\n');
-                            file_count += 1;
-                            last_line_start = line_start;
+                    let lbl = needs_line_by_line(pattern);
+                    if lbl {
+                        // Line-by-line to prevent [[:space:]] crossing newlines
+                        let mut lpos = 0;
+                        while lpos <= buf.len() {
+                            let lend = memchr::memchr(b'\n', &buf[lpos..])
+                                .map(|p| lpos + p)
+                                .unwrap_or(buf.len());
+                            let line_bytes = &buf[lpos..lend];
+                            if re.is_match(line_bytes) {
+                                use std::io::Write;
+                                let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
+                                out_buf.extend_from_slice(line_bytes);
+                                out_buf.push(b'\n');
+                                file_count += 1;
+                            }
+                            line_num += 1;
+                            lpos = lend + 1;
+                        }
+                    } else {
+                        // Whole-buffer search
+                        let mut last_line_start = usize::MAX;
+                        let mut counted_to: usize = 0;
+                        for m in re.find_iter(buf) {
+                            let start = m.start();
+                            line_num += memchr::memchr_iter(b'\n', &buf[counted_to..start]).count();
+                            counted_to = start;
+                            let (line_start, line_end) = line_bounds(buf, start);
+                            if line_start != last_line_start {
+                                use std::io::Write;
+                                let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
+                                out_buf.extend_from_slice(&buf[line_start..line_end]);
+                                out_buf.push(b'\n');
+                                file_count += 1;
+                                last_line_start = line_start;
+                            }
                         }
                     }
                 }
@@ -1288,7 +1374,7 @@ pub fn search_persistent_mmap(
             if is_binary(&buf) {
                 return Vec::new();
             }
-            let hits = matcher.search_buffer(&buf);
+            let hits = matcher.search_buffer(&buf, needs_line_by_line(pattern));
             if hits.is_empty() {
                 return Vec::new();
             }
