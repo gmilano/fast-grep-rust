@@ -163,9 +163,17 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                     chars.next();
                     first = false;
                 } else if c == '[' && chars.peek() == Some(&':') {
-                    // POSIX class like [:alnum:] — skip to :]
+                    // POSIX class like [:alnum:] inside a bracket expression.
+                    // The full pattern is [[:alnum:]] — inner closes at :] and
+                    // outer bracket expression continues. Skip to :].
+                    chars.next(); // consume ':'
                     while let Some(p) = chars.next() {
-                        if p == ']' { break; }
+                        if p == ':' {
+                            if chars.peek() == Some(&']') {
+                                chars.next(); // consume closing ']'
+                            }
+                            break;
+                        }
                     }
                     first = false;
                 } else if c == ']' && !first {

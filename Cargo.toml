@@ -26,6 +26,10 @@ base64 = "0.21"
 notify = { version = "7", optional = true }
 ctrlc = { version = "3", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+objc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
@@ -42,3 +46,7 @@ daemon = ["dep:notify", "dep:ctrlc"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+[[example]]
+name = "re_test"
+path = "/tmp/re_test.rs"

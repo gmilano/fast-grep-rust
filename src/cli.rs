@@ -211,8 +211,15 @@ pub fn run() -> Result<()> {
         effective = format!("(?i){}", effective);
     }
 
+    // Case-insensitive search can't use the index reliably — the index stores
+    // trigrams from the original (case-sensitive) text, so (?i) patterns miss
+    // uppercase variants. Fall back to full scan when -i is active.
     if let Some(ref idx_path) = cli.index_path {
-        run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
+        if cli.ignore_case {
+            run_direct_search(&effective, &dir, &opts)?;
+        } else {
+            run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
+        }
     } else {
         run_direct_search(&effective, &dir, &opts)?;
     }

@@ -5,3 +5,5 @@ pub mod sparse;
 pub mod trigram;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+#[cfg(target_os = "macos")]
+pub mod metal;

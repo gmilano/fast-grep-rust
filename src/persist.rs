@@ -551,10 +551,12 @@ impl PersistentIndex {
                 let bm_card = candidate_docs.len() as usize;
                 bitmap_dur += t_bitmap.elapsed();
 
-                // Fast path: if bitmap is very selective (< 0.7% of corpus),
-                // skip posting load entirely — just verify the candidate files.
+                // Fast path: if bitmap is very selective (< 0.7% of corpus) AND there's
+                // only one alternative — skip posting load and verify files directly.
+                // NOTE: with multiple alternatives (alternation like a|b|c), we must NOT
+                // return early here because other alternatives still need to be processed.
                 let bitmap_threshold = (self.num_docs() as f64 * 0.007) as usize;
-                if bm_card <= bitmap_threshold {
+                if bm_card <= bitmap_threshold && alternatives.len() == 1 {
                     let paths: Vec<&Path> = candidate_docs
                         .iter()
                         .filter_map(|id| self.doc_path(id))

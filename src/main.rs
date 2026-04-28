@@ -2,6 +2,8 @@ mod cli;
 #[cfg(feature = "daemon")]
 mod daemon;
 mod index;
+#[cfg(target_os = "macos")]
+pub mod metal;
 mod persist;
 mod searcher;
 mod sparse;
