@@ -1,0 +1,68 @@
+{
+  "context": {
+    "timestamp_utc": "2026-04-30T05:45:47.210001+00:00",
+    "git_sha": "637f4ecd302f6f01f661a221a4d7a569cac2887c",
+    "git_short": "637f4ec",
+    "git_dirty": true,
+    "fgr_version": "fgr 0.3.1",
+    "hostname": "UY-IT03576",
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "corpus": "/Users/gaston.milano/os.glob.ai/os.agents.coding/coda-desktop"
+  },
+  "results": [
+    {
+      "label": "indexed:TODO",
+      "mean_s": 0.0240585416,
+      "stddev_s": 0.007640974737424746,
+      "min_s": 0.014615584000000001,
+      "max_s": 0.040728666000000004,
+      "median_s": 0.025360167000000003,
+      "runs": 10
+    },
+    {
+      "label": "indexed:useState",
+      "mean_s": 0.017308475100000005,
+      "stddev_s": 0.0005062347679491645,
+      "min_s": 0.016635708000000003,
+      "max_s": 0.017969209,
+      "median_s": 0.017325479,
+      "runs": 10
+    },
+    {
+      "label": "indexed:function",
+      "mean_s": 0.144049329,
+      "stddev_s": 0.009022936407786172,
+      "min_s": 0.129168584,
+      "max_s": 0.16311508300000002,
+      "median_s": 0.14325439550000002,
+      "runs": 10
+    },
+    {
+      "label": "indexed:import",
+      "mean_s": 0.22854066239999998,
+      "stddev_s": 0.011637655945616372,
+      "min_s": 0.2097245,
+      "max_s": 0.242469333,
+      "median_s": 0.23148800000000003,
+      "runs": 10
+    },
+    {
+      "label": "indexed:zzznopematch",
+      "mean_s": 0.008377450100000001,
+      "stddev_s": 0.0004379128609330224,
+      "min_s": 0.007369292,
+      "max_s": 0.008931459000000001,
+      "median_s": 0.008387646000000002,
+      "runs": 10
+    },
+    {
+      "label": "direct:useState",
+      "mean_s": 0.3258012085,
+      "stddev_s": 0.016650966813471075,
+      "min_s": 0.30465058300000003,
+      "max_s": 0.36602900000000005,
+      "median_s": 0.3255582295,
+      "runs": 10
+    }
+  ]
+}
