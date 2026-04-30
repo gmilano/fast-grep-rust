@@ -1,0 +1,19 @@
+# cargo-audit configuration.
+#
+# We accept transitive "unmaintained" warnings for crates we don't directly
+# depend on; cargo-audit otherwise fails CI for things we cannot fix without
+# upstream changes. These are NOT security vulnerabilities — only signals
+# that the crate's author is no longer publishing updates.
+
+[advisories]
+ignore = [
+    # `instant` is unmaintained. Pulled in transitively via:
+    #   notify (FS watcher used by the `daemon` feature) -> notify-types -> instant
+    # Re-evaluate when `notify` drops the dependency or moves to `web-time`.
+    "RUSTSEC-2024-0384",
+
+    # `paste` is unmaintained. Pulled in transitively via:
+    #   metal (macOS Metal GPU verify, optional) -> paste
+    # Re-evaluate when `metal-rs` removes the dependency.
+    "RUSTSEC-2024-0436",
+]

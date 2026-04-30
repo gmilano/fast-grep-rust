@@ -339,8 +339,19 @@ fgr daemon start /path/to/repo --output .fgr</code></pre>
   </div>
 </footer>
 
+<!--
+  Mermaid is loaded from jsDelivr but pinned to an exact version + SRI hash.
+  modulepreload + integrity makes the browser fetch + verify the bundle once;
+  the inline ESM `import` then resolves from the verified cache. If jsDelivr
+  ever serves different bytes for this version (e.g. a supply-chain attack),
+  the integrity check fails and the script does not run.
+-->
+<link rel="modulepreload"
+      href="https://cdn.jsdelivr.net/npm/mermaid@11.14.0/dist/mermaid.esm.min.mjs"
+      integrity="sha384-QKnqrMjp4QCSqR5R2H+rXW8780iTNp7Y3mwQOMdlAZhMePrlb/UxZJYF+Mqf+kUw"
+      crossorigin="anonymous" />
 <script type="module">
-  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.14.0/dist/mermaid.esm.min.mjs";
   mermaid.initialize({
     startOnLoad: true,
     theme: 'dark',

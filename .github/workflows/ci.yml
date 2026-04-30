@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least-privilege: CI only needs read access to clone the repo. No releases,
+# no PR comments, no package writes. Pull requests from forks already get a
+# read-only token by default, but we set this explicitly so a future change
+# to the workflow can't accidentally inherit broader scopes.
+permissions:
+  contents: read
+
 env:
   # Don't bake `target-cpu=native` into CI artifacts; CI runs on shared hardware
   # and there's no need to over-specialize. The local dev default in
@@ -49,3 +56,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets -- -D warnings
         continue-on-error: true
+
+  audit:
+    name: cargo audit (deps CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Honors .cargo/audit.toml so we don't fail on triaged unmaintained-only
+      # warnings. Real CVEs (vulnerability advisories) still fail the build.
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
