@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+  "version": "0.1.0",
+  "description": "Indexed regex search. 6-25x faster than ripgrep on large codebases.",
+  "homepage": "https://github.com/gmilano/fast-grep-rust",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/gmilano/fast-grep-rust/releases/download/v0.1.0/fast-grep-v0.1.0-x86_64-pc-windows-msvc.zip",
+      "hash": "REPLACE_WITH_X86_64_WINDOWS_SHA256"
+    }
+  },
+  "extract_dir": "fast-grep-v0.1.0-x86_64-pc-windows-msvc",
+  "bin": "fgr.exe",
+  "checkver": {
+    "github": "https://github.com/gmilano/fast-grep-rust"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/gmilano/fast-grep-rust/releases/download/v$version/fast-grep-v$version-x86_64-pc-windows-msvc.zip"
+      }
+    },
+    "extract_dir": "fast-grep-v$version-x86_64-pc-windows-msvc",
+    "hash": {
+      "url": "$url.sha256"
+    }
+  }
+}
