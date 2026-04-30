@@ -53,15 +53,93 @@ Five techniques combine to eliminate >99% of I/O before the regex engine runs:
 
 5. **4-byte content prefix filter** — Before running the regex engine, checks a 4-byte content prefix per candidate. Eliminates 95%+ of I/O during verification.
 
-## Install
+## Installation
+
+The binary name is `fgr`.
+
+### Precompiled binaries
+
+Download the archive for your platform from the
+[latest release](https://github.com/gmilano/fast-grep-rust/releases/latest) and
+put `fgr` somewhere on your `PATH`. SHA256 sidecars (`*.sha256`) and a
+`SHA256SUMS` file are attached to every release.
+
+Targets published on each release:
+
+| OS      | Architecture | Archive                                                  |
+| ------- | ------------ | -------------------------------------------------------- |
+| macOS   | aarch64      | `fast-grep-vX.Y.Z-aarch64-apple-darwin.tar.gz`           |
+| macOS   | x86_64       | `fast-grep-vX.Y.Z-x86_64-apple-darwin.tar.gz`            |
+| Linux   | aarch64 (gnu)| `fast-grep-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`      |
+| Linux   | aarch64 (musl)| `fast-grep-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`    |
+| Linux   | x86_64 (gnu) | `fast-grep-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`       |
+| Linux   | x86_64 (musl)| `fast-grep-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`      |
+| Windows | x86_64       | `fast-grep-vX.Y.Z-x86_64-pc-windows-msvc.zip`            |
+
+### Cargo (any platform with a Rust toolchain)
+
+```bash
+cargo install fast-grep
+```
+
+Or download a prebuilt binary into Cargo's bin dir without compiling:
+
+```bash
+cargo binstall fast-grep
+```
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew install gmilano/fast-grep/fast-grep
+```
+
+The tap lives at [`gmilano/homebrew-fast-grep`](https://github.com/gmilano/homebrew-fast-grep).
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add fast-grep https://github.com/gmilano/scoop-fast-grep
+scoop install fast-grep
+```
+
+### Debian / Ubuntu (.deb)
+
+A `.deb` package is attached to every release for `amd64` and `arm64`:
+
+```bash
+curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.1.0-1_amd64.deb
+sudo dpkg -i fast-grep_*_amd64.deb
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/gmilano/fast-grep-rust
 cd fast-grep-rust
 cargo build --release
+# binary at ./target/release/fgr
 ```
 
-Binary at `./target/release/fgr`. SIMD (AVX2/NEON) auto-enabled via `.cargo/config.toml`.
+SIMD (AVX2/NEON) auto-enabled via `.cargo/config.toml` (`target-cpu=native`),
+so a from-source build is tuned to your machine. Distributed binaries are
+built without `target-cpu=native` so they work on any CPU of the target arch.
+
+### Not yet packaged
+
+These channels are not officially packaged yet — they need a community
+maintainer in each ecosystem (the same path ripgrep took). PRs welcome.
+
+- `apt` on Debian / Ubuntu (official repos)
+- `dnf` on Fedora / `yum` on RHEL
+- `pacman` on Arch / AUR
+- MacPorts
+- Chocolatey / Winget
+- FreeBSD `pkg`, OpenBSD `pkg_add`, NetBSD `pkgin`
+- Nix / Guix / Flox
+- Void Linux / Gentoo
+
+In the meantime, `cargo install fast-grep` works on all of them.
 
 ## Usage
 

@@ -2,6 +2,26 @@
 name = "fast-grep"
 version = "0.1.0"
 edition = "2021"
+authors = ["Gaston Milano <gmilano@genexus.com>"]
+description = "Indexed regex search. 6-25x faster than ripgrep on large codebases via sparse n-gram index, position masks, and mmap'd posting lists."
+license = "MIT"
+repository = "https://github.com/gmilano/fast-grep-rust"
+homepage = "https://github.com/gmilano/fast-grep-rust"
+documentation = "https://github.com/gmilano/fast-grep-rust"
+readme = "README.md"
+keywords = ["grep", "search", "regex", "index", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = [
+    "benches/data/**",
+    "*.pdf",
+    "docs/**",
+    ".fgr/**",
+    ".claude/**",
+    "TASK.md",
+    "AGENTS.md",
+    "ADAPTIVE_FREQ.md",
+    "SIMD_LITERAL.md",
+]
 
 [[bin]]
 name = "fgr"
@@ -41,6 +61,21 @@ harness = false
 lto = true
 codegen-units = 1
 
-[[example]]
-name = "re_test"
-path = "/tmp/re_test.rs"
+# Metadata for cargo-deb (used by the release workflow to build .deb packages)
+[package.metadata.deb]
+maintainer = "Gaston Milano <gmilano@genexus.com>"
+copyright = "2026, Gaston Milano <gmilano@genexus.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+fast-grep (fgr) is an indexed regex search tool. It builds a persistent
+sparse n-gram index over a codebase so that subsequent searches become
+sub-200ms lookups instead of multi-second full scans. Without an index it
+falls back to a ripgrep-equivalent parallel scan."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/fgr", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/fast-grep/README", "644"],
+    ["LICENSE", "usr/share/doc/fast-grep/LICENSE", "644"],
+]

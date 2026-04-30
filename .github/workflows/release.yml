@@ -1,0 +1,264 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). If empty, uses current ref."
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  # Override .cargo/config.toml's `target-cpu=native` so released binaries
+  # run on any CPU of the target architecture, not just the build host.
+  RUSTFLAGS: ""
+  CARGO_TERM_COLOR: always
+  BIN_NAME: fgr
+  CRATE_NAME: fast-grep
+
+jobs:
+  # Resolve the tag/version once so every downstream job agrees.
+  meta:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: false
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use_cross: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_cross: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: matrix.use_cross == false
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross == true
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        shell: bash
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage archive
+        id: stage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          target="${{ matrix.target }}"
+          name="${CRATE_NAME}-${tag}-${target}"
+          stage="$(mktemp -d)/$name"
+          mkdir -p "$stage"
+
+          if [[ "${{ matrix.os }}" == windows-* ]]; then
+            cp "target/${target}/release/${BIN_NAME}.exe" "$stage/"
+          else
+            cp "target/${target}/release/${BIN_NAME}" "$stage/"
+          fi
+          cp README.md LICENSE "$stage/"
+
+          mkdir -p dist
+          repo_root="$PWD"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            archive="dist/${name}.zip"
+            (cd "$(dirname "$stage")" && 7z a -tzip "$repo_root/$archive" "$(basename "$stage")") \
+              || (cd "$(dirname "$stage")" && zip -r "$repo_root/$archive" "$(basename "$stage")")
+          else
+            archive="dist/${name}.tar.gz"
+            tar -C "$(dirname "$stage")" -czf "$archive" "$(basename "$stage")"
+          fi
+
+          # SHA256 sidecar (Homebrew + integrity)
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$archive" | awk '{print $1}' > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" | awk '{print $1}' > "${archive}.sha256"
+          fi
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sha256=${archive}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.sha256 }}
+          if-no-files-found: error
+
+  deb:
+    name: build .deb (${{ matrix.target }})
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.target }}
+
+      - name: Install cross (aarch64 only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Build .deb
+        shell: bash
+        run: cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Stage .deb
+        id: stage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          deb=$(ls target/${{ matrix.target }}/debian/*.deb | head -n1)
+          cp "$deb" dist/
+          cd dist
+          for f in *.deb; do sha256sum "$f" | awk '{print $1}' > "$f.sha256"; done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: [meta, build, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.sha256' \) -exec cp {} release/ \;
+          (cd release && sha256sum *.tar.gz *.zip *.deb 2>/dev/null > SHA256SUMS || true)
+          ls -la release
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          generate_release_notes: true
+          files: release/*
+
+  publish-crate:
+    name: publish to crates.io
+    needs: [meta, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo publish (skipped if CRATES_IO_TOKEN secret is unset)
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${CRATES_IO_TOKEN:-}" ]; then
+            echo "CRATES_IO_TOKEN secret not set; skipping crates.io publish."
+            exit 0
+          fi
+          cargo publish --locked --token "$CRATES_IO_TOKEN"
