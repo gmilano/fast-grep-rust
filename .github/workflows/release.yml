@@ -252,7 +252,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo publish (skipped if CRATES_IO_TOKEN secret is unset)
+      - name: cargo publish (skipped if token unset or version already on crates.io)
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         shell: bash
@@ -261,4 +261,10 @@ jobs:
             echo "CRATES_IO_TOKEN secret not set; skipping crates.io publish."
             exit 0
           fi
-          cargo publish --locked --token "$CRATES_IO_TOKEN"
+          out=$(cargo publish --locked --token "$CRATES_IO_TOKEN" 2>&1) && { echo "$out"; exit 0; }
+          echo "$out"
+          if echo "$out" | grep -qE "already (uploaded|exists)"; then
+            echo "Version already on crates.io — treating as success."
+            exit 0
+          fi
+          exit 1
