@@ -108,7 +108,7 @@ scoop install fast-grep
 A `.deb` package is attached to every release for `amd64` and `arm64`:
 
 ```bash
-curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.3.0-1_amd64.deb
+curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.3.1-1_amd64.deb
 sudo dpkg -i fast-grep_*_amd64.deb
 ```
 

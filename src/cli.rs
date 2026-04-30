@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -6,6 +7,17 @@ use clap::{Parser, Subcommand};
 
 use crate::{index, persist, searcher};
 
+// ANSI escape codes for the TTY rendering path. We write them by hand to keep
+// the dep footprint zero (no `colored`, no `termcolor`) — the codes that
+// survive on every modern terminal we care about (macOS Terminal/iTerm2,
+// Linux xterm/gnome-terminal/alacritty, Windows Terminal).
+const C_RESET: &str = "\x1b[0m";
+const C_BOLD: &str = "\x1b[1m";
+const C_DIM: &str = "\x1b[2m";
+const C_PATH: &str = "\x1b[35m"; // magenta — file paths
+const C_LINENO: &str = "\x1b[32m"; // green — line numbers
+const C_MATCH: &str = "\x1b[1;31m"; // bold red — matched substring
+
 /// Search options extracted from CLI flags
 struct SearchOpts {
     count: bool,
@@ -13,6 +25,9 @@ struct SearchOpts {
     quiet: bool,
     no_ignore: bool,
     file_type: Option<String>,
+    /// Effective regex pattern (may have (?i) prefix etc.) — used by the TTY
+    /// renderer to highlight matched substrings.
+    pattern: Option<String>,
 }
 
 #[derive(Parser)]
@@ -185,6 +200,7 @@ pub fn run() -> Result<()> {
         quiet: cli.quiet,
         no_ignore: cli.no_ignore,
         file_type: cli.file_type.clone(),
+        pattern: None, // populated below once the effective pattern is built
     };
 
     if let Some(cmd) = cli.command {
@@ -210,6 +226,9 @@ pub fn run() -> Result<()> {
     if cli.ignore_case {
         effective = format!("(?i){}", effective);
     }
+
+    let mut opts = opts;
+    opts.pattern = Some(effective.clone());
 
     // Case-insensitive search can't use the index reliably — the index stores
     // trigrams from the original (case-sensitive) text, so (?i) patterns miss
@@ -243,14 +262,30 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         return Ok(());
     }
 
-    // For default output, use streaming API — minimal allocations, direct to stdout
+    // TTY path: collect matches, then render grouped+colored. The collecting
+    // overhead is negligible compared to the regex+IO, and grouped rendering
+    // requires sorted-by-file matches anyway.
+    if std::io::stdout().is_terminal() {
+        let start = Instant::now();
+        let mut matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+        // Stable sort by path so streaming-order races don't interleave files
+        // in the rendered output. Within a file, search_full_scan already
+        // returns matches in line order.
+        matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
+        let elapsed = start.elapsed();
+        let n = matches.len();
+        output_matches(&matches, opts)?;
+        eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, n);
+        return Ok(());
+    }
+
+    // Piped path: streaming `path:line:content` for grep-compatible pipelines.
     let start = Instant::now();
     let output = std::sync::Mutex::new(std::io::BufWriter::new(std::io::stdout()));
     let count = searcher::search_full_scan_streaming(
         dir, pattern, opts.no_ignore, opts.file_type.as_deref(), &output,
     )?;
     {
-        use std::io::Write;
         let mut out = output.lock().unwrap();
         let _ = out.flush();
     }
@@ -306,7 +341,8 @@ fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &s
             eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
         }
     } else {
-        let (matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref())?;
+        let (mut matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref())?;
+        matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
         let search_time = start.elapsed();
         output_matches(&matches, opts)?;
         if !opts.quiet {
@@ -323,22 +359,110 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
         for m in matches { *counts.entry(&m.path).or_insert(0) += 1; }
         let mut pairs: Vec<_> = counts.into_iter().collect();
         pairs.sort_by_key(|(p, _)| p.clone());
-        for (path, count) in pairs { println!("{}:{}", path.display(), count); }
+        let tty = std::io::stdout().is_terminal();
+        for (path, count) in pairs {
+            if tty {
+                println!("{}{}{}{}:{}{}{}", C_BOLD, C_PATH, path.display(), C_RESET, C_LINENO, count, C_RESET);
+            } else {
+                println!("{}:{}", path.display(), count);
+            }
+        }
         return Ok(());
     }
     if opts.files_only {
         let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
         files.sort(); files.dedup();
-        for f in files { println!("{}", f.display()); }
+        let tty = std::io::stdout().is_terminal();
+        for f in files {
+            if tty {
+                println!("{}{}{}{}", C_BOLD, C_PATH, f.display(), C_RESET);
+            } else {
+                println!("{}", f.display());
+            }
+        }
         return Ok(());
     }
-    use std::io::Write;
+
     let stdout = std::io::stdout();
+    let tty = stdout.is_terminal();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    for m in matches {
-        let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
+    if tty {
+        write_grouped_matches(&mut out, matches, opts.pattern.as_deref())?;
+    } else {
+        for m in matches {
+            let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
+        }
     }
     Ok(())
+}
+
+/// ripgrep-style grouped output: file path on its own line, then each match
+/// indented as `<lineno>: <content>` with the matched substring highlighted.
+/// Improves on rg by right-aligning line numbers within each file group, so a
+/// file that contains both line 3 and line 1042 renders cleanly aligned.
+fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pattern: Option<&str>) -> Result<()> {
+    // Compile the regex once for highlight-position lookups. If pattern is
+    // None or doesn't compile, we still print the line — just unhighlighted.
+    let re = pattern.and_then(|p| regex::Regex::new(p).ok());
+
+    let mut current: Option<&std::path::Path> = None;
+    let mut i = 0;
+    while i < matches.len() {
+        // Find the end of the current file's run.
+        let path = matches[i].path.as_path();
+        let mut j = i + 1;
+        while j < matches.len() && matches[j].path.as_path() == path { j += 1; }
+
+        // Width of the largest line number in this group (for right-align).
+        let max_lineno = matches[i..j].iter().map(|m| m.line_number).max().unwrap_or(1);
+        let lineno_width = max_lineno.to_string().len();
+
+        // Blank line between groups.
+        if current.is_some() {
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out, "{}{}{}{}", C_BOLD, C_PATH, path.display(), C_RESET);
+
+        for m in &matches[i..j] {
+            let line = if let Some(ref r) = re {
+                highlight_matches(&m.line, r)
+            } else {
+                m.line.clone()
+            };
+            let _ = writeln!(
+                out,
+                "{}{:>w$}{}{}:{} {}",
+                C_LINENO, m.line_number, C_RESET,
+                C_DIM, C_RESET,
+                line,
+                w = lineno_width,
+            );
+        }
+
+        current = Some(path);
+        i = j;
+    }
+    Ok(())
+}
+
+/// Returns a copy of `line` with every regex match wrapped in ANSI codes.
+/// Falls back to returning the line unchanged if the regex can't be applied.
+fn highlight_matches(line: &str, re: &regex::Regex) -> String {
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut last_end = 0usize;
+    for mat in re.find_iter(line) {
+        if mat.start() > last_end {
+            out.push_str(&line[last_end..mat.start()]);
+        }
+        out.push_str(C_MATCH);
+        out.push_str(&line[mat.start()..mat.end()]);
+        out.push_str(C_RESET);
+        last_end = mat.end();
+    }
+    if last_end < line.len() {
+        out.push_str(&line[last_end..]);
+    }
+    out
 }
 
 fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
