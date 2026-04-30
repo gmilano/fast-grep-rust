@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>fast-grep — indexed regex search, 6–25× faster than ripgrep</title>
+  <meta name="description" content="fast-grep is an open-source indexed regex search tool: 6–25× faster than ripgrep on the Linux kernel, git-independent, MIT-licensed, written in Rust." />
+  <meta property="og:title" content="fast-grep — indexed regex search" />
+  <meta property="og:description" content="6–25× faster than ripgrep on the Linux kernel. Git-independent. Open source." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>fast-grep</h1>
+    <p class="tagline">Indexed regex search for codebases. 6–25× faster than ripgrep, sub-200ms per query, git-independent. Built so coding agents stop waiting for grep.</p>
+    <div class="badges">
+      <a href="https://crates.io/crates/fast-grep"><img src="https://img.shields.io/crates/v/fast-grep.svg" alt="crates.io" /></a>
+      <a href="https://github.com/gmilano/fast-grep-rust/releases/latest"><img src="https://img.shields.io/github/v/release/gmilano/fast-grep-rust" alt="release" /></a>
+      <a href="https://github.com/gmilano/fast-grep-rust/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT" /></a>
+    </div>
+    <div class="cta">
+      <a class="btn" href="https://github.com/gmilano/fast-grep-rust">View on GitHub</a>
+      <a class="btn ghost" href="#install">Install</a>
+      <a class="btn ghost" href="#how">How it works</a>
+    </div>
+  </div>
+</header>
+
+<nav class="toc">
+  <div class="wrap">
+    <strong>fast-grep</strong>
+    <a href="#why">Why</a>
+    <a href="#how">How it works</a>
+    <a href="#decompose">Live demo</a>
+    <a href="#pipeline">Search pipeline</a>
+    <a href="#architecture">Architecture (C4)</a>
+    <a href="#bench">Benchmarks</a>
+    <a href="#testing">Testing pyramid</a>
+    <a href="#install">Install</a>
+  </div>
+</nav>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Why this exists</h2>
+    <p class="lede">Coding agents call <code>grep</code> on every reasoning step. Each call blocks the next thought. Across a session, slow search compounds into minutes of dead time per task — the single biggest latency leak in any agent harness.</p>
+    <p>Cursor's blog on indexed regex search lit the spark. They tied their index to git commits. We didn't: fast-grep watches any directory, kept fresh by an FS daemon, and works on non-git repos, generated artifacts, and unstaged changes. It's the fastest open-source indexed grep we've measured.</p>
+    <p><a href="https://www.genexus.com">Built at GeneXus</a> · <a href="https://github.com/gmilano/fast-grep-rust">github.com/gmilano/fast-grep-rust</a></p>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How fast-grep searches</h2>
+    <p class="lede">Five techniques combine to eliminate &gt;99% of file I/O before the regex engine runs.</p>
+    <div class="steps">
+      <div class="card">
+        <h4>1. Sparse n-grams</h4>
+        <p>Variable-length substrings whose boundaries fall on rare bigram pairs (computed from the corpus itself). Fewer, longer, more selective posting lists than fixed trigrams.</p>
+      </div>
+      <div class="card">
+        <h4>2. Position masks</h4>
+        <p>Two 8-bit Bloom filters per (n-gram, document) pair encode position-mod-8 and successor character. Drops the false-positive rate to 0.42% before any I/O.</p>
+      </div>
+      <div class="card">
+        <h4>3. mmap'd posting lists</h4>
+        <p>Binary index files memory-mapped at query time. 17ms cold load regardless of corpus size — the OS pages in only the lists you touch.</p>
+      </div>
+      <div class="card">
+        <h4>4. Line-level offsets</h4>
+        <p>Index stores byte offsets of candidate lines, not just file IDs. Verification jumps directly to the suspicious line instead of scanning the whole file.</p>
+      </div>
+      <div class="card">
+        <h4>5. 4-byte prefix filter</h4>
+        <p>Before invoking the regex engine, fast-grep checks a 4-byte content prefix per candidate line. Eliminates &gt;95% of remaining I/O.</p>
+      </div>
+    </div>
+    <p class="note" style="margin-top: 24px;">Deep dive: <a href="techniques.md">Techniques</a> · <a href="vs-ripgrep.md">vs ripgrep</a> · <a href="https://github.com/gmilano/fast-grep-rust/blob/master/src/searcher.rs">source code</a></p>
+  </div>
+</section>
+
+<section id="decompose">
+  <div class="wrap">
+    <h2>Live: how a pattern decomposes</h2>
+    <p class="lede">Type a regex (or paste a real one) and see how fast-grep would decompose it into trigrams to look up in the index. Falls back to a full scan when there's no usable literal run.</p>
+    <div class="demo">
+      <label for="pat-input">Pattern:</label>
+      <input id="pat-input" type="text" value="EXPORT_SYMBOL" autocomplete="off" spellcheck="false" />
+      <div class="preset-row">
+        <button class="preset-btn" data-pattern="EXPORT_SYMBOL">EXPORT_SYMBOL</button>
+        <button class="preset-btn" data-pattern="TODO|FIXME|HACK">TODO|FIXME|HACK</button>
+        <button class="preset-btn" data-pattern="static.*inline">static.*inline</button>
+        <button class="preset-btn" data-pattern="container_of">container_of</button>
+        <button class="preset-btn" data-pattern="\\bfn\\s+\\w+">\bfn\s+\w+</button>
+        <button class="preset-btn" data-pattern="ab">ab (too short)</button>
+      </div>
+      <div class="output" id="pat-output"></div>
+    </div>
+    <p class="note">This demo uses fixed 3-grams for clarity. The real engine uses corpus-adaptive sparse n-grams (variable length, bigram-rarity weighted) which produce fewer, more selective lookups — but the decomposition pattern matching shown here (literal vs alternation vs regex) is exactly what <code>src/searcher.rs</code> implements.</p>
+  </div>
+</section>
+
+<section id="pipeline">
+  <div class="wrap">
+    <h2>Indexed search pipeline</h2>
+    <p class="lede">The 5-stage path a query takes through fast-grep, with realistic numbers from the Linux kernel benchmark (<code>EXPORT_SYMBOL</code> over 81 690 files):</p>
+    <div class="pipeline">
+      <div class="pipeline-step" data-step="0">
+        <h5>1. Pattern</h5>
+        <div class="value"></div>
+      </div>
+      <div class="pipeline-step" data-step="1">
+        <h5>2. Trigrams</h5>
+        <div class="value"></div>
+      </div>
+      <div class="pipeline-step" data-step="2">
+        <h5>3. Posting lists</h5>
+        <div class="value"></div>
+      </div>
+      <div class="pipeline-step" data-step="3">
+        <h5>4. Position masks</h5>
+        <div class="value"></div>
+      </div>
+      <div class="pipeline-step" data-step="4">
+        <h5>5. Verify</h5>
+        <div class="value"></div>
+      </div>
+    </div>
+    <div class="pipeline-controls">
+      <button class="btn play">▶ Play</button>
+      <button class="btn ghost reset">↻ Reset</button>
+      <span class="step-label">Press play to start</span>
+    </div>
+    <p class="note">Steps 1–4 take ≈10 ms. Step 5 (the only stage that touches actual file bytes) is where the 4-byte prefix filter eliminates &gt;95% of the I/O. End-to-end this query returns 197 matches in 197 ms — vs 1 553 ms for ripgrep.</p>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <h2>Architecture (C4 model)</h2>
+    <p class="lede">Three zoom levels, from "where does this fit" to "what runs in the search hot path". Mermaid renders these in your browser.</p>
+
+    <h3>Level 1 — System Context</h3>
+    <p>Who uses fast-grep, and what does it talk to?</p>
+    <pre class="mermaid">
+graph TB
+  dev["👤 Developer<br/>shell user"]
+  agent["🤖 Coding agent<br/>(Cursor, Claude Code, Aider)"]
+  fgr(("fast-grep<br/>CLI + optional daemon"))
+  fs[(File system<br/>any directory)]
+
+  dev -- "fgr 'pattern' /path" --> fgr
+  agent -- "tool-call: search" --> fgr
+  fgr -- "mmap reads" --> fs
+  fgr -- "watch + read" --> fs
+    </pre>
+
+    <h3>Level 2 — Containers</h3>
+    <p>Inside fast-grep there are two cooperating processes plus the on-disk index.</p>
+    <pre class="mermaid">
+graph LR
+  cli["fgr CLI<br/>(Rust binary, single static)"]
+  daemon["fgr daemon<br/>(optional, FS-watcher)"]
+  index[(Index files<br/>mmap'd: postings, bitmaps,<br/>lookup, meta.json)]
+  fs[(File system)]
+
+  cli -- "build / load" --> index
+  cli -- "TCP localhost<br/>(flush before search)" --> daemon
+  daemon -- "incremental<br/>updates" --> index
+  daemon -- "notify::Watcher<br/>(debounced 3s)" --> fs
+  cli -- "verify reads" --> fs
+    </pre>
+
+    <h3>Level 3 — Search Components</h3>
+    <p>The internals of one indexed query, top-to-bottom in execution order.</p>
+    <pre class="mermaid">
+graph TB
+  cli["CLI / argument parser"]
+  pat["Pattern decomposer<br/>(extract literal runs &amp;<br/>alternation branches)"]
+  load["Index loader<br/>(mmap meta.json + postings)"]
+  ngram["Sparse n-gram extractor"]
+  posting["Posting list intersection"]
+  bloom["Position-mask Bloom filter<br/>(Blackbird locMask + nextMask)"]
+  prefix["4-byte content prefix filter"]
+  verify["Line-level regex verify"]
+  out["Output renderer<br/>(grouped/colored or piped)"]
+
+  cli --> pat --> ngram --> posting --> bloom --> prefix --> verify --> out
+  load -.-> posting
+  load -.-> bloom
+    </pre>
+
+    <p class="note">The optional Metal GPU pre-filter (macOS, opt-in via <code>FGR_METAL=1</code>) lives between "prefix" and "verify" and runs literal scans on candidate lines as a Metal compute kernel.</p>
+  </div>
+</section>
+
+<section id="bench">
+  <div class="wrap">
+    <h2>Benchmarks</h2>
+    <p class="lede">Linux kernel 6.6 (81 690 files), Apple M1 Pro, warm cache. Numbers from the project's <a href="https://github.com/gmilano/fast-grep-rust/blob/master/scripts/bench.sh">reproducible bench script</a>.</p>
+    <h3>vs ripgrep (no index)</h3>
+    <table>
+      <thead><tr><th>Pattern</th><th>fast-grep</th><th>ripgrep</th><th>Speedup</th></tr></thead>
+      <tbody>
+        <tr><td><code>TODO</code></td><td><strong>97 ms</strong></td><td>2 463 ms</td><td><strong>25×</strong></td></tr>
+        <tr><td><code>printk</code></td><td><strong>172 ms</strong></td><td>2 492 ms</td><td><strong>14×</strong></td></tr>
+        <tr><td><code>EXPORT_SYMBOL</code></td><td><strong>197 ms</strong></td><td>1 553 ms</td><td><strong>8×</strong></td></tr>
+        <tr><td><code>container_of</code></td><td><strong>344 ms</strong></td><td>2 440 ms</td><td><strong>7×</strong></td></tr>
+        <tr><td><code>static.*inline</code></td><td><strong>394 ms</strong></td><td>2 369 ms</td><td><strong>6×</strong></td></tr>
+      </tbody>
+    </table>
+    <h3>vs ugrep (indexed)</h3>
+    <table>
+      <thead><tr><th>Pattern</th><th>fast-grep</th><th>ugrep</th><th>Speedup</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXPORT_SYMBOL</code></td><td><strong>197 ms</strong></td><td>1 898 ms</td><td><strong>9.6×</strong></td></tr>
+        <tr><td><code>TODO</code></td><td><strong>97 ms</strong></td><td>599 ms</td><td><strong>6.2×</strong></td></tr>
+        <tr><td><code>static.*inline</code></td><td><strong>394 ms</strong></td><td>1 595 ms</td><td><strong>4.0×</strong></td></tr>
+        <tr><td><code>printk</code></td><td><strong>172 ms</strong></td><td>645 ms</td><td><strong>3.8×</strong></td></tr>
+        <tr><td><code>container_of</code></td><td><strong>344 ms</strong></td><td>656 ms</td><td><strong>1.9×</strong></td></tr>
+      </tbody>
+    </table>
+    <h3>Index cost</h3>
+    <table>
+      <tbody>
+        <tr><td>Full build</td><td><strong>~60 s</strong> (one-time)</td></tr>
+        <tr><td>Incremental update</td><td>&lt;1 s for 10–100 files (75× faster than rebuild)</td></tr>
+        <tr><td>Index load (mmap)</td><td>17 ms</td></tr>
+        <tr><td>Index size</td><td>775 MB postings + 161 MB bitmaps</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="testing">
+  <div class="wrap">
+    <h2>Testing pyramid</h2>
+    <p class="lede">Where the project sits today, and where we want it to go. Numbers reflect <code>cargo test --release</code> output as of the latest release.</p>
+
+    <h3>Current state</h3>
+    <div class="pyramid">
+      <div class="pyramid-tier t-e2e">
+        <div class="count">0</div>
+        <div class="label">E2E / CLI snapshot tests</div>
+      </div>
+      <div class="pyramid-tier t-int">
+        <div class="count">9</div>
+        <div class="label">Integration: searcher (7) + regex correctness corpus (2)</div>
+      </div>
+      <div class="pyramid-tier t-unit">
+        <div class="count">33</div>
+        <div class="label">Unit: index, sparse, trigram</div>
+      </div>
+    </div>
+
+    <h3>Target state</h3>
+    <p>What a healthy pyramid for this project looks like — gaps to fill, ranked by ROI:</p>
+    <table>
+      <thead><tr><th>Tier</th><th>Now</th><th>Target</th><th>Gap (why it matters)</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Unit</td>
+          <td>33</td>
+          <td>~80</td>
+          <td>Coverage holes in <code>persist.rs</code>, <code>daemon.rs</code>, the <code>output_matches</code>/<code>highlight_into</code> renderer (the recent v0.3.1 work has zero unit coverage).</td>
+        </tr>
+        <tr>
+          <td>Property</td>
+          <td>0</td>
+          <td>~10</td>
+          <td>Invariants of the regex decomposer: literal runs of length ≥3 should always intersect-match the input; alternation splits should round-trip. <code>proptest</code> is the right tool.</td>
+        </tr>
+        <tr>
+          <td>Integration</td>
+          <td>9</td>
+          <td>~25</td>
+          <td>Daemon lifecycle (start → fs change → flush before search), incremental update against committed-then-modified files, --type filter combinations.</td>
+        </tr>
+        <tr>
+          <td>CLI snapshot</td>
+          <td>0</td>
+          <td>~15</td>
+          <td>Lock the user-facing TTY output (grouped/colored) and piped output (<code>path:line:content</code>) with <code>insta</code> snapshots so we don't silently regress the rendering.</td>
+        </tr>
+        <tr>
+          <td>Fuzz</td>
+          <td>0</td>
+          <td>1 target</td>
+          <td><code>cargo-fuzz</code> on the verifier: random pattern + random byte buffer should never panic and should match the regex crate's own behavior.</td>
+        </tr>
+        <tr>
+          <td>Bench (regression)</td>
+          <td>baseline JSON</td>
+          <td>CI gate</td>
+          <td>Wire <code>scripts/bench.sh</code> into a GitHub Action that compares against <code>benches/baseline-v0.3.1.json</code> and fails the build if any pattern regresses by &gt;15%.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="lede">All channels we control. Community packaging (apt, Fedora, Arch, MacPorts, Chocolatey…) welcome — see <a href="https://github.com/gmilano/fast-grep-rust#not-yet-packaged">README</a>.</p>
+    <pre><code># Cargo (any platform with a Rust toolchain)
+cargo install fast-grep
+
+# Prebuilt binary via cargo-binstall
+cargo binstall fast-grep
+
+# Homebrew (macOS / Linux)
+brew install gmilano/fast-grep/fast-grep
+
+# Scoop (Windows)
+scoop bucket add fast-grep https://github.com/gmilano/scoop-fast-grep
+scoop install fast-grep
+
+# Debian / Ubuntu — .deb attached to every release
+curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.3.1-1_amd64.deb
+sudo dpkg -i fast-grep_*_amd64.deb</code></pre>
+    <p>Then:</p>
+    <pre><code># Build the index once (auto-built on first search if missing)
+fgr index /path/to/repo --output .fgr
+
+# Search — sub-200ms on cached queries
+fgr "EXPORT_SYMBOL" /path/to/repo --index .fgr
+
+# Watch + auto-update on file changes
+fgr daemon start /path/to/repo --output .fgr</code></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Built at <a href="https://www.genexus.com">GeneXus</a> · MIT · <a href="https://github.com/gmilano/fast-grep-rust">github.com/gmilano/fast-grep-rust</a>
+  </div>
+</footer>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      darkMode: true,
+      background: '#161b22',
+      primaryColor: '#21262d',
+      primaryTextColor: '#e6edf3',
+      primaryBorderColor: '#58a6ff',
+      lineColor: '#8b949e',
+      secondaryColor: '#161b22',
+      tertiaryColor: '#0d1117',
+    },
+    flowchart: { curve: 'basis', useMaxWidth: true },
+  });
+</script>
+<script src="app.js" defer></script>
+
+</body>
+</html>
