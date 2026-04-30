@@ -81,13 +81,5 @@ cargo binstall fast-grep
 
 ## Cutting a release
 
-```
-# 1. Bump version in Cargo.toml + Cargo.lock
-cargo update -p fast-grep --precise X.Y.Z 2>/dev/null || true
-# 2. Tag and push
-git tag vX.Y.Z
-git push origin vX.Y.Z
-# 3. Wait for the release workflow to finish, then:
-packaging/homebrew/update-formula.sh vX.Y.Z   # update tap
-packaging/scoop/update-manifest.sh vX.Y.Z     # update bucket
-```
+See [`../RELEASING.md`](../RELEASING.md) for the full procedure (version
+bump, tagging, post-tag tap/bucket updates, and common failure modes).

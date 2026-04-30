@@ -208,6 +208,11 @@ LLM coding agents (Cursor, Claude Code, Aider) spend significant time grepping l
 | [zoekt](https://github.com/sourcegraph/zoekt) | Trigram index (Go) | Powers Sourcegraph |
 | [Cursor](https://cursor.com/blog/fast-regex-search) | Sparse n-gram (closed) | Inspiration for this project |
 
+## Releasing
+
+Release procedure (version bump, tagging, post-tag updates to Homebrew tap
+and Scoop bucket, common failures): [`RELEASING.md`](RELEASING.md).
+
 ## Credits
 
 Created and maintained at **[GeneXus](https://www.genexus.com)**.
