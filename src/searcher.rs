@@ -496,16 +496,6 @@ fn line_bounds(buf: &[u8], offset: usize) -> (usize, usize) {
     (line_start, line_end)
 }
 
-/// Given a byte buffer and an offset, find line number and line boundaries.
-/// Uses SIMD memchr for newline scanning. Used when incremental counting
-/// is not available (e.g. single-match lookups).
-#[inline]
-fn line_at_offset(buf: &[u8], offset: usize) -> (usize, usize, usize) {
-    let line_num = memchr::memchr_iter(b'\n', &buf[..offset]).count() + 1;
-    let (line_start, line_end) = line_bounds(buf, offset);
-    (line_num, line_start, line_end)
-}
-
 /// Check if buffer looks binary (null byte in first 512 bytes).
 #[inline]
 fn is_binary(buf: &[u8]) -> bool {

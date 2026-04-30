@@ -57,7 +57,7 @@ run_hyperfine() {
   local label="$1" cmd="$2" out_json="$3"
   echo "==> [$label] $cmd"
   hyperfine \
-    --warmup 3 --runs 10 \
+    --warmup 5 --runs 30 \
     --export-json "$out_json" \
     --shell=none \
     --command-name "$label" \

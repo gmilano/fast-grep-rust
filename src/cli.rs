@@ -358,7 +358,7 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
         let mut counts: std::collections::HashMap<&PathBuf, usize> = std::collections::HashMap::new();
         for m in matches { *counts.entry(&m.path).or_insert(0) += 1; }
         let mut pairs: Vec<_> = counts.into_iter().collect();
-        pairs.sort_by_key(|(p, _)| p.clone());
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
         let tty = std::io::stdout().is_terminal();
         for (path, count) in pairs {
             if tty {
@@ -405,6 +405,11 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
     // None or doesn't compile, we still print the line — just unhighlighted.
     let re = pattern.and_then(|p| regex::Regex::new(p).ok());
 
+    // Reused across all matches: avoids per-line String allocation when the
+    // regex can be applied. For the no-regex fallback we just write `m.line`
+    // by reference, no clone needed.
+    let mut hl_buf = String::with_capacity(256);
+
     let mut current: Option<&std::path::Path> = None;
     let mut i = 0;
     while i < matches.len() {
@@ -424,17 +429,19 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
         let _ = writeln!(out, "{}{}{}{}", C_BOLD, C_PATH, path.display(), C_RESET);
 
         for m in &matches[i..j] {
-            let line = if let Some(ref r) = re {
-                highlight_matches(&m.line, r)
+            let rendered: &str = if let Some(ref r) = re {
+                hl_buf.clear();
+                highlight_into(&m.line, r, &mut hl_buf);
+                hl_buf.as_str()
             } else {
-                m.line.clone()
+                m.line.as_str()
             };
             let _ = writeln!(
                 out,
                 "{}{:>w$}{}{}:{} {}",
                 C_LINENO, m.line_number, C_RESET,
                 C_DIM, C_RESET,
-                line,
+                rendered,
                 w = lineno_width,
             );
         }
@@ -445,10 +452,11 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
     Ok(())
 }
 
-/// Returns a copy of `line` with every regex match wrapped in ANSI codes.
-/// Falls back to returning the line unchanged if the regex can't be applied.
-fn highlight_matches(line: &str, re: &regex::Regex) -> String {
-    let mut out = String::with_capacity(line.len() + 16);
+/// Writes `line` into `out` with every regex match wrapped in ANSI codes.
+/// Caller is responsible for clearing `out` before calling if a fresh result
+/// is needed; we append, so the same buffer can be reused across many lines.
+fn highlight_into(line: &str, re: &regex::Regex, out: &mut String) {
+    out.reserve(line.len() + 16);
     let mut last_end = 0usize;
     for mat in re.find_iter(line) {
         if mat.start() > last_end {
@@ -462,7 +470,6 @@ fn highlight_matches(line: &str, re: &regex::Regex) -> String {
     if last_end < line.len() {
         out.push_str(&line[last_end..]);
     }
-    out
 }
 
 fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
