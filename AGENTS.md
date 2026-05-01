@@ -20,6 +20,9 @@ src/
 └── searcher.rs    # Rayon parallel verify + full-scan baseline
 benches/
 └── search.rs      # Criterion benchmarks
+.claude/skills/
+└── fast-grep/
+    └── SKILL.md   # Usage guide for AI coding agents (Claude Code, etc.)
 ```
 
 ## Key algorithms
