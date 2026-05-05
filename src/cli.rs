@@ -24,6 +24,7 @@ struct SearchOpts {
     files_only: bool,
     quiet: bool,
     no_ignore: bool,
+    hidden: bool,
     file_type: Option<String>,
     /// Effective regex pattern (may have (?i) prefix etc.) — used by the TTY
     /// renderer to highlight matched substrings.
@@ -121,6 +122,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_ignore: bool,
 
+    /// Include hidden files and directories (dotfiles like .git, .github)
+    #[arg(short = '.', long = "hidden", global = true)]
+    pub hidden: bool,
+
     /// Filter by file extension (e.g., --type rs)
     #[arg(long = "type", value_name = "EXT", global = true)]
     pub file_type: Option<String>,
@@ -199,12 +204,13 @@ pub fn run() -> Result<()> {
         files_only: cli.files_only,
         quiet: cli.quiet,
         no_ignore: cli.no_ignore,
+        hidden: cli.hidden,
         file_type: cli.file_type.clone(),
         pattern: None, // populated below once the effective pattern is built
     };
 
     if let Some(cmd) = cli.command {
-        return run_subcommand(cmd, opts.no_ignore, opts.file_type.as_deref());
+        return run_subcommand(cmd, opts.no_ignore, opts.hidden, opts.file_type.as_deref());
     }
 
     let pattern = match cli.pattern.as_ref() {
@@ -250,7 +256,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     // For count/files-only/quiet, use the collecting API
     if opts.count || opts.files_only || opts.quiet {
         let start = Instant::now();
-        let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+        let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref())?;
         let elapsed = start.elapsed();
         output_matches(&matches, opts)?;
         if !opts.quiet {
@@ -267,7 +273,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     // requires sorted-by-file matches anyway.
     if std::io::stdout().is_terminal() {
         let start = Instant::now();
-        let mut matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.file_type.as_deref())?;
+        let mut matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref())?;
         // Stable sort by path so streaming-order races don't interleave files
         // in the rendered output. Within a file, search_full_scan already
         // returns matches in line order.
@@ -283,7 +289,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     let start = Instant::now();
     let output = std::sync::Mutex::new(std::io::BufWriter::new(std::io::stdout()));
     let count = searcher::search_full_scan_streaming(
-        dir, pattern, opts.no_ignore, opts.file_type.as_deref(), &output,
+        dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref(), &output,
     )?;
     {
         let mut out = output.lock().unwrap();
@@ -334,14 +340,14 @@ fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &s
     let load_time = start.elapsed();
     let start = Instant::now();
     if opts.count {
-        let (n, _) = searcher::search_persistent_count(&idx, pattern, path_filter.as_deref())?;
+        let (n, _) = searcher::search_persistent_count(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
         let search_time = start.elapsed();
         println!("{}", n);
         if !opts.quiet {
             eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
         }
     } else {
-        let (mut matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref())?;
+        let (mut matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
         matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
         let search_time = start.elapsed();
         output_matches(&matches, opts)?;
@@ -472,7 +478,7 @@ fn highlight_into(line: &str, re: &regex::Regex, out: &mut String) {
     }
 }
 
-fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
+fn run_subcommand(cmd: Commands, no_ignore: bool, hidden: bool, type_filter: Option<&str>) -> Result<()> {
     match cmd {
         Commands::Index { dir, output, daemon } => {
             let idx_path = dir.join(&output);
@@ -489,7 +495,7 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
             }
         }
         Commands::Bench { pattern, dir } => {
-            run_bench(&pattern, &dir, no_ignore, type_filter)?;
+            run_bench(&pattern, &dir, no_ignore, hidden, type_filter)?;
         }
         Commands::Update { dir, index: idx_path } => {
             let root = if let Some(d) = dir { d } else {
@@ -572,12 +578,12 @@ fn run_subcommand(cmd: Commands, no_ignore: bool, type_filter: Option<&str>) -> 
     Ok(())
 }
 
-fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter: Option<&str>) -> Result<()> {
+fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, hidden: bool, type_filter: Option<&str>) -> Result<()> {
     println!("Benchmarking pattern '{}' in {:?}", pattern, dir);
     println!("{}", "=".repeat(70));
 
     let start = Instant::now();
-    let full_scan_count = searcher::search_full_scan_count(dir, pattern, no_ignore, type_filter)?;
+    let full_scan_count = searcher::search_full_scan_count(dir, pattern, no_ignore, hidden, type_filter)?;
     let full_scan_time = start.elapsed();
 
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
@@ -591,7 +597,7 @@ fn run_bench(pattern: &str, dir: &std::path::Path, no_ignore: bool, type_filter:
     let persist_load_time = start.elapsed();
 
     let start = Instant::now();
-    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern, None)?;
+    let (persist_matches, timing) = searcher::search_persistent_timed(&pidx, pattern, None, hidden)?;
     let persist_search_time = start.elapsed();
 
     // Get rg match count for correctness comparison

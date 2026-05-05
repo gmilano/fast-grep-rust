@@ -123,7 +123,7 @@ fn full_scan_matches_regex_crate() {
             let test_file = tmp.path().join("test.txt");
             fs::write(&test_file, &t.haystack).unwrap();
 
-            let fgr_results = search_full_scan(tmp.path(), &t.regex, true, None);
+            let fgr_results = search_full_scan(tmp.path(), &t.regex, true, false, None);
             let fgr_matches = match fgr_results {
                 Ok(results) => !results.is_empty(),
                 Err(_) => {
@@ -213,7 +213,7 @@ fn indexed_search_matches_full_scan_regex_suite() {
             fs::write(&test_file, &t.haystack).unwrap();
 
             // Full scan
-            let full_results = match search_full_scan(tmp.path(), &t.regex, true, None) {
+            let full_results = match search_full_scan(tmp.path(), &t.regex, true, false, None) {
                 Ok(r) => r,
                 Err(_) => {
                     skipped += 1;

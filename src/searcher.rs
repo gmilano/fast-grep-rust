@@ -36,6 +36,20 @@ fn is_literal(pattern: &str) -> bool {
     true
 }
 
+/// Path-component-based heuristic for "hidden". Returns true if any normal
+/// component starts with `.` (Unix dotfile convention, also used cross-platform
+/// by `.git/`, `.github/`, `.cargo/`, etc.). Mirrors what `ignore` crate does
+/// when `.hidden(true)` is set, so query-time filtering of an index built with
+/// hidden files included produces the same visible result set.
+fn is_hidden_path(p: &Path) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::Normal(s) => {
+            s.to_str().map_or(false, |s| s.starts_with('.'))
+        }
+        _ => false,
+    })
+}
+
 /// Extract the longest literal substring from a regex pattern for pre-filtering.
 /// Returns None if no useful literal (< 3 bytes) can be extracted.
 fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
@@ -595,6 +609,7 @@ pub fn search_persistent_count(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
     path_filter: Option<&Path>,
+    hidden: bool,
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
@@ -611,6 +626,9 @@ pub fn search_persistent_count(
             }
             let mut by_file: HashMap<&Path, Vec<u32>> = HashMap::new();
             for hit in &hits {
+                if !hidden && is_hidden_path(hit.path) {
+                    continue;
+                }
                 if let Some(filter) = path_filter {
                     if !hit.path.starts_with(filter) {
                         continue;
@@ -664,19 +682,19 @@ pub fn search_persistent_count(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
-                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
-            } else {
-                paths
-            };
+            let filtered: Vec<&Path> = paths
+                .into_iter()
+                .filter(|p| (hidden || !is_hidden_path(p))
+                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .collect();
             count_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
-                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
-            } else {
-                paths
-            };
+            let filtered: Vec<&Path> = paths
+                .into_iter()
+                .filter(|p| (hidden || !is_hidden_path(p))
+                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .collect();
             count_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
         }
     };
@@ -730,7 +748,7 @@ pub fn search_persistent(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
 ) -> Result<Vec<Match>> {
-    Ok(search_persistent_timed(index, pattern, None)?.0)
+    Ok(search_persistent_timed(index, pattern, None, false)?.0)
 }
 
 /// Search with detailed timing breakdown. Uses line-level verify when index provides line hits.
@@ -738,6 +756,7 @@ pub fn search_persistent_timed(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
     path_filter: Option<&Path>,
+    hidden: bool,
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
@@ -791,6 +810,9 @@ pub fn search_persistent_timed(
             // Group by file path for efficient mmap (one mmap per file)
             let mut by_file: HashMap<&Path, Vec<(u32, u32)>> = HashMap::new();
             for hit in &hits {
+                if !hidden && is_hidden_path(hit.path) {
+                    continue;
+                }
                 if let Some(filter) = path_filter {
                     if !hit.path.starts_with(filter) {
                         continue;
@@ -925,19 +947,19 @@ pub fn search_persistent_timed(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
-                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
-            } else {
-                paths
-            };
+            let filtered: Vec<&Path> = paths
+                .into_iter()
+                .filter(|p| (hidden || !is_hidden_path(p))
+                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
-                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
-            } else {
-                paths
-            };
+            let filtered: Vec<&Path> = paths
+                .into_iter()
+                .filter(|p| (hidden || !is_hidden_path(p))
+                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
         }
     };
@@ -995,6 +1017,7 @@ pub fn search_full_scan(
     root: &Path,
     pattern: &str,
     no_ignore: bool,
+    hidden: bool,
     type_filter: Option<&str>,
 ) -> Result<Vec<Match>> {
     let matcher = Matcher::new(pattern)?;
@@ -1002,7 +1025,7 @@ pub fn search_full_scan(
 
     let walker = ignore::WalkBuilder::new(root)
         .git_ignore(!no_ignore)
-        .hidden(false)
+        .hidden(!hidden)
         .threads(num_cpus())
         .build_parallel();
 
@@ -1103,6 +1126,7 @@ pub fn search_full_scan_count(
     root: &Path,
     pattern: &str,
     no_ignore: bool,
+    hidden: bool,
     type_filter: Option<&str>,
 ) -> Result<usize> {
     let matcher = Matcher::new(pattern)?;
@@ -1110,7 +1134,7 @@ pub fn search_full_scan_count(
 
     let walker = ignore::WalkBuilder::new(root)
         .git_ignore(!no_ignore)
-        .hidden(false)
+        .hidden(!hidden)
         .threads(num_cpus())
         .build_parallel();
 
@@ -1188,6 +1212,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
     root: &Path,
     pattern: &str,
     no_ignore: bool,
+    hidden: bool,
     type_filter: Option<&str>,
     output: &Mutex<W>,
 ) -> Result<usize> {
@@ -1196,7 +1221,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
 
     let walker = ignore::WalkBuilder::new(root)
         .git_ignore(!no_ignore)
-        .hidden(false)
+        .hidden(!hidden)
         .threads(num_cpus())
         .build_parallel();
 

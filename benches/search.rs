@@ -31,7 +31,7 @@ fn bench_patterns(c: &mut Criterion) {
     for pattern in &patterns {
         group.bench_function(format!("full_scan/{}", pattern), |b| {
             b.iter(|| {
-                fast_grep::searcher::search_full_scan(&dir, pattern, false, None).unwrap();
+                fast_grep::searcher::search_full_scan(&dir, pattern, false, false, None).unwrap();
             });
         });
 

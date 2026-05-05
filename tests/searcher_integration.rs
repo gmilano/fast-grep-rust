@@ -141,7 +141,7 @@ fn indexed_search_matches_full_scan() {
             .collect();
         indexed.sort();
 
-        let mut full: Vec<String> = search_full_scan(tmp.path(), pattern, true, None)
+        let mut full: Vec<String> = search_full_scan(tmp.path(), pattern, true, false, None)
             .unwrap()
             .iter()
             .map(|m| {
