@@ -13,7 +13,6 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::index::{Posting, SparseIndex};
-use crate::sparse::BigramFreq;
 use crate::trigram;
 
 // --- Zero-copy read helpers ---
@@ -95,13 +94,11 @@ fn merge_sorted_lines(
 // --- Timing ---
 
 pub struct SearchTiming {
-    pub covering_ngrams_ms: f64,
     pub lookup_ms: f64,
     pub bitmap_intersect_ms: f64,
     pub verify_ms: f64,
     pub candidates: usize,
     pub matches: usize,
-    pub ngrams_queried: usize,
     /// Verify strategy used: "line-level", "file-level", or "file-level (fallback)"
     pub strategy: String,
     /// Match density (lines per file) that drove the strategy decision
@@ -146,9 +143,6 @@ pub struct IndexMeta {
     /// Number of docs in the main (non-delta) index. Set on full build.
     #[serde(default)]
     pub main_num_docs: Option<usize>,
-    /// Corpus-adaptive bigram frequency table, base64-encoded.
-    #[serde(default)]
-    pub bigram_freq_b64: Option<String>,
 }
 
 #[derive(Clone)]
@@ -182,7 +176,6 @@ pub struct PersistentIndex {
     pub delta_lookup: Vec<LookupEntry>,
     pub delta_postings: Vec<u8>,
     pub main_num_docs: usize,
-    pub freq: BigramFreq,
 }
 
 impl PersistentIndex {
@@ -415,23 +408,8 @@ impl PersistentIndex {
 
     // --- Search methods ---
 
-    pub fn search(&self, pattern: &str) -> Vec<&Path> {
-        match self.search_timed(pattern).0 {
-            SearchResult::LineHits(hits) => {
-                let mut paths: Vec<&Path> = hits.iter().map(|h| h.path).collect();
-                paths.sort();
-                paths.dedup();
-                paths
-            }
-            SearchResult::BitmapFiles(paths) | SearchResult::AllFiles(paths) => paths,
-        }
-    }
-
     pub fn search_timed(&self, pattern: &str) -> (SearchResult<'_>, SearchTiming) {
-        let t0 = Instant::now();
-
         let alternatives = trigram::decompose_pattern(pattern);
-        let covering_ngrams_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
             let docs = self.live_doc_ids();
@@ -439,13 +417,11 @@ impl PersistentIndex {
             return (
                 SearchResult::AllFiles(docs),
                 SearchTiming {
-                    covering_ngrams_ms,
                     lookup_ms: 0.0,
                     bitmap_intersect_ms: 0.0,
                     verify_ms: 0.0,
                     candidates: n,
                     matches: 0,
-                    ngrams_queried: 0,
                     strategy: String::new(),
                     density: 0.0,
                     prefix_filtered: 0,
@@ -453,7 +429,6 @@ impl PersistentIndex {
             );
         }
 
-        let mut ngrams_queried = 0usize;
         let mut result_lines: Vec<(u32, u32, u32, [u8; 4])> = Vec::new();
         let mut bitmap_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
@@ -466,13 +441,11 @@ impl PersistentIndex {
                 return (
                     SearchResult::AllFiles(docs),
                     SearchTiming {
-                        covering_ngrams_ms,
                         lookup_ms: 0.0,
                         bitmap_intersect_ms: 0.0,
                         verify_ms: 0.0,
                         candidates: n,
                         matches: 0,
-                        ngrams_queried: 0,
                         strategy: String::new(),
                         density: 0.0,
                         prefix_filtered: 0,
@@ -480,7 +453,6 @@ impl PersistentIndex {
                 );
             }
 
-            ngrams_queried += alt_trigrams.len();
             let hashes: Vec<u32> = alt_trigrams.iter().map(|tri| crc32fast::hash(tri)).collect();
 
             if has_bitmaps {
@@ -566,13 +538,11 @@ impl PersistentIndex {
                     return (
                         SearchResult::BitmapFiles(paths),
                         SearchTiming {
-                            covering_ngrams_ms,
                             lookup_ms: bitmap_dur.as_secs_f64() * 1000.0,
                             bitmap_intersect_ms: 0.0,
                             verify_ms: 0.0,
                             candidates: n,
                             matches: 0,
-                            ngrams_queried,
                             strategy: String::new(),
                             density: 0.0,
                             prefix_filtered: 0,
@@ -668,13 +638,11 @@ impl PersistentIndex {
         (
             SearchResult::LineHits(hits),
             SearchTiming {
-                covering_ngrams_ms,
                 lookup_ms: bitmap_dur.as_secs_f64() * 1000.0,
                 bitmap_intersect_ms: intersect_dur.as_secs_f64() * 1000.0,
                 verify_ms: 0.0,
                 candidates: num_candidates,
                 matches: 0,
-                ngrams_queried,
                 strategy: String::new(),
                 density: 0.0,
                 prefix_filtered: 0,
@@ -734,13 +702,6 @@ pub fn build(
     let index = SparseIndex::build_from_directory(root, no_ignore, type_filter, verbose)?;
 
     fs::create_dir_all(output).context("creating output directory")?;
-
-    // Build corpus-adaptive bigram frequency table
-    let freq = BigramFreq::from_corpus(&index.doc_ids, 5000);
-    let freq_b64 = {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(freq.to_bytes())
-    };
 
     // Collect file mtimes
     let mut file_mtimes = HashMap::new();
@@ -839,7 +800,6 @@ pub fn build(
         file_mtimes,
         dir_mtimes,
         main_num_docs: Some(num_docs),
-        bigram_freq_b64: Some(freq_b64),
     };
     let meta_path = output.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
@@ -973,17 +933,6 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         }
     }
 
-    // Load bigram frequency table from meta (or fall back to flat)
-    let freq = if let Some(ref b64) = meta.bigram_freq_b64 {
-        use base64::Engine;
-        match base64::engine::general_purpose::STANDARD.decode(b64) {
-            Ok(bytes) => BigramFreq::from_bytes(&bytes),
-            Err(_) => BigramFreq::flat(),
-        }
-    } else {
-        BigramFreq::flat()
-    };
-
     Ok(PersistentIndex {
         lookup_mmap,
         lookup_count,
@@ -999,7 +948,6 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         delta_lookup,
         delta_postings,
         main_num_docs,
-        freq,
     })
 }
 
@@ -1287,7 +1235,6 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         file_mtimes: new_mtimes,
         dir_mtimes: new_dir_mtimes,
         main_num_docs: Some(main_num_docs),
-        bigram_freq_b64: meta.bigram_freq_b64,
     };
     let meta_json = serde_json::to_string_pretty(&new_meta)?;
     fs::write(&meta_path, meta_json)?;

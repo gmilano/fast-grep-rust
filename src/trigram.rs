@@ -1,17 +1,3 @@
-use std::collections::HashSet;
-
-pub fn extract_trigrams(text: &str) -> HashSet<[u8; 3]> {
-    let bytes = text.as_bytes();
-    let mut set = HashSet::new();
-    if bytes.len() < 3 {
-        return set;
-    }
-    for w in bytes.windows(3) {
-        set.insert([w[0], w[1], w[2]]);
-    }
-    set
-}
-
 /// Decompose a regex pattern into literal trigrams that must appear in any match.
 /// Returns a Vec of Vec<[u8;3]> where the outer vec is OR alternatives,
 /// and each inner vec is AND-required trigrams for that alternative.
@@ -35,30 +21,6 @@ pub fn decompose_pattern(pattern: &str) -> Vec<Vec<[u8; 3]>> {
         result.push(trigrams);
     }
     // Filter out empty alternatives (they match everything)
-    if result.iter().any(|v| v.is_empty()) {
-        return vec![vec![]];
-    }
-    result
-}
-
-/// Like decompose_pattern but preserves trigram order (no sort/dedup).
-/// Used for adjacency filtering with position masks.
-pub fn decompose_pattern_ordered(pattern: &str) -> Vec<Vec<[u8; 3]>> {
-    let alternatives = split_alternatives(pattern);
-    let mut result = Vec::new();
-    for alt in &alternatives {
-        let literals = extract_literal_runs(alt);
-        let mut trigrams = Vec::new();
-        for lit in &literals {
-            let bytes = lit.as_bytes();
-            if bytes.len() >= 3 {
-                for w in bytes.windows(3) {
-                    trigrams.push([w[0], w[1], w[2]]);
-                }
-            }
-        }
-        result.push(trigrams);
-    }
     if result.iter().any(|v| v.is_empty()) {
         return vec![vec![]];
     }
@@ -255,49 +217,6 @@ fn is_meta(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- extract_trigrams tests (ported from trigram.test.ts) ---
-
-    #[test]
-    fn empty_string_returns_no_trigrams() {
-        assert_eq!(extract_trigrams("").len(), 0);
-    }
-
-    #[test]
-    fn short_string_returns_no_trigrams() {
-        assert_eq!(extract_trigrams("ab").len(), 0);
-    }
-
-    #[test]
-    fn extracts_single_trigram_from_3_char_string() {
-        let result = extract_trigrams("abc");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(&[b'a', b'b', b'c']));
-    }
-
-    #[test]
-    fn extracts_all_trigrams_from_a_word() {
-        let result = extract_trigrams("hello");
-        assert_eq!(result.len(), 3);
-        assert!(result.contains(&[b'h', b'e', b'l']));
-        assert!(result.contains(&[b'e', b'l', b'l']));
-        assert!(result.contains(&[b'l', b'l', b'o']));
-    }
-
-    #[test]
-    fn deduplicates_repeated_trigrams() {
-        let result = extract_trigrams("aaaa");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(&[b'a', b'a', b'a']));
-    }
-
-    #[test]
-    fn handles_unicode_characters() {
-        let result = extract_trigrams("café");
-        assert!(result.len() > 0);
-        // "caf" should be present as bytes
-        assert!(result.contains(&[b'c', b'a', b'f']));
-    }
 
     // --- decompose_pattern tests (ported from decomposeRegex in trigram.test.ts) ---
 

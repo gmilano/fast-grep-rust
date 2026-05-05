@@ -10,7 +10,6 @@ use regex::bytes::Regex as BytesRegex;
 
 use std::collections::HashMap;
 
-use crate::index::SparseIndex;
 use crate::persist::SearchResult;
 #[cfg(target_os = "macos")]
 use crate::metal::metal_impl::global_verifier;
@@ -36,13 +35,18 @@ fn is_literal(pattern: &str) -> bool {
     true
 }
 
-/// Path-component-based heuristic for "hidden". Returns true if any normal
-/// component starts with `.` (Unix dotfile convention, also used cross-platform
-/// by `.git/`, `.github/`, `.cargo/`, etc.). Mirrors what `ignore` crate does
-/// when `.hidden(true)` is set, so query-time filtering of an index built with
-/// hidden files included produces the same visible result set.
-fn is_hidden_path(p: &Path) -> bool {
-    p.components().any(|c| match c {
+/// Path-component-based heuristic for "hidden". Returns true if any component
+/// of `p` *under* `root` starts with `.` (Unix dotfile convention, also used
+/// cross-platform by `.git/`, `.github/`, `.cargo/`, etc.). Mirrors what the
+/// `ignore` crate does when `.hidden(true)` is set: the filter applies to
+/// entries inside the search tree, not to ancestors of the root itself.
+/// Stripping the root prefix matters on systems where the path *to* the root
+/// happens to contain dot-components (e.g. Windows tempdirs are
+/// `…\Temp\.tmpXXXX`, and a project under `~/.config/foo/` is not "hidden"
+/// from the user's perspective just because `.config` sits above it).
+fn is_hidden_path(p: &Path, root: &Path) -> bool {
+    let rel = p.strip_prefix(root).unwrap_or(p);
+    rel.components().any(|c| match c {
         std::path::Component::Normal(s) => {
             s.to_str().map_or(false, |s| s.starts_with('.'))
         }
@@ -531,78 +535,6 @@ fn is_known_text_ext(path: &std::path::Path) -> bool {
     }
 }
 
-pub struct Searcher {
-    index: SparseIndex,
-}
-
-impl Searcher {
-    pub fn new(root: &Path, no_ignore: bool, type_filter: Option<&str>) -> Result<Self> {
-        let index = SparseIndex::build_from_directory(root, no_ignore, type_filter, false)?;
-        Ok(Searcher { index })
-    }
-
-    pub fn search(&self, pattern: &str) -> Result<Vec<Match>> {
-        let matcher = Matcher::new(pattern)?;
-        let candidates = self.index.search(pattern);
-
-        let matches: Vec<Match> = candidates
-            .par_iter()
-            .flat_map(|path| {
-                let mmap = match open_mmap(path) {
-                    Some(m) => m,
-                    None => return Vec::new(),
-                };
-                let buf = &*mmap;
-                if !is_known_text_ext(path) && is_binary(buf) {
-                    return Vec::new();
-                }
-                let hits = matcher.search_buffer(buf, needs_line_by_line(pattern));
-                if hits.is_empty() {
-                    return Vec::new();
-                }
-                let path_buf = path.to_path_buf();
-                hits.into_iter()
-                    .map(|(ln, line)| Match {
-                        path: path_buf.clone(),
-                        line_number: ln,
-                        line,
-                    })
-                    .collect()
-            })
-            .collect();
-
-        Ok(matches)
-    }
-
-    pub fn search_files_only(&self, pattern: &str) -> Result<Vec<PathBuf>> {
-        let matcher = Matcher::new(pattern)?;
-        let candidates = self.index.search(pattern);
-
-        let files: Vec<PathBuf> = candidates
-            .par_iter()
-            .filter(|path| {
-                let mmap = match open_mmap(path) {
-                    Some(m) => m,
-                    None => return false,
-                };
-                let buf = &*mmap;
-                if !is_known_text_ext(path) && is_binary(buf) {
-                    return false;
-                }
-                matcher.has_match(buf, needs_line_by_line(pattern))
-            })
-            .map(|p| p.to_path_buf())
-            .collect();
-
-        Ok(files)
-    }
-
-    pub fn search_count(&self, pattern: &str) -> Result<usize> {
-        let matches = self.search(pattern)?;
-        Ok(matches.len())
-    }
-}
-
 /// Count-optimized search: line-level verify for indexed, full-file for fallback.
 pub fn search_persistent_count(
     index: &crate::persist::PersistentIndex,
@@ -612,6 +544,7 @@ pub fn search_persistent_count(
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
+    let index_root = PathBuf::from(&index.meta.root_dir);
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -625,7 +558,7 @@ pub fn search_persistent_count(
             }
             let mut by_file: HashMap<&Path, Vec<u32>> = HashMap::new();
             for hit in &hits {
-                if !hidden && is_hidden_path(hit.path) {
+                if !hidden && is_hidden_path(hit.path, &index_root) {
                     continue;
                 }
                 if let Some(filter) = path_filter {
@@ -683,7 +616,7 @@ pub fn search_persistent_count(
         SearchResult::BitmapFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p))
+                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
                     && path_filter.map_or(true, |f| p.starts_with(f)))
                 .collect();
             count_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
@@ -691,7 +624,7 @@ pub fn search_persistent_count(
         SearchResult::AllFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p))
+                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
                     && path_filter.map_or(true, |f| p.starts_with(f)))
                 .collect();
             count_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
@@ -742,14 +675,6 @@ fn open_mmap(path: &Path) -> Option<Mmap> {
     }
 }
 
-/// Search using a persistent index with Rayon parallel verify.
-pub fn search_persistent(
-    index: &crate::persist::PersistentIndex,
-    pattern: &str,
-) -> Result<Vec<Match>> {
-    Ok(search_persistent_timed(index, pattern, None, false)?.0)
-}
-
 /// Search with detailed timing breakdown. Uses line-level verify when index provides line hits.
 pub fn search_persistent_timed(
     index: &crate::persist::PersistentIndex,
@@ -759,6 +684,7 @@ pub fn search_persistent_timed(
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
+    let index_root = PathBuf::from(&index.meta.root_dir);
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -809,7 +735,7 @@ pub fn search_persistent_timed(
             // Group by file path for efficient mmap (one mmap per file)
             let mut by_file: HashMap<&Path, Vec<(u32, u32)>> = HashMap::new();
             for hit in &hits {
-                if !hidden && is_hidden_path(hit.path) {
+                if !hidden && is_hidden_path(hit.path, &index_root) {
                     continue;
                 }
                 if let Some(filter) = path_filter {
@@ -946,7 +872,7 @@ pub fn search_persistent_timed(
         SearchResult::BitmapFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p))
+                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
                     && path_filter.map_or(true, |f| p.starts_with(f)))
                 .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
@@ -954,7 +880,7 @@ pub fn search_persistent_timed(
         SearchResult::AllFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p))
+                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
                     && path_filter.map_or(true, |f| p.starts_with(f)))
                 .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
@@ -1395,42 +1321,3 @@ fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
-/// Verify using mmap instead of fs::read — avoids heap allocation per file.
-pub fn search_persistent_mmap(
-    index: &crate::persist::PersistentIndex,
-    pattern: &str,
-) -> Result<Vec<Match>> {
-    let matcher = Matcher::new(pattern)?;
-    let candidates = index.search(pattern);
-
-    let matches: Vec<Match> = candidates
-        .par_iter()
-        .flat_map(|path| {
-            let file = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return Vec::new(),
-            };
-            let buf = match unsafe { memmap2::Mmap::map(&file) } {
-                Ok(m) => m,
-                Err(_) => return Vec::new(),
-            };
-            if is_binary(&buf) {
-                return Vec::new();
-            }
-            let hits = matcher.search_buffer(&buf, needs_line_by_line(pattern));
-            if hits.is_empty() {
-                return Vec::new();
-            }
-            let path_buf = path.to_path_buf();
-            hits.into_iter()
-                .map(|(ln, line)| Match {
-                    path: path_buf.clone(),
-                    line_number: ln,
-                    line,
-                })
-                .collect()
-        })
-        .collect();
-
-    Ok(matches)
-}

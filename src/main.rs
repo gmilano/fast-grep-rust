@@ -6,7 +6,6 @@ mod index;
 pub mod metal;
 mod persist;
 mod searcher;
-mod sparse;
 mod trigram;
 
 fn main() {

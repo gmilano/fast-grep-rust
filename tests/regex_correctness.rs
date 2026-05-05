@@ -9,7 +9,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use fast_grep::searcher::{search_full_scan, Searcher};
+use fast_grep::persist::{build as build_index, load as load_index};
+use fast_grep::searcher::{search_full_scan, search_persistent_timed};
 
 #[derive(Debug)]
 struct RegexTest {
@@ -222,16 +223,21 @@ fn indexed_search_matches_full_scan_regex_suite() {
             };
             let full_matched = !full_results.is_empty();
 
-            // Indexed search
-            let searcher = match Searcher::new(tmp.path(), true, None) {
-                Ok(s) => s,
+            // Indexed search via the persistent index — the path the CLI ships.
+            let idx_dir = tmp.path().join(".fgr-test");
+            if build_index(tmp.path(), &idx_dir, true, None, false).is_err() {
+                skipped += 1;
+                continue;
+            }
+            let idx = match load_index(&idx_dir) {
+                Ok(i) => i,
                 Err(_) => {
                     skipped += 1;
                     continue;
                 }
             };
-            let indexed_results = match searcher.search(&t.regex) {
-                Ok(r) => r,
+            let indexed_results = match search_persistent_timed(&idx, &t.regex, None, false) {
+                Ok((r, _)) => r,
                 Err(_) => {
                     skipped += 1;
                     continue;
