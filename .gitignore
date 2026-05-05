@@ -1,5 +1,8 @@
 /target
 .fgr/
 
+# Claude Code per-user local overrides — not for the shared repo
+.claude/settings.local.json
+
 # stray PDFs (briefs, exports) — keep them out of the public repo
 *.pdf
