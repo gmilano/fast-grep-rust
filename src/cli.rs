@@ -439,13 +439,7 @@ fn run_indexed_search(
             idx_path.display()
         );
         let build_start = Instant::now();
-        persist::build(
-            search_path,
-            idx_path,
-            opts.no_ignore,
-            &opts.file_type,
-            true,
-        )?;
+        persist::build(search_path, idx_path, opts.no_ignore, &opts.file_type, true)?;
         eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
     }
 
@@ -475,16 +469,15 @@ fn run_indexed_search(
     let start = Instant::now();
 
     if opts.count {
-        let (n, _) =
-            searcher::search_persistent_count(
-                &idx,
-                pattern,
-                path_filter.as_deref(),
-                opts.hidden,
-                &opts.file_type,
-                &opts.include,
-                &opts.exclude,
-            )?;
+        let (n, _) = searcher::search_persistent_count(
+            &idx,
+            pattern,
+            path_filter.as_deref(),
+            opts.hidden,
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+        )?;
         let search_time = start.elapsed();
         println!("{}", n);
         if !opts.quiet {
@@ -499,16 +492,15 @@ fn run_indexed_search(
 
     if opts.files_only || opts.quiet {
         // Same as direct: bypass render pipeline for these aggregate modes.
-        let (matches, _) =
-            searcher::search_persistent_timed(
-                &idx,
-                pattern,
-                path_filter.as_deref(),
-                opts.hidden,
-                &opts.file_type,
-                &opts.include,
-                &opts.exclude,
-            )?;
+        let (matches, _) = searcher::search_persistent_timed(
+            &idx,
+            pattern,
+            path_filter.as_deref(),
+            opts.hidden,
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+        )?;
         output_summary(&matches, opts)?;
         let search_time = start.elapsed();
         if !opts.quiet {

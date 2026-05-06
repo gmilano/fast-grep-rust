@@ -250,7 +250,9 @@ pub fn search_full_scan_render<W: Write + Send>(
     let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
 
     let mut wb = ignore::WalkBuilder::new(root);
-    wb.git_ignore(!no_ignore).hidden(!hidden).threads(num_cpus());
+    wb.git_ignore(!no_ignore)
+        .hidden(!hidden)
+        .threads(num_cpus());
     if let Some(ov) = crate::searcher::build_overrides(root, include, exclude)? {
         wb.overrides(ov);
     }

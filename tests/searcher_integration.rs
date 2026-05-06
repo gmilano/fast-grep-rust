@@ -154,17 +154,18 @@ fn indexed_search_matches_full_scan() {
             .collect();
         indexed.sort();
 
-        let mut full: Vec<String> = search_full_scan(tmp.path(), pattern, true, false, &[], &[], &[], false)
-            .unwrap()
-            .iter()
-            .map(|m| {
-                format!(
-                    "{}:{}",
-                    m.path.strip_prefix(tmp.path()).unwrap().display(),
-                    m.line_number
-                )
-            })
-            .collect();
+        let mut full: Vec<String> =
+            search_full_scan(tmp.path(), pattern, true, false, &[], &[], &[], false)
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{}:{}",
+                        m.path.strip_prefix(tmp.path()).unwrap().display(),
+                        m.line_number
+                    )
+                })
+                .collect();
         full.sort();
 
         assert_eq!(

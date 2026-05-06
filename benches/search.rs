@@ -32,7 +32,14 @@ fn bench_patterns(c: &mut Criterion) {
         group.bench_function(format!("full_scan/{}", pattern), |b| {
             b.iter(|| {
                 fast_grep::searcher::search_full_scan(
-                    &dir, pattern, false, false, &[], &[], &[], false,
+                    &dir,
+                    pattern,
+                    false,
+                    false,
+                    &[],
+                    &[],
+                    &[],
+                    false,
                 )
                 .unwrap();
             });

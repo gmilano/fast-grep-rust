@@ -1211,7 +1211,9 @@ pub fn search_full_scan(
     let collector: Mutex<Vec<Vec<Match>>> = Mutex::new(Vec::new());
 
     let mut wb = ignore::WalkBuilder::new(root);
-    wb.git_ignore(!no_ignore).hidden(!hidden).threads(num_cpus());
+    wb.git_ignore(!no_ignore)
+        .hidden(!hidden)
+        .threads(num_cpus());
     if let Some(ov) = build_overrides(root, include, exclude)? {
         wb.overrides(ov);
     }
@@ -1328,7 +1330,9 @@ pub fn search_full_scan_count(
     let total_count = std::sync::atomic::AtomicUsize::new(0);
 
     let mut wb = ignore::WalkBuilder::new(root);
-    wb.git_ignore(!no_ignore).hidden(!hidden).threads(num_cpus());
+    wb.git_ignore(!no_ignore)
+        .hidden(!hidden)
+        .threads(num_cpus());
     if let Some(ov) = build_overrides(root, include, exclude)? {
         wb.overrides(ov);
     }

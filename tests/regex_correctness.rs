@@ -320,7 +320,8 @@ fn full_scan_matches_regex_crate() {
             let test_file = tmp.path().join("test.txt");
             fs::write(&test_file, &t.haystack).unwrap();
 
-            let fgr_results = search_full_scan(tmp.path(), &t.regex, true, false, &[], &[], &[], false);
+            let fgr_results =
+                search_full_scan(tmp.path(), &t.regex, true, false, &[], &[], &[], false);
             let fgr_matches = match fgr_results {
                 Ok(results) => !results.is_empty(),
                 Err(_) => {
@@ -437,13 +438,14 @@ fn indexed_search_matches_full_scan_regex_suite() {
             fs::write(&test_file, &t.haystack).unwrap();
 
             // Full scan
-            let full_results = match search_full_scan(tmp.path(), &t.regex, true, false, &[], &[], &[], false) {
-                Ok(r) => r,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
+            let full_results =
+                match search_full_scan(tmp.path(), &t.regex, true, false, &[], &[], &[], false) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
             let full_matched = !full_results.is_empty();
 
             // Indexed search via the persistent index — the path the CLI ships.
@@ -459,13 +461,14 @@ fn indexed_search_matches_full_scan_regex_suite() {
                     continue;
                 }
             };
-            let indexed_results = match search_persistent_timed(&idx, &t.regex, None, false, &[], &[], &[]) {
-                Ok((r, _)) => r,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
+            let indexed_results =
+                match search_persistent_timed(&idx, &t.regex, None, false, &[], &[], &[]) {
+                    Ok((r, _)) => r,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
             let indexed_matched = !indexed_results.is_empty();
 
             // The index may return false positives (candidates that don't actually match)
