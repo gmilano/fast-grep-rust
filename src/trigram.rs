@@ -1,3 +1,41 @@
+/// Returns true if `pattern` enables case-insensitive matching anywhere
+/// via an inline `(?i…)` flag group. The trigram index is built from the
+/// raw bytes of source files (case-sensitive), so a `(?i)abc` pattern
+/// can match `ABC` in a file even though the trigram `abc` was never
+/// recorded — the index would falsely report no candidates. Callers use
+/// this as a short-circuit signal to fall back to a full-file scan.
+///
+/// Walks `(?…)` flag groups looking for `i` not preceded by `-` (the
+/// `-i` form disables the flag rather than enabling it). Catches
+/// `(?i)`, `(?im)`, `(?mi)`, `(?Ri)`, `(?i:…)`, etc. False positives
+/// (treating `(?-i)abc` as case-insensitive) are harmless — we just
+/// pay the full-scan cost unnecessarily.
+pub fn has_case_insensitive_flag(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'(' && bytes[i + 1] == b'?' {
+            // Walk the flag-group prefix until `:` (scoped flags) or `)`
+            // (top-level flags), checking each char.
+            let mut j = i + 2;
+            let mut negate = false;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'-' => negate = true,
+                    b'i' if !negate => return true,
+                    b':' | b')' => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Decompose a regex pattern into literal trigrams that must appear in any match.
 /// Returns a Vec of Vec<[u8;3]> where the outer vec is OR alternatives,
 /// and each inner vec is AND-required trigrams for that alternative.
@@ -180,7 +218,16 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                     let mut lookahead = chars.clone();
                     lookahead.next();
                     if let Some(&after) = lookahead.peek() {
-                        if ":PimsxuU-<!=".contains(after) {
+                        // Flag-group prefix chars the rust `regex` crate accepts:
+                        // `i` `m` `s` `x` `u` `U` (standard) plus `R` (CRLF
+                        // line-terminator mode); plus `:` (end of flag prefix
+                        // before the group body), `P` (named-group `(?P<…>`),
+                        // `-` (negate flag), `<`/`!`/`=` (lookaround prefixes).
+                        // Missing one of these means the parser falls into
+                        // the literal extractor and pulls trigrams from the
+                        // regex syntax — which won't exist in source files
+                        // and produces a false-empty candidate set.
+                        if ":PimRsxuU-<!=".contains(after) {
                             chars.next();
                             while let Some(&c) = chars.peek() {
                                 if c == ':' || c == ')' {

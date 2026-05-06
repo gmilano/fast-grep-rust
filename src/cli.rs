@@ -1,22 +1,15 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::render::{
+    self, ContextOpts, Dispatch, RenderOpts, C_BOLD, C_LINENO, C_PATH, C_RESET,
+};
 use crate::{index, persist, searcher};
-
-// ANSI escape codes for the TTY rendering path. We write them by hand to keep
-// the dep footprint zero (no `colored`, no `termcolor`) — the codes that
-// survive on every modern terminal we care about (macOS Terminal/iTerm2,
-// Linux xterm/gnome-terminal/alacritty, Windows Terminal).
-const C_RESET: &str = "\x1b[0m";
-const C_BOLD: &str = "\x1b[1m";
-const C_DIM: &str = "\x1b[2m";
-const C_PATH: &str = "\x1b[35m"; // magenta — file paths
-const C_LINENO: &str = "\x1b[32m"; // green — line numbers
-const C_MATCH: &str = "\x1b[1;31m"; // bold red — matched substring
 
 /// Search options extracted from CLI flags
 struct SearchOpts {
@@ -28,7 +21,9 @@ struct SearchOpts {
     file_type: Option<String>,
     /// Force the grouped (heading) output format on/off. None = follow TTY.
     heading_override: Option<bool>,
-    /// Effective regex pattern (may have (?i) prefix etc.) — used by the TTY
+    /// Resolved before/after context window for `-A` / `-B` / `-C`.
+    context: ContextOpts,
+    /// Effective regex pattern (may have (?i) prefix etc.) — used by the
     /// renderer to highlight matched substrings.
     pattern: Option<String>,
 }
@@ -135,6 +130,11 @@ pub struct Cli {
     /// Print one match per line as `path:line:content` (default when stdout is piped)
     #[arg(short = 'N', long = "no-heading", global = true, overrides_with = "heading")]
     pub no_heading: bool,
+
+    /// Disable Unicode matching mode — `\b`, `\w`, `\s` etc. fall back to
+    /// ASCII-only definitions.
+    #[arg(short = 'U', long = "no-unicode", global = true)]
+    pub no_unicode: bool,
 
     /// Filter by file extension (e.g., --type rs)
     #[arg(long = "type", value_name = "EXT", global = true)]
@@ -247,6 +247,8 @@ pub fn run() -> Result<()> {
         None
     };
 
+    let context = ContextOpts::resolve(cli.context, cli.before_context, cli.after_context);
+
     let opts = SearchOpts {
         count: cli.count,
         files_only: cli.files_only,
@@ -255,6 +257,7 @@ pub fn run() -> Result<()> {
         hidden: cli.hidden,
         file_type: cli.file_type.clone(),
         heading_override,
+        context,
         pattern: None, // populated below once the effective pattern is built
     };
 
@@ -280,6 +283,17 @@ pub fn run() -> Result<()> {
     };
     if cli.ignore_case {
         effective = format!("(?i){}", effective);
+    }
+    // `--no-unicode` is honoured by inlining `(?-u)` at the start of the
+    // pattern. Both the regex crate and our `Matcher` respect the inline
+    // flag, so no separate plumbing through `Matcher::new` is needed.
+    // Trade-off: this disables the pure-literal fast path for patterns
+    // that would otherwise have hit it (literals don't actually care about
+    // Unicode mode, but `(?-u)<literal>` is no longer a "pure literal"
+    // syntactically). We accept that — `--no-unicode` is niche enough
+    // that the slow regex path is fine.
+    if cli.no_unicode {
+        effective = format!("(?-u){}", effective);
     }
 
     let mut opts = opts;
@@ -317,12 +331,15 @@ fn use_color() -> bool {
 }
 
 fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
-    // For count/files-only/quiet, use the collecting API
+    // count/files-only/quiet bypass the render pipeline entirely — they
+    // produce per-file aggregates (counts, file lists) or no output at
+    // all, so context flags don't apply and the simpler Vec<Match> API
+    // is what we want.
     if opts.count || opts.files_only || opts.quiet {
         let start = Instant::now();
         let matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref())?;
         let elapsed = start.elapsed();
-        output_matches(&matches, opts)?;
+        output_summary(&matches, opts)?;
         if !opts.quiet {
             eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, matches.len());
         }
@@ -332,30 +349,22 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         return Ok(());
     }
 
-    // Buffered path: collect matches, then render via output_matches. Used
-    // when we need either grouped output (heading) or ANSI colour, since the
-    // streaming path below is byte-for-byte raw and can't decorate output.
-    // Streaming is only an option when both heading and colour are off, i.e.
-    // a piped `path:line:content` consumer like grep/awk pipelines.
-    if use_heading(opts) || use_color() {
-        let start = Instant::now();
-        let mut matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref())?;
-        // Stable sort by path so streaming-order races don't interleave files
-        // in the rendered output. Within a file, search_full_scan already
-        // returns matches in line order.
-        matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
-        let elapsed = start.elapsed();
-        let n = matches.len();
-        output_matches(&matches, opts)?;
-        eprintln!("Searched in {:.2}ms, {} matches", elapsed.as_secs_f64() * 1000.0, n);
-        return Ok(());
-    }
+    let render_opts = render_opts_for(opts);
+    let dispatch = dispatch_for(&render_opts);
 
-    // Flat path: streaming `path:line:content` for grep-compatible pipelines.
     let start = Instant::now();
-    let output = std::sync::Mutex::new(std::io::BufWriter::new(std::io::stdout()));
-    let count = searcher::search_full_scan_streaming(
-        dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref(), &output,
+    let stdout = std::io::stdout();
+    let output = Mutex::new(std::io::BufWriter::new(stdout));
+    let count = render::search_full_scan_render(
+        dir,
+        pattern,
+        opts.no_ignore,
+        opts.hidden,
+        opts.file_type.as_deref(),
+        &opts.context,
+        &render_opts,
+        dispatch,
+        &output,
     )?;
     {
         let mut out = output.lock().unwrap();
@@ -405,6 +414,7 @@ fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &s
 
     let load_time = start.elapsed();
     let start = Instant::now();
+
     if opts.count {
         let (n, _) = searcher::search_persistent_count(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
         let search_time = start.elapsed();
@@ -412,19 +422,76 @@ fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &s
         if !opts.quiet {
             eprintln!("Load: {:.1}ms, Search: {:.1}ms", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0);
         }
-    } else {
-        let (mut matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
-        matches.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
+        return Ok(());
+    }
+
+    if opts.files_only || opts.quiet {
+        // Same as direct: bypass render pipeline for these aggregate modes.
+        let (matches, _) = searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
+        output_summary(&matches, opts)?;
         let search_time = start.elapsed();
-        output_matches(&matches, opts)?;
         if !opts.quiet {
             eprintln!("Load: {:.1}ms, Search: {:.1}ms, {} matches", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0, matches.len());
         }
+        if opts.quiet && matches.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let render_opts = render_opts_for(opts);
+    let dispatch = dispatch_for(&render_opts);
+
+    let stdout = std::io::stdout();
+    let output = Mutex::new(std::io::BufWriter::new(stdout));
+    let (count, _) = render::search_persistent_render(
+        &idx,
+        pattern,
+        path_filter.as_deref(),
+        opts.hidden,
+        &opts.context,
+        &render_opts,
+        dispatch,
+        &output,
+    )?;
+    {
+        let mut out = output.lock().unwrap();
+        let _ = out.flush();
+    }
+    let search_time = start.elapsed();
+    if !opts.quiet {
+        eprintln!("Load: {:.1}ms, Search: {:.1}ms, {} matches", load_time.as_secs_f64() * 1000.0, search_time.as_secs_f64() * 1000.0, count);
     }
     Ok(())
 }
 
-fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> {
+/// Build a `RenderOpts` from CLI flags. Heading honours --heading/--no-heading
+/// then falls back to TTY auto-detect; colour is strictly TTY-driven so a
+/// piped `--heading` doesn't leak escapes.
+fn render_opts_for(opts: &SearchOpts) -> RenderOpts {
+    RenderOpts {
+        heading: use_heading(opts),
+        color: use_color(),
+        pattern: opts.pattern.clone(),
+    }
+}
+
+/// Streaming dispatch is only safe when neither heading nor colour are on:
+/// both require buffered, sorted output (heading wants stable file order,
+/// colour can't be applied per-byte during a streaming write).
+fn dispatch_for(render_opts: &RenderOpts) -> Dispatch {
+    if render_opts.heading || render_opts.color {
+        Dispatch::Sorted
+    } else {
+        Dispatch::Streaming
+    }
+}
+
+/// Aggregate-mode output: `--count` (one `path:N` per file) and
+/// `--files-with-matches` (one path per file). `--quiet` is a no-op here.
+/// The full match-line render path lives in `render::*` now; this function
+/// is the leftover that used to handle every output mode.
+fn output_summary(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> {
     if opts.quiet { return Ok(()); }
     if opts.count {
         let mut counts: std::collections::HashMap<&PathBuf, usize> = std::collections::HashMap::new();
@@ -452,155 +519,8 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
                 println!("{}", f.display());
             }
         }
-        return Ok(());
-    }
-
-    let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    let color = use_color();
-    if use_heading(opts) {
-        write_grouped_matches(&mut out, matches, opts.pattern.as_deref(), color)?;
-    } else {
-        write_flat_matches(&mut out, matches, opts.pattern.as_deref(), color)?;
     }
     Ok(())
-}
-
-/// grep-style flat output: `path:line:content` per match. When `color` is
-/// true we wrap the path, line number, and matched substring in ANSI codes
-/// (mirroring ripgrep's --no-heading on a TTY); otherwise the bytes are
-/// plain text — same shape as the streaming path so downstream tools see
-/// identical output regardless of which render path served the request.
-fn write_flat_matches<W: Write>(
-    out: &mut W,
-    matches: &[searcher::Match],
-    pattern: Option<&str>,
-    color: bool,
-) -> Result<()> {
-    if !color {
-        for m in matches {
-            let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
-        }
-        return Ok(());
-    }
-
-    let re = pattern.and_then(|p| regex::Regex::new(p).ok());
-    let mut hl_buf = String::with_capacity(256);
-
-    for m in matches {
-        let rendered: &str = if let Some(ref r) = re {
-            hl_buf.clear();
-            highlight_into(&m.line, r, &mut hl_buf);
-            hl_buf.as_str()
-        } else {
-            m.line.as_str()
-        };
-        let _ = writeln!(
-            out,
-            "{}{}{}{}:{}{}{}:{}",
-            C_BOLD, C_PATH, m.path.display(), C_RESET,
-            C_LINENO, m.line_number, C_RESET,
-            rendered,
-        );
-    }
-    Ok(())
-}
-
-/// Helper: returns the ANSI sequence if `color` is true, else `""`. Lets the
-/// renderer share one code path for both coloured and plain output without
-/// branching on every write.
-#[inline]
-fn ansi(seq: &'static str, color: bool) -> &'static str {
-    if color { seq } else { "" }
-}
-
-/// ripgrep-style grouped output: file path on its own line, then each match
-/// indented as `<lineno>: <content>` with the matched substring highlighted.
-/// Improves on rg by right-aligning line numbers within each file group, so a
-/// file that contains both line 3 and line 1042 renders cleanly aligned.
-/// `color` gates ANSI escapes: heading layout stays the same when off, only
-/// the colour codes are suppressed (e.g. `fgr --heading | cat`).
-fn write_grouped_matches<W: Write>(
-    out: &mut W,
-    matches: &[searcher::Match],
-    pattern: Option<&str>,
-    color: bool,
-) -> Result<()> {
-    // Compile the regex once for highlight-position lookups. If pattern is
-    // None or doesn't compile, we still print the line — just unhighlighted.
-    let re = pattern.and_then(|p| regex::Regex::new(p).ok());
-
-    // Reused across all matches: avoids per-line String allocation when the
-    // regex can be applied. For the no-regex fallback we just write `m.line`
-    // by reference, no clone needed.
-    let mut hl_buf = String::with_capacity(256);
-
-    let bold = ansi(C_BOLD, color);
-    let dim = ansi(C_DIM, color);
-    let reset = ansi(C_RESET, color);
-    let path_c = ansi(C_PATH, color);
-    let lineno_c = ansi(C_LINENO, color);
-
-    let mut current: Option<&std::path::Path> = None;
-    let mut i = 0;
-    while i < matches.len() {
-        // Find the end of the current file's run.
-        let path = matches[i].path.as_path();
-        let mut j = i + 1;
-        while j < matches.len() && matches[j].path.as_path() == path { j += 1; }
-
-        // Width of the largest line number in this group (for right-align).
-        let max_lineno = matches[i..j].iter().map(|m| m.line_number).max().unwrap_or(1);
-        let lineno_width = max_lineno.to_string().len();
-
-        // Blank line between groups.
-        if current.is_some() {
-            let _ = writeln!(out);
-        }
-        let _ = writeln!(out, "{}{}{}{}", bold, path_c, path.display(), reset);
-
-        for m in &matches[i..j] {
-            let rendered: &str = if let (Some(ref r), true) = (&re, color) {
-                hl_buf.clear();
-                highlight_into(&m.line, r, &mut hl_buf);
-                hl_buf.as_str()
-            } else {
-                m.line.as_str()
-            };
-            let _ = writeln!(
-                out,
-                "{}{:>w$}{}{}:{} {}",
-                lineno_c, m.line_number, reset,
-                dim, reset,
-                rendered,
-                w = lineno_width,
-            );
-        }
-
-        current = Some(path);
-        i = j;
-    }
-    Ok(())
-}
-
-/// Writes `line` into `out` with every regex match wrapped in ANSI codes.
-/// Caller is responsible for clearing `out` before calling if a fresh result
-/// is needed; we append, so the same buffer can be reused across many lines.
-fn highlight_into(line: &str, re: &regex::Regex, out: &mut String) {
-    out.reserve(line.len() + 16);
-    let mut last_end = 0usize;
-    for mat in re.find_iter(line) {
-        if mat.start() > last_end {
-            out.push_str(&line[last_end..mat.start()]);
-        }
-        out.push_str(C_MATCH);
-        out.push_str(&line[mat.start()..mat.end()]);
-        out.push_str(C_RESET);
-        last_end = mat.end();
-    }
-    if last_end < line.len() {
-        out.push_str(&line[last_end..]);
-    }
 }
 
 fn run_subcommand(cmd: Commands, no_ignore: bool, hidden: bool, type_filter: Option<&str>) -> Result<()> {

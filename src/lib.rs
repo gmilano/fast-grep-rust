@@ -1,5 +1,6 @@
 pub mod index;
 pub mod persist;
+pub mod render;
 pub mod searcher;
 pub mod trigram;
 #[cfg(feature = "daemon")]

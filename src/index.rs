@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use ignore::WalkBuilder;
 
+use crate::searcher::is_known_text_ext;
+
 pub struct IndexStats {
     pub num_docs: usize,
     pub num_ngrams: usize,
@@ -137,7 +139,14 @@ impl SparseIndex {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if content.iter().take(512).any(|&b| b == 0) {
+            // Match `search_full_scan`'s binary-detection rule so the
+            // indexed and direct-scan paths see the same set of files.
+            // Known text extensions (`.txt`, `.rs`, etc.) trust the
+            // extension and bypass the null-byte heuristic — fixtures
+            // can legitimately contain `\0` and we don't want to drop
+            // them from the index when the direct scan would still
+            // search them.
+            if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
                 continue;
             }
 

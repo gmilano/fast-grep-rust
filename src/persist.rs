@@ -409,6 +409,32 @@ impl PersistentIndex {
     // --- Search methods ---
 
     pub fn search_timed(&self, pattern: &str) -> (SearchResult<'_>, SearchTiming) {
+        // Patterns with inline `(?i)` (or any flag group enabling
+        // case-insensitive matching) defeat the trigram index — the
+        // index was built case-sensitively, so `(?i)abc` looking up
+        // the trigram "abc" will miss files containing `ABC`. Fall
+        // back to scanning every live file. Same approach the CLI
+        // already used for the `-i` flag, now applied uniformly so
+        // direct callers of this API (tests, library users) also get
+        // correct results.
+        if trigram::has_case_insensitive_flag(pattern) {
+            let docs = self.live_doc_ids();
+            let n = docs.len();
+            return (
+                SearchResult::AllFiles(docs),
+                SearchTiming {
+                    lookup_ms: 0.0,
+                    bitmap_intersect_ms: 0.0,
+                    verify_ms: 0.0,
+                    candidates: n,
+                    matches: 0,
+                    strategy: String::new(),
+                    density: 0.0,
+                    prefix_filtered: 0,
+                },
+            );
+        }
+
         let alternatives = trigram::decompose_pattern(pattern);
 
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {

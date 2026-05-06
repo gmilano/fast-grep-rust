@@ -5,6 +5,7 @@ mod index;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod persist;
+mod render;
 mod searcher;
 mod trigram;
 

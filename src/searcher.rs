@@ -15,6 +15,15 @@ use crate::persist::SearchResult;
 use crate::metal::metal_impl::global_verifier;
 
 
+/// Match record for the legacy aggregate-mode APIs (`search_full_scan` and
+/// `search_persistent_timed`). The render pipeline writes formatted bytes
+/// directly and never goes through this type, so the binary itself reads
+/// only `path` (for `--count` / `--files-with-matches` summaries). The
+/// `line_number` and `line` fields stay live for the integration tests in
+/// `tests/searcher_integration.rs` and `tests/regex_correctness.rs`,
+/// which need full match records to assert correctness against the regex
+/// crate's reference behaviour.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Match {
     pub path: PathBuf,
@@ -42,7 +51,7 @@ fn is_literal(pattern: &str) -> bool {
 /// to column 0 mid-line, then the following match's escape codes start
 /// drawing on top of the previous content).
 #[inline]
-fn strip_trailing_cr(line: &[u8]) -> &[u8] {
+pub(crate) fn strip_trailing_cr(line: &[u8]) -> &[u8] {
     match line.split_last() {
         Some((b'\r', rest)) => rest,
         _ => line,
@@ -58,7 +67,7 @@ fn strip_trailing_cr(line: &[u8]) -> &[u8] {
 /// happens to contain dot-components (e.g. Windows tempdirs are
 /// `…\Temp\.tmpXXXX`, and a project under `~/.config/foo/` is not "hidden"
 /// from the user's perspective just because `.config` sits above it).
-fn is_hidden_path(p: &Path, root: &Path) -> bool {
+pub(crate) fn is_hidden_path(p: &Path, root: &Path) -> bool {
     let rel = p.strip_prefix(root).unwrap_or(p);
     rel.components().any(|c| match c {
         std::path::Component::Normal(s) => {
@@ -179,7 +188,9 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                     let mut lookahead = chars.clone();
                     lookahead.next();
                     if let Some(&after) = lookahead.peek() {
-                        if ":PimsxuU-<!=".contains(after) {
+                        // Same flag-group recognition rule as trigram::extract_literal_runs;
+                        // `R` (CRLF mode) was missing there too — see that file's note.
+                        if ":PimRsxuU-<!=".contains(after) {
                             chars.next();
                             while let Some(&c) = chars.peek() {
                                 if c == ':' || c == ')' {
@@ -273,7 +284,7 @@ fn try_literal_alternation(pattern: &str) -> Option<Vec<Vec<u8>>> {
 /// meaning we need to search line-by-line to match grep/rg behavior.
 /// This is the case when the pattern uses [[:space:]], \s, or similar
 /// that match \n, but does NOT use explicit (?s) or (?m) multiline flags.
-fn needs_line_by_line(pattern: &str) -> bool {
+pub(crate) fn needs_line_by_line(pattern: &str) -> bool {
     // If pattern explicitly opts into multiline/dotall, respect it
     if pattern.contains("(?s)") || pattern.contains("(?m)") || pattern.contains("(?is)") {
         return false;
@@ -294,7 +305,7 @@ fn needs_line_by_line(pattern: &str) -> bool {
 }
 
 /// Matcher abstraction with SIMD-accelerated pre-filters.
-enum Matcher {
+pub(crate) enum Matcher {
     /// Pure literal — SIMD memmem only, no regex needed
     Literal(memmem::Finder<'static>),
     /// Pure regex — no pre-filter available
@@ -312,7 +323,7 @@ enum Matcher {
 }
 
 impl Matcher {
-    fn new(pattern: &str) -> Result<Self> {
+    pub(crate) fn new(pattern: &str) -> Result<Self> {
         // 1. Pure literal — no regex metacharacters at all
         if is_literal(pattern) {
             let needle: &'static [u8] = Vec::leak(pattern.as_bytes().to_vec());
@@ -365,7 +376,7 @@ impl Matcher {
     /// IMPORTANT: We check line-by-line for regex patterns to avoid cross-line
     /// false positives (e.g. [[:space:]] matching \n between two lines).
     #[inline]
-    fn has_match(&self, buf: &[u8], lbl: bool) -> bool {
+    pub(crate) fn has_match(&self, buf: &[u8], lbl: bool) -> bool {
         match self {
             Matcher::Literal(finder) => finder.find(buf).is_some(),
             Matcher::Regex(re) => {
@@ -529,14 +540,14 @@ fn line_bounds(buf: &[u8], offset: usize) -> (usize, usize) {
 
 /// Check if buffer looks binary (null byte in first 512 bytes).
 #[inline]
-fn is_binary(buf: &[u8]) -> bool {
+pub(crate) fn is_binary(buf: &[u8]) -> bool {
     let check_len = buf.len().min(512);
     memchr::memchr(0, &buf[..check_len]).is_some()
 }
 
 /// Known text extensions — skip binary check for these (major perf win)
 #[inline(always)]
-fn is_known_text_ext(path: &std::path::Path) -> bool {
+pub(crate) fn is_known_text_ext(path: &std::path::Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(e) => matches!(e,
             "rs"|"ts"|"tsx"|"js"|"jsx"|"py"|"go"|"rb"|"java"|"c"|"h"|"cpp"|"cc"|"hpp"|
@@ -1143,193 +1154,12 @@ pub fn search_full_scan_count(
     Ok(total_count.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Streaming full scan — writes directly to output, minimal allocations.
-/// Uses capped read buffers (like ripgrep) to limit memory usage.
-pub fn search_full_scan_streaming<W: std::io::Write + Send>(
-    root: &Path,
-    pattern: &str,
-    no_ignore: bool,
-    hidden: bool,
-    type_filter: Option<&str>,
-    output: &Mutex<W>,
-) -> Result<usize> {
-    let matcher = Matcher::new(pattern)?;
-    let match_count = std::sync::atomic::AtomicUsize::new(0);
+// `search_full_scan_streaming` (the inline-format streaming path) was
+// removed in the render-pipeline refactor. Its responsibilities now belong
+// to `crate::render::search_full_scan_render` with `Dispatch::Streaming`,
+// which inherits context, heading, and colour for free.
 
-    let walker = ignore::WalkBuilder::new(root)
-        .git_ignore(!no_ignore)
-        .hidden(!hidden)
-        .threads(num_cpus())
-        .build_parallel();
-
-    let type_filter_owned = type_filter.map(|s| s.to_string());
-
-    walker.run(|| {
-        let matcher = &matcher;
-        let output = output;
-        let match_count = &match_count;
-        let type_filter = type_filter_owned.as_deref();
-        // Fixed-capacity read buffer — caps memory at ~1MB per thread regardless of file size
-        // Thread-local reusable read buffer for small files
-        let mut read_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-        // Thread-local output buffer to batch writes
-        let mut out_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-
-        Box::new(move |entry| {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
-            };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => return ignore::WalkState::Continue,
-                }
-            }
-
-            // Hybrid read strategy: reusable buffer for small files, mmap for large
-            read_buf.clear();
-            let file = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if flen == 0 { return ignore::WalkState::Continue; }
-
-            // For files that would bloat our buffer, use mmap
-            let _mmap_holder;
-            let buf: &[u8] = if flen > 256 * 1024 {
-                _mmap_holder = match unsafe { memmap2::Mmap::map(&file) } {
-                    Ok(m) => Some(m),
-                    Err(_) => return ignore::WalkState::Continue,
-                };
-                _mmap_holder.as_ref().unwrap()
-            } else {
-                _mmap_holder = None;
-                use std::io::Read;
-                let mut f = file;
-                if f.read_to_end(&mut read_buf).is_err() {
-                    return ignore::WalkState::Continue;
-                }
-                &read_buf[..]
-            };
-
-            if !is_known_text_ext(path) && is_binary(buf) {
-                return ignore::WalkState::Continue;
-            }
-
-            // Pre-filter: skip entire file if literal/AC not found
-            match matcher {
-                Matcher::LiteralThenRegex { ref finder, .. } => {
-                    if finder.find(buf).is_none() {
-                        return ignore::WalkState::Continue;
-                    }
-                }
-                Matcher::AhoCorasickThenRegex { ref ac, .. } => {
-                    if ac.find(buf).is_none() {
-                        return ignore::WalkState::Continue;
-                    }
-                }
-                _ => {}
-            }
-
-            let path_bytes = path.to_string_lossy();
-            let mut file_count = 0usize;
-
-            match matcher {
-                Matcher::Literal(ref finder) => {
-                    let mut offset = 0;
-                    let mut line_num: usize = 1;
-                    let mut counted_to: usize = 0;
-
-                    while let Some(pos) = finder.find(&buf[offset..]) {
-                        let abs_pos = offset + pos;
-                        line_num += memchr::memchr_iter(b'\n', &buf[counted_to..abs_pos]).count();
-                        counted_to = abs_pos;
-                        let (line_start, line_end) = line_bounds(buf, abs_pos);
-
-                        use std::io::Write;
-                        let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                        out_buf.extend_from_slice(strip_trailing_cr(&buf[line_start..line_end]));
-                        out_buf.push(b'\n');
-                        file_count += 1;
-
-                        offset = line_end + 1;
-                        if offset >= buf.len() { break; }
-                    }
-                }
-                Matcher::Regex(ref re)
-                | Matcher::LiteralThenRegex { regex: ref re, .. }
-                | Matcher::AhoCorasickThenRegex { regex: ref re, .. } => {
-                    let mut line_num: usize = 1;
-
-                    let lbl = needs_line_by_line(pattern);
-                    if lbl {
-                        // Line-by-line to prevent [[:space:]] crossing newlines
-                        let mut lpos = 0;
-                        while lpos <= buf.len() {
-                            let lend = memchr::memchr(b'\n', &buf[lpos..])
-                                .map(|p| lpos + p)
-                                .unwrap_or(buf.len());
-                            let line_bytes = &buf[lpos..lend];
-                            if re.is_match(line_bytes) {
-                                use std::io::Write;
-                                let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                                out_buf.extend_from_slice(strip_trailing_cr(line_bytes));
-                                out_buf.push(b'\n');
-                                file_count += 1;
-                            }
-                            line_num += 1;
-                            lpos = lend + 1;
-                        }
-                    } else {
-                        // Whole-buffer search
-                        let mut last_line_start = usize::MAX;
-                        let mut counted_to: usize = 0;
-                        for m in re.find_iter(buf) {
-                            let start = m.start();
-                            line_num += memchr::memchr_iter(b'\n', &buf[counted_to..start]).count();
-                            counted_to = start;
-                            let (line_start, line_end) = line_bounds(buf, start);
-                            if line_start != last_line_start {
-                                use std::io::Write;
-                                let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                                out_buf.extend_from_slice(strip_trailing_cr(&buf[line_start..line_end]));
-                                out_buf.push(b'\n');
-                                file_count += 1;
-                                last_line_start = line_start;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if file_count > 0 {
-                match_count.fetch_add(file_count, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            // Flush output buffer after each file with matches
-            if !out_buf.is_empty() {
-                let mut out = output.lock().unwrap();
-                let _ = out.write_all(&out_buf);
-                out_buf.clear();
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    Ok(match_count.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-fn num_cpus() -> usize {
+pub(crate) fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
