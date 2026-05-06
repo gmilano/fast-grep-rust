@@ -22,15 +22,17 @@ impl MetalVerifier {
     pub fn new() -> Option<Self> {
         let device = Device::system_default()?;
         let options = CompileOptions::new();
-        let library = device
-            .new_library_with_source(SHADER_SRC, &options)
-            .ok()?;
+        let library = device.new_library_with_source(SHADER_SRC, &options).ok()?;
         let func = library.get_function("literal_search", None).ok()?;
         let pipeline = device
             .new_compute_pipeline_state_with_function(&func)
             .ok()?;
         let queue = device.new_command_queue();
-        Some(Self { device, pipeline, queue })
+        Some(Self {
+            device,
+            pipeline,
+            queue,
+        })
     }
 
     /// Filter `line_slices` by literal `needle` using the GPU.
@@ -41,11 +43,13 @@ impl MetalVerifier {
     pub fn filter(
         &self,
         line_data: &[u8],
-        line_slices: &[(u32, u32)],  // (offset, len)
+        line_slices: &[(u32, u32)], // (offset, len)
         needle: &[u8],
     ) -> Vec<bool> {
         let n = line_slices.len();
-        if n == 0 { return vec![]; }
+        if n == 0 {
+            return vec![];
+        }
 
         // --- Build GPU buffers ---
         let data_buf = self.device.new_buffer_with_data(
@@ -54,8 +58,12 @@ impl MetalVerifier {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let entries: Vec<LineEntry> = line_slices.iter()
-            .map(|&(off, len)| LineEntry { offset: off, length: len })
+        let entries: Vec<LineEntry> = line_slices
+            .iter()
+            .map(|&(off, len)| LineEntry {
+                offset: off,
+                length: len,
+            })
             .collect();
         let entries_buf = self.device.new_buffer_with_data(
             entries.as_ptr() as *const _,

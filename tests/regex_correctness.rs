@@ -59,13 +59,34 @@ fn unescape_haystack(s: &str) -> String {
             continue;
         }
         match bytes[i + 1] {
-            b'n' => { out.push('\n'); i += 2; }
-            b't' => { out.push('\t'); i += 2; }
-            b'r' => { out.push('\r'); i += 2; }
-            b'f' => { out.push('\x0C'); i += 2; }
-            b'v' => { out.push('\x0B'); i += 2; }
-            b'\\' => { out.push('\\'); i += 2; }
-            b'0' => { out.push('\0'); i += 2; }
+            b'n' => {
+                out.push('\n');
+                i += 2;
+            }
+            b't' => {
+                out.push('\t');
+                i += 2;
+            }
+            b'r' => {
+                out.push('\r');
+                i += 2;
+            }
+            b'f' => {
+                out.push('\x0C');
+                i += 2;
+            }
+            b'v' => {
+                out.push('\x0B');
+                i += 2;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            b'0' => {
+                out.push('\0');
+                i += 2;
+            }
             b'x' if i + 3 < bytes.len() => {
                 let hex = std::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or("");
                 if let Ok(b) = u8::from_str_radix(hex, 16) {
@@ -106,7 +127,11 @@ fn parse_toml_tests(path: &std::path::Path) -> Vec<RegexTest> {
                 || entry.get("line-terminator").is_some()
                 || entry.get("utf8").and_then(|v| v.as_bool()) == Some(false);
 
-            let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             // regex can be a string or array of strings; skip multi-pattern tests
             let raw_regex = match entry.get("regex") {
@@ -121,10 +146,20 @@ fn parse_toml_tests(path: &std::path::Path) -> Vec<RegexTest> {
             // Honour the fixture's `unescape = true` for the haystack
             // (Fowler-style fixtures encode bytes like `\x02` and `\n` as
             // literals expecting the runner to decode them before matching).
-            let unescape = entry.get("unescape").and_then(|v| v.as_bool()).unwrap_or(false);
-            let haystack = if unescape { unescape_haystack(&raw_haystack) } else { raw_haystack };
+            let unescape = entry
+                .get("unescape")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let haystack = if unescape {
+                unescape_haystack(&raw_haystack)
+            } else {
+                raw_haystack
+            };
 
-            let compiles = entry.get("compiles").and_then(|v| v.as_bool()).unwrap_or(true);
+            let compiles = entry
+                .get("compiles")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
 
             let should_match = match entry.get("matches").and_then(|v| v.as_array()) {
                 Some(arr) => !arr.is_empty(),
@@ -143,12 +178,18 @@ fn parse_toml_tests(path: &std::path::Path) -> Vec<RegexTest> {
             // `\A` (start-of-input) is preferred over `^` here so the
             // anchor is unambiguous even if the fixture also sets
             // multiline mode somewhere in the regex.
-            let unicode = entry.get("unicode").and_then(|v| v.as_bool()).unwrap_or(true);
+            let unicode = entry
+                .get("unicode")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let case_insensitive = entry
                 .get("case-insensitive")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let anchored = entry.get("anchored").and_then(|v| v.as_bool()).unwrap_or(false);
+            let anchored = entry
+                .get("anchored")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mut regex = raw_regex;
             if anchored {
                 regex = format!(r"\A{}", regex);
@@ -174,7 +215,9 @@ fn parse_toml_tests(path: &std::path::Path) -> Vec<RegexTest> {
 }
 
 fn testdata_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("regex-testdata")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("regex-testdata")
 }
 
 /// Verify full scan correctness: for each test case, create a temp file with the haystack
@@ -440,7 +483,10 @@ fn indexed_search_matches_full_scan_regex_suite() {
 
     eprintln!(
         "Index correctness: {} total, {} passed, {} skipped, {} false negatives",
-        total, passed, skipped, false_negatives.len()
+        total,
+        passed,
+        skipped,
+        false_negatives.len()
     );
     if !false_negatives.is_empty() {
         eprintln!("FALSE NEGATIVES (index missed real matches):");

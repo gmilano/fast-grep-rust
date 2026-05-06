@@ -127,8 +127,7 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             // Escaped character — check if it's a literal
             if let Some(&next) = chars.peek() {
                 match next {
-                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z'
-                    | 'p' | 'P' => {
+                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z' | 'p' | 'P' => {
                         // Not a literal — regex escape class
                         if !current.is_empty() {
                             runs.push(std::mem::take(&mut current));
@@ -138,7 +137,9 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                         if (next == 'p' || next == 'P') && chars.peek() == Some(&'{') {
                             chars.next(); // skip '{'
                             while let Some(c) = chars.next() {
-                                if c == '}' { break; }
+                                if c == '}' {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -188,7 +189,9 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                 runs.push(std::mem::take(&mut current));
             }
             while let Some(c) = chars.next() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
             }
         } else if ch == '(' {
             // Skip entire group if it contains alternation — extracting literals
@@ -203,9 +206,16 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             let saved = chars.clone();
             while let Some(c) = chars.next() {
                 match c {
-                    '\\' => { chars.next(); }
+                    '\\' => {
+                        chars.next();
+                    }
                     '(' => depth += 1,
-                    ')' => { depth -= 1; if depth == 0 { break; } }
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
                     '|' if depth == 1 => has_alt = true,
                     _ => {}
                 }
@@ -335,7 +345,6 @@ mod tests {
         // Should not panic; result depends on implementation details
         assert!(result.len() >= 1);
     }
-
 
     #[test]
     fn char_class_not_treated_as_literal() {

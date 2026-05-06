@@ -58,11 +58,7 @@ impl ContextOpts {
     /// Resolve grep-style flags into a single set of context lines.
     /// `--before-context` and `--after-context` win over `--context` for
     /// their direction; `--context` is the symmetric fallback.
-    pub fn resolve(
-        context: Option<usize>,
-        before: Option<usize>,
-        after: Option<usize>,
-    ) -> Self {
+    pub fn resolve(context: Option<usize>, before: Option<usize>, after: Option<usize>) -> Self {
         Self {
             before: before.or(context).unwrap_or(0),
             after: after.or(context).unwrap_or(0),
@@ -371,25 +367,27 @@ pub fn search_persistent_render<W: Write + Send>(
     let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
 
     use rayon::prelude::*;
-    candidate_paths.par_iter().for_each_init(WorkerBufs::new, |bufs, path| {
-        let flen = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(_) => return,
-        };
-        let mut holder: Option<Mmap> = None;
-        let buf = match read_or_mmap(path, flen, &mut bufs.read_buf, &mut holder) {
-            Some(b) => b,
-            None => return,
-        };
+    candidate_paths
+        .par_iter()
+        .for_each_init(WorkerBufs::new, |bufs, path| {
+            let flen = match std::fs::metadata(path) {
+                Ok(m) => m.len(),
+                Err(_) => return,
+            };
+            let mut holder: Option<Mmap> = None;
+            let buf = match read_or_mmap(path, flen, &mut bufs.read_buf, &mut holder) {
+                Some(b) => b,
+                None => return,
+            };
 
-        bufs.out.clear();
-        let count = render_file_into(path, buf, &matcher, pattern, ctx, render, &mut bufs.out);
+            bufs.out.clear();
+            let count = render_file_into(path, buf, &matcher, pattern, ctx, render, &mut bufs.out);
 
-        if count > 0 {
-            total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-            dispatch_file(path, &mut bufs.out, dispatch, output, &collector);
-        }
-    });
+            if count > 0 {
+                total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                dispatch_file(path, &mut bufs.out, dispatch, output, &collector);
+            }
+        });
 
     if dispatch == Dispatch::Sorted {
         let mut entries = collector.into_inner().unwrap();
@@ -415,7 +413,11 @@ mod render_tests {
     use std::path::PathBuf;
 
     fn opts(heading: bool) -> RenderOpts {
-        RenderOpts { heading, color: false, pattern: None }
+        RenderOpts {
+            heading,
+            color: false,
+            pattern: None,
+        }
     }
 
     /// Test helper: run render_file_into against raw bytes and return UTF-8.
@@ -423,7 +425,15 @@ mod render_tests {
         let path = PathBuf::from("test.txt");
         let matcher = Matcher::new(pattern).unwrap();
         let mut out = Vec::new();
-        let n = render_file_into(&path, buf, &matcher, pattern, &ctx, &opts(heading), &mut out);
+        let n = render_file_into(
+            &path,
+            buf,
+            &matcher,
+            pattern,
+            &ctx,
+            &opts(heading),
+            &mut out,
+        );
         (n, String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -431,7 +441,12 @@ mod render_tests {
 
     #[test]
     fn zero_context_flat_one_match() {
-        let (n, out) = render(b"alpha\nbeta\ngamma\n", "beta", ContextOpts::default(), false);
+        let (n, out) = render(
+            b"alpha\nbeta\ngamma\n",
+            "beta",
+            ContextOpts::default(),
+            false,
+        );
         assert_eq!(n, 1);
         assert_eq!(out, "test.txt:2:beta\n");
     }
@@ -463,7 +478,15 @@ mod render_tests {
     #[test]
     fn after_context_only() {
         let buf = b"a\nb\nMATCH\nc\nd\ne\n";
-        let (n, out) = render(buf, "MATCH", ContextOpts { before: 0, after: 2 }, false);
+        let (n, out) = render(
+            buf,
+            "MATCH",
+            ContextOpts {
+                before: 0,
+                after: 2,
+            },
+            false,
+        );
         assert_eq!(n, 1);
         assert_eq!(out, "test.txt:3:MATCH\ntest.txt-4-c\ntest.txt-5-d\n");
     }
@@ -471,7 +494,15 @@ mod render_tests {
     #[test]
     fn before_context_only() {
         let buf = b"a\nb\nc\nMATCH\nd\n";
-        let (n, out) = render(buf, "MATCH", ContextOpts { before: 2, after: 0 }, false);
+        let (n, out) = render(
+            buf,
+            "MATCH",
+            ContextOpts {
+                before: 2,
+                after: 0,
+            },
+            false,
+        );
         assert_eq!(n, 1);
         assert_eq!(out, "test.txt-2-b\ntest.txt-3-c\ntest.txt:4:MATCH\n");
     }
@@ -479,7 +510,15 @@ mod render_tests {
     #[test]
     fn match_at_line_one_clamps_before() {
         let buf = b"MATCH\nrest\n";
-        let (n, out) = render(buf, "MATCH", ContextOpts { before: 5, after: 0 }, false);
+        let (n, out) = render(
+            buf,
+            "MATCH",
+            ContextOpts {
+                before: 5,
+                after: 0,
+            },
+            false,
+        );
         assert_eq!(n, 1);
         // No before-context lines because we're at SOF.
         assert_eq!(out, "test.txt:1:MATCH\n");
@@ -488,7 +527,15 @@ mod render_tests {
     #[test]
     fn match_at_eof_clamps_after() {
         let buf = b"a\nMATCH"; // no trailing newline
-        let (n, out) = render(buf, "MATCH", ContextOpts { before: 0, after: 5 }, false);
+        let (n, out) = render(
+            buf,
+            "MATCH",
+            ContextOpts {
+                before: 0,
+                after: 5,
+            },
+            false,
+        );
         assert_eq!(n, 1);
         // No after-context lines because we're at EOF.
         assert_eq!(out, "test.txt:2:MATCH\n");
@@ -501,7 +548,15 @@ mod render_tests {
         // Two matches, distance 2, with -A 1 -B 0 → after-context absorbs.
         let buf = b"a\nMATCH\nb\nMATCH\nc\n";
         //         line1  2     3   4     5
-        let (n, out) = render(buf, "MATCH", ContextOpts { before: 0, after: 1 }, false);
+        let (n, out) = render(
+            buf,
+            "MATCH",
+            ContextOpts {
+                before: 0,
+                after: 1,
+            },
+            false,
+        );
         assert_eq!(n, 2);
         // Expected: m2, ctx3, m4, ctx5 — no `--` because m4 lands inside m2's after-window.
         let expected = "test.txt:2:MATCH\ntest.txt-3-b\ntest.txt:4:MATCH\ntest.txt-5-c\n";
@@ -513,7 +568,15 @@ mod render_tests {
         // Two matches, distance 8, with -C 1 → not adjacent, separator expected.
         let buf = b"a\nM\nb\nc\nd\ne\nf\ng\nM\nh\n";
         //         1  2 3 4 5 6 7 8 9 10
-        let (n, out) = render(buf, "M", ContextOpts { before: 1, after: 1 }, false);
+        let (n, out) = render(
+            buf,
+            "M",
+            ContextOpts {
+                before: 1,
+                after: 1,
+            },
+            false,
+        );
         assert_eq!(n, 2);
         let expected = "test.txt-1-a\ntest.txt:2:M\ntest.txt-3-b\n--\ntest.txt-8-g\ntest.txt:9:M\ntest.txt-10-h\n";
         assert_eq!(out, expected);
@@ -524,7 +587,15 @@ mod render_tests {
         // Match on line 2 (with -A 2) extends through line 4. Match also on line 4.
         // Line 4 must render as `:` (Match), not `-` (Context).
         let buf = b"a\nM\nb\nM\nc\n";
-        let (n, out) = render(buf, "M", ContextOpts { before: 0, after: 2 }, false);
+        let (n, out) = render(
+            buf,
+            "M",
+            ContextOpts {
+                before: 0,
+                after: 2,
+            },
+            false,
+        );
         assert_eq!(n, 2);
         // Expected: m2, ctx3, m4 (NOT ctx4!), ctx5.
         let expected = "test.txt:2:M\ntest.txt-3-b\ntest.txt:4:M\ntest.txt-5-c\n";
@@ -534,7 +605,15 @@ mod render_tests {
     #[test]
     fn heading_mode_with_context() {
         let buf = b"a\nM\nb\n";
-        let (n, out) = render(buf, "M", ContextOpts { before: 1, after: 1 }, true);
+        let (n, out) = render(
+            buf,
+            "M",
+            ContextOpts {
+                before: 1,
+                after: 1,
+            },
+            true,
+        );
         assert_eq!(n, 1);
         let expected = "test.txt\n1-a\n2:M\n3-b\n";
         assert_eq!(out, expected);
@@ -632,8 +711,8 @@ mod scan_tests {
     #[test]
     fn no_trailing_newline_handled() {
         let buf = b"a\nbb\nlast"; // no trailing \n
-        // Last line "last" runs from 5..9. From end of "bb" (offset 4),
-        // forward 1 should be EOF since there's no terminator after "last".
+                                  // Last line "last" runs from 5..9. From end of "bb" (offset 4),
+                                  // forward 1 should be EOF since there's no terminator after "last".
         assert_eq!(forward_n_lines(buf, 4, 1), buf.len());
         // Back from inside "last" (offset 7): 1 line back = start of "bb" = 2.
         assert_eq!(back_n_lines(buf, 7, 1), 2);
@@ -719,8 +798,7 @@ pub(crate) fn render_file_into(
     //                   matching ripgrep)
     //   header_emitted — heading mode emits the path header lazily on the
     //                   first match in the file
-    let mut prev_lines: VecDeque<(u32, usize, usize)> =
-        VecDeque::with_capacity(ctx.before.max(1));
+    let mut prev_lines: VecDeque<(u32, usize, usize)> = VecDeque::with_capacity(ctx.before.max(1));
     let mut after_remaining: usize = 0;
     // Last line number we wrote out (match or context). Drives the chunk-
     // merge decision: a new match within `before + 1` lines of the last

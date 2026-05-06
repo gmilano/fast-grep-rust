@@ -16,7 +16,9 @@ pub use metal_impl::MetalVerifier;
 /// Returns None for patterns like `static.*inline` with no fixed literal.
 pub fn extract_literal(pattern: &str) -> Option<String> {
     // Bail on common regex metacharacters that prevent literal extraction
-    let has_meta = pattern.chars().any(|c| matches!(c, '*' | '+' | '?' | '[' | '(' | ')' | '|' | '^' | '$' | '{'));
+    let has_meta = pattern
+        .chars()
+        .any(|c| matches!(c, '*' | '+' | '?' | '[' | '(' | ')' | '|' | '^' | '$' | '{'));
     if has_meta {
         return None;
     }
@@ -37,5 +39,3 @@ pub struct VerifyResult {
     pub path: std::path::PathBuf,
     pub line: String,
 }
-
-

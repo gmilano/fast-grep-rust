@@ -10,10 +10,9 @@ use regex::bytes::Regex as BytesRegex;
 
 use std::collections::HashMap;
 
-use crate::persist::SearchResult;
 #[cfg(target_os = "macos")]
 use crate::metal::metal_impl::global_verifier;
-
+use crate::persist::SearchResult;
 
 /// Match record for the legacy aggregate-mode APIs (`search_full_scan` and
 /// `search_persistent_timed`). The render pipeline writes formatted bytes
@@ -70,9 +69,7 @@ pub(crate) fn strip_trailing_cr(line: &[u8]) -> &[u8] {
 pub(crate) fn is_hidden_path(p: &Path, root: &Path) -> bool {
     let rel = p.strip_prefix(root).unwrap_or(p);
     rel.components().any(|c| match c {
-        std::path::Component::Normal(s) => {
-            s.to_str().map_or(false, |s| s.starts_with('.'))
-        }
+        std::path::Component::Normal(s) => s.to_str().map_or(false, |s| s.starts_with('.')),
         _ => false,
     })
 }
@@ -104,7 +101,9 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                     if (next == 'p' || next == 'P') && chars.peek() == Some(&'{') {
                         chars.next();
                         while let Some(c) = chars.next() {
-                            if c == '}' { break; }
+                            if c == '}' {
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -163,9 +162,16 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                 let mut scan = chars.clone();
                 while let Some(c) = scan.next() {
                     match c {
-                        '\\' => { scan.next(); }
+                        '\\' => {
+                            scan.next();
+                        }
                         '(' => depth += 1,
-                        ')' => { depth -= 1; if depth == 0 { break; } }
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
                         '|' if depth == 1 => has_alt = true,
                         _ => {}
                     }
@@ -176,9 +182,16 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
                 depth = 1;
                 while let Some(c) = chars.next() {
                     match c {
-                        '\\' => { chars.next(); }
+                        '\\' => {
+                            chars.next();
+                        }
                         '(' => depth += 1,
-                        ')' => { depth -= 1; if depth == 0 { break; } }
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -279,7 +292,6 @@ fn try_literal_alternation(pattern: &str) -> Option<Vec<Vec<u8>>> {
     Some(literals)
 }
 
-
 /// Returns true if the pattern could produce cross-line matches,
 /// meaning we need to search line-by-line to match grep/rg behavior.
 /// This is the case when the pattern uses [[:space:]], \s, or similar
@@ -316,10 +328,7 @@ pub(crate) enum Matcher {
         regex: BytesRegex,
     },
     /// Aho-Corasick pre-filter for alternations + regex verify
-    AhoCorasickThenRegex {
-        ac: AhoCorasick,
-        regex: BytesRegex,
-    },
+    AhoCorasickThenRegex { ac: AhoCorasick, regex: BytesRegex },
 }
 
 impl Matcher {
@@ -380,19 +389,28 @@ impl Matcher {
         match self {
             Matcher::Literal(finder) => finder.find(buf).is_some(),
             Matcher::Regex(re) => {
-                if lbl { buf.split(|&b| b == b'\n').any(|line| re.is_match(line)) }
-                else { re.is_match(buf) }
+                if lbl {
+                    buf.split(|&b| b == b'\n').any(|line| re.is_match(line))
+                } else {
+                    re.is_match(buf)
+                }
             }
             Matcher::LiteralThenRegex { finder, regex } => {
                 finder.find(buf).is_some() && {
-                    if lbl { buf.split(|&b| b == b'\n').any(|line| regex.is_match(line)) }
-                    else { regex.is_match(buf) }
+                    if lbl {
+                        buf.split(|&b| b == b'\n').any(|line| regex.is_match(line))
+                    } else {
+                        regex.is_match(buf)
+                    }
                 }
             }
             Matcher::AhoCorasickThenRegex { ac, regex } => {
                 ac.find(buf).is_some() && {
-                    if lbl { buf.split(|&b| b == b'\n').any(|line| regex.is_match(line)) }
-                    else { regex.is_match(buf) }
+                    if lbl {
+                        buf.split(|&b| b == b'\n').any(|line| regex.is_match(line))
+                    } else {
+                        regex.is_match(buf)
+                    }
                 }
             }
         }
@@ -418,11 +436,15 @@ impl Matcher {
             }
             Matcher::Regex(re) => count_regex_lines(buf, re, lbl),
             Matcher::LiteralThenRegex { finder, regex } => {
-                if finder.find(buf).is_none() { return 0; }
+                if finder.find(buf).is_none() {
+                    return 0;
+                }
                 count_regex_lines(buf, regex, lbl)
             }
             Matcher::AhoCorasickThenRegex { ac, regex } => {
-                if ac.find(buf).is_none() { return 0; }
+                if ac.find(buf).is_none() {
+                    return 0;
+                }
                 count_regex_lines(buf, regex, lbl)
             }
         }
@@ -439,7 +461,9 @@ fn count_regex_lines(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> usize {
             let end = memchr::memchr(b'\n', &buf[pos..])
                 .map(|p| pos + p)
                 .unwrap_or(buf.len());
-            if re.is_match(&buf[pos..end]) { count += 1; }
+            if re.is_match(&buf[pos..end]) {
+                count += 1;
+            }
             pos = end + 1;
         }
         return count;
@@ -448,7 +472,10 @@ fn count_regex_lines(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> usize {
     let mut last_line_start = usize::MAX;
     for m in re.find_iter(buf) {
         let (line_start, _) = line_bounds(buf, m.start());
-        if line_start != last_line_start { count += 1; last_line_start = line_start; }
+        if line_start != last_line_start {
+            count += 1;
+            last_line_start = line_start;
+        }
     }
     count
 }
@@ -469,7 +496,8 @@ fn search_literal(buf: &[u8], finder: &memmem::Finder) -> Vec<(usize, String)> {
         counted_to = abs_pos;
 
         let (line_start, line_end) = line_bounds(buf, abs_pos);
-        let line = String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
+        let line =
+            String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
         results.push((line_num, line));
 
         // Advance past this line to avoid duplicates
@@ -497,7 +525,10 @@ fn search_regex(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> Vec<(usize, 
                 .unwrap_or(buf.len());
             let line = &buf[pos..end];
             if re.is_match(line) {
-                results.push((line_num, String::from_utf8_lossy(strip_trailing_cr(line)).into_owned()));
+                results.push((
+                    line_num,
+                    String::from_utf8_lossy(strip_trailing_cr(line)).into_owned(),
+                ));
             }
             line_num += 1;
             pos = end + 1;
@@ -514,7 +545,8 @@ fn search_regex(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> Vec<(usize, 
         counted_to = start;
         let (line_start, line_end) = line_bounds(buf, start);
         if line_start != last_line_start {
-            let line = String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
+            let line =
+                String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
             results.push((line_num, line));
             last_line_start = line_start;
         }
@@ -549,12 +581,66 @@ pub(crate) fn is_binary(buf: &[u8]) -> bool {
 #[inline(always)]
 pub(crate) fn is_known_text_ext(path: &std::path::Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => matches!(e,
-            "rs"|"ts"|"tsx"|"js"|"jsx"|"py"|"go"|"rb"|"java"|"c"|"h"|"cpp"|"cc"|"hpp"|
-            "cs"|"swift"|"kt"|"scala"|"php"|"html"|"css"|"scss"|"less"|"json"|"toml"|
-            "yaml"|"yml"|"md"|"txt"|"sh"|"bash"|"zsh"|"fish"|"vim"|"lua"|"r"|"sql"|
-            "xml"|"svg"|"tf"|"hcl"|"nix"|"ex"|"exs"|"erl"|"hrl"|"ml"|"mli"|"hs"|
-            "clj"|"cljs"|"lisp"|"el"|"dart"|"zig"|"v"|"proto"|"graphql"|"gql"
+        Some(e) => matches!(
+            e,
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "rb"
+                | "java"
+                | "c"
+                | "h"
+                | "cpp"
+                | "cc"
+                | "hpp"
+                | "cs"
+                | "swift"
+                | "kt"
+                | "scala"
+                | "php"
+                | "html"
+                | "css"
+                | "scss"
+                | "less"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "md"
+                | "txt"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+                | "vim"
+                | "lua"
+                | "r"
+                | "sql"
+                | "xml"
+                | "svg"
+                | "tf"
+                | "hcl"
+                | "nix"
+                | "ex"
+                | "exs"
+                | "erl"
+                | "hrl"
+                | "ml"
+                | "mli"
+                | "hs"
+                | "clj"
+                | "cljs"
+                | "lisp"
+                | "el"
+                | "dart"
+                | "zig"
+                | "v"
+                | "proto"
+                | "graphql"
+                | "gql"
         ),
         None => false,
     }
@@ -641,18 +727,28 @@ pub fn search_persistent_count(
         SearchResult::BitmapFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
-                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .filter(|p| {
+                    (hidden || !is_hidden_path(p, &index_root))
+                        && path_filter.map_or(true, |f| p.starts_with(f))
+                })
                 .collect();
             count_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
-                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .filter(|p| {
+                    (hidden || !is_hidden_path(p, &index_root))
+                        && path_filter.map_or(true, |f| p.starts_with(f))
+                })
                 .collect();
-            count_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
+            count_file_level(
+                &matcher,
+                &filtered,
+                &mut timing,
+                "file-level (fallback)",
+                lbl,
+            )
         }
     };
 
@@ -741,8 +837,7 @@ pub fn search_persistent_timed(
                         let pref = &hit.line_prefix;
                         if pat_bytes.len() <= 4 {
                             // Pattern fits in prefix — check all positions
-                            pref.windows(pat_bytes.len())
-                                .any(|w| w == pat_bytes)
+                            pref.windows(pat_bytes.len()).any(|w| w == pat_bytes)
                         } else {
                             // Longer pattern — check if it could start within
                             // the first few bytes (prefix overlaps with pattern start)
@@ -809,7 +904,9 @@ pub fn search_persistent_timed(
                 // On macOS, try Metal GPU pre-filter first for literal patterns
                 // (only when FGR_METAL=1 is set).
                 #[cfg(target_os = "macos")]
-                let use_metal = std::env::var("FGR_METAL").map(|v| v == "1").unwrap_or(false);
+                let use_metal = std::env::var("FGR_METAL")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
 
                 #[cfg(target_os = "macos")]
                 let metal_literal: Option<Vec<u8>> = if use_metal {
@@ -849,7 +946,9 @@ pub fn search_persistent_timed(
 
                         for &(line_no, byte_offset) in lines {
                             let start = byte_offset as usize;
-                            if start >= mmap.len() { continue; }
+                            if start >= mmap.len() {
+                                continue;
+                            }
                             let end = memchr::memchr(b'\n', &mmap[start..])
                                 .map(|p| start + p)
                                 .unwrap_or(mmap.len());
@@ -877,11 +976,14 @@ pub fn search_persistent_timed(
                         for (i, &(line_no, start, end)) in byte_offsets.iter().enumerate() {
                             // Skip if GPU said no
                             if let Some(ref mask) = gpu_mask {
-                                if i < mask.len() && !mask[i] { continue; }
+                                if i < mask.len() && !mask[i] {
+                                    continue;
+                                }
                             }
                             let line_bytes = &mmap[start..end];
                             if matcher.has_match(line_bytes, needs_line_by_line(pattern)) {
-                                let line = String::from_utf8_lossy(strip_trailing_cr(line_bytes)).into_owned();
+                                let line = String::from_utf8_lossy(strip_trailing_cr(line_bytes))
+                                    .into_owned();
                                 file_matches.push(Match {
                                     path: path_buf.clone(),
                                     line_number: line_no as usize,
@@ -897,18 +999,28 @@ pub fn search_persistent_timed(
         SearchResult::BitmapFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
-                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .filter(|p| {
+                    (hidden || !is_hidden_path(p, &index_root))
+                        && path_filter.map_or(true, |f| p.starts_with(f))
+                })
                 .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
             let filtered: Vec<&Path> = paths
                 .into_iter()
-                .filter(|p| (hidden || !is_hidden_path(p, &index_root))
-                    && path_filter.map_or(true, |f| p.starts_with(f)))
+                .filter(|p| {
+                    (hidden || !is_hidden_path(p, &index_root))
+                        && path_filter.map_or(true, |f| p.starts_with(f))
+                })
                 .collect();
-            verify_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
+            verify_file_level(
+                &matcher,
+                &filtered,
+                &mut timing,
+                "file-level (fallback)",
+                lbl,
+            )
         }
     };
 
@@ -1008,7 +1120,9 @@ pub fn search_full_scan(
 
             // Use metadata from the walk entry (already stat'd, no extra syscall)
             let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if flen == 0 { return ignore::WalkState::Continue; }
+            if flen == 0 {
+                return ignore::WalkState::Continue;
+            }
 
             // Read with reusable buffer (fast for small files) or mmap (for large)
             read_buf.clear();
@@ -1119,7 +1233,9 @@ pub fn search_full_scan_count(
                 Err(_) => return ignore::WalkState::Continue,
             };
             let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            if flen == 0 { return ignore::WalkState::Continue; }
+            if flen == 0 {
+                return ignore::WalkState::Continue;
+            }
 
             let _mmap_holder;
             let buf: &[u8] = if flen > 256 * 1024 {
@@ -1164,4 +1280,3 @@ pub(crate) fn num_cpus() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
 }
-

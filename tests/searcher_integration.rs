@@ -132,9 +132,7 @@ fn finds_matches_in_nested_files() {
     let idx = build_test_index(tmp.path());
     let results = search(&idx, "DeepModule");
     assert!(!results.is_empty());
-    assert!(results[0]
-        .path
-        .ends_with("nested/deep/module.ts"));
+    assert!(results[0].path.ends_with("nested/deep/module.ts"));
 }
 
 #[test]

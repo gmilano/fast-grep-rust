@@ -56,7 +56,7 @@ fn full_scan_zero_context_one_file() {
     let n = search_full_scan_render(
         tmp.path(),
         "beta",
-        true, // no_ignore
+        true,  // no_ignore
         false, // hidden
         None,
         &ContextOpts::default(),
@@ -84,7 +84,10 @@ fn full_scan_with_context_emits_separator_between_distant_chunks() {
         true,
         false,
         None,
-        &ContextOpts { before: 1, after: 1 },
+        &ContextOpts {
+            before: 1,
+            after: 1,
+        },
         &render_opts(false, false, "M"),
         Dispatch::Streaming,
         &out,
@@ -129,16 +132,17 @@ fn full_scan_sorted_dispatch_orders_files() {
     let pos_a = s.find("a.txt").expect("a.txt missing");
     let pos_m = s.find("m.txt").expect("m.txt missing");
     let pos_z = s.find("z.txt").expect("z.txt missing");
-    assert!(pos_a < pos_m && pos_m < pos_z, "files not in sorted order:\n{}", s);
+    assert!(
+        pos_a < pos_m && pos_m < pos_z,
+        "files not in sorted order:\n{}",
+        s
+    );
 }
 
 #[test]
 fn heading_mode_emits_path_once_per_file() {
     let tmp = tempfile::tempdir().unwrap();
-    write_files(
-        tmp.path(),
-        &[("f.txt", "hit\nmiss\nhit\nmiss\nhit\n")],
-    );
+    write_files(tmp.path(), &[("f.txt", "hit\nmiss\nhit\nmiss\nhit\n")]);
     let out = sink();
 
     search_full_scan_render(
@@ -176,7 +180,10 @@ fn heading_mode_with_context_uses_dash_for_context() {
         true,
         false,
         None,
-        &ContextOpts { before: 1, after: 1 },
+        &ContextOpts {
+            before: 1,
+            after: 1,
+        },
         &render_opts(true, false, "M"),
         Dispatch::Sorted,
         &out,
@@ -184,7 +191,11 @@ fn heading_mode_with_context_uses_dash_for_context() {
     .unwrap();
 
     let s = String::from_utf8(out.into_inner().unwrap()).unwrap();
-    assert!(s.contains("\n1-a\n"), "context line missing `-` delimiter:\n{}", s);
+    assert!(
+        s.contains("\n1-a\n"),
+        "context line missing `-` delimiter:\n{}",
+        s
+    );
     assert!(s.contains("\n2:M\n"));
     assert!(s.contains("\n3-b\n"));
 }
@@ -194,10 +205,14 @@ fn heading_mode_with_context_uses_dash_for_context() {
 #[test]
 fn indexed_search_with_context_matches_full_scan() {
     let tmp = tempfile::tempdir().unwrap();
-    let content = "alpha\nbravo\nMATCH one\ncharlie\ndelta\necho\nfoxtrot\nMATCH two\ngolf\nhotel\n";
+    let content =
+        "alpha\nbravo\nMATCH one\ncharlie\ndelta\necho\nfoxtrot\nMATCH two\ngolf\nhotel\n";
     write_files(tmp.path(), &[("f.txt", content)]);
 
-    let ctx = ContextOpts { before: 1, after: 1 };
+    let ctx = ContextOpts {
+        before: 1,
+        after: 1,
+    };
     let opts = render_opts(false, false, "MATCH");
 
     let scan_out = sink();
@@ -245,7 +260,10 @@ fn match_at_line_one_clamps_before_context() {
         true,
         false,
         None,
-        &ContextOpts { before: 5, after: 0 },
+        &ContextOpts {
+            before: 5,
+            after: 0,
+        },
         &render_opts(false, false, "MATCH"),
         Dispatch::Sorted,
         &out,
@@ -254,7 +272,12 @@ fn match_at_line_one_clamps_before_context() {
 
     let s = String::from_utf8(out.into_inner().unwrap()).unwrap();
     // Only the match line — no synthetic before-context, no panic.
-    assert_eq!(s.lines().count(), 1, "expected single output line, got:\n{}", s);
+    assert_eq!(
+        s.lines().count(),
+        1,
+        "expected single output line, got:\n{}",
+        s
+    );
     assert!(s.contains(":1:MATCH"));
 }
 
@@ -270,7 +293,10 @@ fn match_at_eof_without_trailing_newline_clamps_after_context() {
         true,
         false,
         None,
-        &ContextOpts { before: 0, after: 5 },
+        &ContextOpts {
+            before: 0,
+            after: 5,
+        },
         &render_opts(false, false, "MATCH"),
         Dispatch::Sorted,
         &out,
@@ -294,13 +320,7 @@ fn match_at_eof_without_trailing_newline_clamps_after_context() {
 #[test]
 fn no_separator_between_files() {
     let tmp = tempfile::tempdir().unwrap();
-    write_files(
-        tmp.path(),
-        &[
-            ("a.txt", "M\n"),
-            ("b.txt", "M\n"),
-        ],
-    );
+    write_files(tmp.path(), &[("a.txt", "M\n"), ("b.txt", "M\n")]);
     let out = sink();
 
     search_full_scan_render(
@@ -309,7 +329,10 @@ fn no_separator_between_files() {
         true,
         false,
         None,
-        &ContextOpts { before: 2, after: 2 },
+        &ContextOpts {
+            before: 2,
+            after: 2,
+        },
         &render_opts(false, false, "M"),
         Dispatch::Sorted,
         &out,
@@ -319,5 +342,9 @@ fn no_separator_between_files() {
     let s = String::from_utf8(out.into_inner().unwrap()).unwrap();
     // Each file produces exactly one chunk; no `--` should appear between
     // them (the separator lives strictly *inside* one file's output).
-    assert!(!s.contains("\n--\n"), "unexpected inter-file separator:\n{}", s);
+    assert!(
+        !s.contains("\n--\n"),
+        "unexpected inter-file separator:\n{}",
+        s
+    );
 }

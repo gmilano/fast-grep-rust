@@ -479,7 +479,10 @@ impl PersistentIndex {
                 );
             }
 
-            let hashes: Vec<u32> = alt_trigrams.iter().map(|tri| crc32fast::hash(tri)).collect();
+            let hashes: Vec<u32> = alt_trigrams
+                .iter()
+                .map(|tri| crc32fast::hash(tri))
+                .collect();
 
             if has_bitmaps {
                 // === Two-tier search: Roaring Bitmap → filtered postings ===
@@ -488,10 +491,8 @@ impl PersistentIndex {
                 let t_bitmap = Instant::now();
 
                 // Parallel deserialization of all bitmaps
-                let mut bitmaps: Vec<Option<RoaringBitmap>> = hashes
-                    .par_iter()
-                    .map(|&h| self.lookup_bitmap(h))
-                    .collect();
+                let mut bitmaps: Vec<Option<RoaringBitmap>> =
+                    hashes.par_iter().map(|&h| self.lookup_bitmap(h)).collect();
 
                 // If any trigram is missing from bitmaps, fall back to full posting list search
                 if bitmaps.iter().any(|b| b.is_none()) {
@@ -511,7 +512,9 @@ impl PersistentIndex {
                     posting_lists.sort_by_key(|v| v.len());
                     let mut candidates = posting_lists.swap_remove(0);
                     for other in &posting_lists {
-                        if candidates.is_empty() { break; }
+                        if candidates.is_empty() {
+                            break;
+                        }
                         candidates = sorted_intersect_lines(&candidates, other);
                     }
                     intersect_dur += t_fallback.elapsed();
@@ -578,22 +581,22 @@ impl PersistentIndex {
 
                 // Phase 2: Load line postings (filtered by bitmap if selective), then intersect
                 let t_intersect = Instant::now();
-                let bm_selectivity =
-                    bm_card as f64 / self.num_docs().max(1) as f64;
+                let bm_selectivity = bm_card as f64 / self.num_docs().max(1) as f64;
 
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = if bm_selectivity < 0.5 {
-                    // Bitmap is selective — use filtered extraction
-                    hashes
-                        .par_iter()
-                        .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
-                        .collect()
-                } else {
-                    // Bitmap isn't selective — full extraction is faster
-                    hashes
-                        .par_iter()
-                        .map(|&h| self.trigram_line_postings(h))
-                        .collect()
-                };
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> =
+                    if bm_selectivity < 0.5 {
+                        // Bitmap is selective — use filtered extraction
+                        hashes
+                            .par_iter()
+                            .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
+                            .collect()
+                    } else {
+                        // Bitmap isn't selective — full extraction is faster
+                        hashes
+                            .par_iter()
+                            .map(|&h| self.trigram_line_postings(h))
+                            .collect()
+                    };
 
                 if posting_lists.iter().any(|p| p.is_none()) {
                     intersect_dur += t_intersect.elapsed();
@@ -1007,7 +1010,8 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             // Exclude the index directory itself to avoid self-invalidation
             if !entry.path().starts_with(index_path) {
                 if let Ok(m) = entry.metadata() {
-                    new_dir_mtimes.insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
+                    new_dir_mtimes
+                        .insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
                 }
             }
             continue;
@@ -1062,7 +1066,10 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
     // Build path -> doc_id mapping
     let path_to_docid: HashMap<String, u32> = (0..pidx.num_docs() as u32)
-        .filter_map(|id| pidx.doc_path(id).map(|p| (p.to_string_lossy().into_owned(), id)))
+        .filter_map(|id| {
+            pidx.doc_path(id)
+                .map(|p| (p.to_string_lossy().into_owned(), id))
+        })
         .collect();
 
     // 6. Update deleted set: mark deleted/modified docs
@@ -1147,10 +1154,12 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
                     let tri = [w[0], w[1], w[2]];
                     if seen_on_line.insert(tri) {
                         let hash = crc32fast::hash(&tri);
-                        delta_ngrams
-                            .entry(hash)
-                            .or_default()
-                            .push((doc_id, line_no, byte_offset, prefix));
+                        delta_ngrams.entry(hash).or_default().push((
+                            doc_id,
+                            line_no,
+                            byte_offset,
+                            prefix,
+                        ));
                     }
                 }
             }
@@ -1270,7 +1279,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     if verbose {
         eprintln!(
             "Changes: +{} added, {} modified, {} deleted",
-            actual_added, actual_modified, deleted_set.len()
+            actual_added,
+            actual_modified,
+            deleted_set.len()
         );
     }
 
@@ -1298,7 +1309,11 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 /// Walk a directory tree and collect mtime for each directory (not files).
 /// Uses the `ignore` crate to respect .gitignore rules.
 /// Excludes `exclude_dir` (the index directory itself) to avoid self-invalidation.
-fn collect_dir_mtimes(root: &Path, no_ignore: bool, exclude_dir: Option<&Path>) -> HashMap<String, u64> {
+fn collect_dir_mtimes(
+    root: &Path,
+    no_ignore: bool,
+    exclude_dir: Option<&Path>,
+) -> HashMap<String, u64> {
     let mut dir_mtimes = HashMap::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)

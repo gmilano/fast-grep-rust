@@ -94,10 +94,8 @@ pub fn is_daemon_running(index_path: &Path) -> bool {
 
 /// Send a command to the daemon and return its response.
 pub fn send_command(index_path: &Path, cmd: &str) -> Result<String> {
-    let port = read_port_file(index_path)
-        .context("no daemon port file found")?;
-    let stream = TcpStream::connect(("127.0.0.1", port))
-        .context("connecting to daemon")?;
+    let port = read_port_file(index_path).context("no daemon port file found")?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).context("connecting to daemon")?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(&stream);
     let mut writer = std::io::BufWriter::new(&stream);
@@ -121,8 +119,10 @@ impl Daemon {
         self.pending_changes.clear();
         self.dirty = false;
         if stats.added > 0 || stats.modified > 0 || stats.deleted > 0 {
-            eprintln!("[daemon] Updated index: +{} added, {} modified, {} deleted in {}ms",
-                stats.added, stats.modified, stats.deleted, stats.duration_ms);
+            eprintln!(
+                "[daemon] Updated index: +{} added, {} modified, {} deleted in {}ms",
+                stats.added, stats.modified, stats.deleted, stats.duration_ms
+            );
         }
         Ok(())
     }
@@ -131,8 +131,10 @@ impl Daemon {
 /// Start the daemon for the given index. Blocks until stopped.
 pub fn start_daemon(index_path: &Path) -> Result<()> {
     if is_daemon_running(index_path) {
-        anyhow::bail!("Daemon already running for this index (PID {})",
-            read_pid_file(index_path).unwrap_or(0));
+        anyhow::bail!(
+            "Daemon already running for this index (PID {})",
+            read_pid_file(index_path).unwrap_or(0)
+        );
     }
 
     // Verify index exists
@@ -147,7 +149,10 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     // Load index and get root dir
     let idx = persist::load(index_path)?;
     let root_dir = PathBuf::from(&idx.meta.root_dir);
-    eprintln!("[daemon] Starting for index at {:?}, root: {:?}", index_path, root_dir);
+    eprintln!(
+        "[daemon] Starting for index at {:?}, root: {:?}",
+        index_path, root_dir
+    );
 
     // Full stale check at startup (zero false negatives)
     if persist::full_stale_check(&idx, index_path) {
@@ -155,16 +160,17 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
         let (_lock, _) = persist::acquire_index_lock(index_path)?;
         let stats = persist::update_incremental(index_path, &root_dir, true)?;
         persist::release_index_lock(index_path);
-        eprintln!("[daemon] Startup update: +{} added, {} modified, {} deleted in {}ms",
-            stats.added, stats.modified, stats.deleted, stats.duration_ms);
+        eprintln!(
+            "[daemon] Startup update: +{} added, {} modified, {} deleted in {}ms",
+            stats.added, stats.modified, stats.deleted, stats.duration_ms
+        );
     } else {
         eprintln!("[daemon] Index is up to date");
     }
     drop(idx);
 
     // Bind TCP listener on localhost (OS picks a free port)
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .context("binding TCP listener")?;
+    let listener = TcpListener::bind("127.0.0.1:0").context("binding TCP listener")?;
     let port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;
 
@@ -181,7 +187,9 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     let idx_path_clone = index_path.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            let paths: Vec<PathBuf> = event.paths.into_iter()
+            let paths: Vec<PathBuf> = event
+                .paths
+                .into_iter()
                 .filter(|p| !p.starts_with(&idx_path_clone))
                 .collect();
             if !paths.is_empty() {
@@ -194,17 +202,15 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
 
     // Accept connections in a separate thread
     let tx_sock = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = tx_sock.send(Event::Socket(stream));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => break,
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = tx_sock.send(Event::Socket(stream));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
         }
     });
 
@@ -212,7 +218,8 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     let tx_sig = tx.clone();
     ctrlc::set_handler(move || {
         let _ = tx_sig.send(Event::Shutdown);
-    }).context("setting Ctrl+C handler")?;
+    })
+    .context("setting Ctrl+C handler")?;
 
     let mut daemon = Daemon {
         index_path: index_path.to_path_buf(),
