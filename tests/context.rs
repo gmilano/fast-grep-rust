@@ -27,6 +27,8 @@ fn render_opts(heading: bool, color: bool, pattern: &str) -> RenderOpts {
         invert: false,
         only_matching: false,
         pattern: Some(pattern.to_string()),
+        rel_base: None,
+        trim: false,
     }
 }
 

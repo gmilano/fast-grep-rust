@@ -9,6 +9,32 @@ use clap::{Parser, Subcommand};
 use crate::render::{self, ContextOpts, Dispatch, RenderOpts, C_BOLD, C_LINENO, C_PATH, C_RESET};
 use crate::{index, persist, searcher};
 
+/// Output layout. Resolved from `--format`, then `--heading`/`--no-heading`,
+/// then the `FGR_FORMAT` env var, then a TTY default (heading in a terminal,
+/// grep when piped — preserving drop-in grep behaviour for scripts).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// `path:line:content` per match — flat, grep-compatible (piped default).
+    Grep,
+    /// File path as a heading, then `line:content` lines (TTY default).
+    Heading,
+    /// Heading + paths relative to the search root: fewest tokens for LLM/agent
+    /// consumers, without losing the path, line number, or content.
+    Compact,
+}
+
+impl OutputFormat {
+    /// Parse a `FGR_FORMAT` value (case-insensitive). Unknown values are ignored.
+    fn parse_env(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "grep" => Some(Self::Grep),
+            "heading" => Some(Self::Heading),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
 /// Search options extracted from CLI flags
 struct SearchOpts {
     count: bool,
@@ -33,8 +59,10 @@ struct SearchOpts {
     /// Glob patterns; a file is excluded if it matches any exclude glob.
     /// Empty list = no negative filter.
     exclude: Vec<String>,
-    /// Force the grouped (heading) output format on/off. None = follow TTY.
-    heading_override: Option<bool>,
+    /// Resolved output layout (grep / heading / compact).
+    format: OutputFormat,
+    /// `--trim`: strip leading indentation from emitted content (lossy).
+    trim: bool,
     /// Resolved before/after context window for `-A` / `-B` / `-C`.
     context: ContextOpts,
     /// Effective regex pattern (may have (?i) prefix etc.) — used by the
@@ -155,6 +183,19 @@ pub struct Cli {
     )]
     pub no_heading: bool,
 
+    /// Output format: `grep` (flat `path:line:content`, piped default), `heading`
+    /// (grouped under a file heading, TTY default), or `compact` (grouped +
+    /// relative paths — fewest tokens for LLM/agent consumers). Overrides
+    /// --heading/--no-heading. Env: FGR_FORMAT.
+    #[arg(long = "format", value_name = "FORMAT", value_enum, global = true)]
+    pub format: Option<OutputFormat>,
+
+    /// Strip leading indentation from each match's content. Lossy (discards
+    /// indentation structure) but trims a few % more tokens — pairs with
+    /// `--format compact` for the leanest LLM/agent output.
+    #[arg(long = "trim", global = true)]
+    pub trim: bool,
+
     /// Disable Unicode matching mode — `\b`, `\w`, `\s` etc. fall back to
     /// ASCII-only definitions.
     #[arg(short = 'U', long = "no-unicode", global = true)]
@@ -259,17 +300,6 @@ pub fn run() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // overrides_with on the flags means clap surfaces only one of them as
-    // true — whichever was passed last on the CLI. None here means neither
-    // was set, so the renderer falls back to TTY auto-detect.
-    let heading_override = if cli.no_heading {
-        Some(false)
-    } else if cli.heading {
-        Some(true)
-    } else {
-        None
-    };
-
     let context = ContextOpts::resolve(cli.context, cli.before_context, cli.after_context);
 
     let opts = SearchOpts {
@@ -283,7 +313,8 @@ pub fn run() -> Result<()> {
         file_type: cli.file_type.clone(),
         include: cli.include.clone(),
         exclude: cli.exclude.clone(),
-        heading_override,
+        format: resolve_format(&cli),
+        trim: cli.trim,
         context,
         pattern: None, // populated below once the effective pattern is built
     };
@@ -344,11 +375,30 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Effective grouping mode: explicit --heading / --no-heading wins; otherwise
-/// auto-detect from the TTY.
-fn use_heading(opts: &SearchOpts) -> bool {
-    opts.heading_override
-        .unwrap_or_else(|| std::io::stdout().is_terminal())
+/// Resolve the output format: explicit `--format` wins, then the legacy
+/// `--heading`/`--no-heading` booleans, then the `FGR_FORMAT` env var, then a
+/// TTY default (heading in a terminal, grep when piped — so `fgr | script`
+/// stays drop-in grep-compatible).
+fn resolve_format(cli: &Cli) -> OutputFormat {
+    if let Some(f) = cli.format {
+        return f;
+    }
+    if cli.no_heading {
+        return OutputFormat::Grep;
+    }
+    if cli.heading {
+        return OutputFormat::Heading;
+    }
+    if let Ok(v) = std::env::var("FGR_FORMAT") {
+        if let Some(f) = OutputFormat::parse_env(&v) {
+            return f;
+        }
+    }
+    if std::io::stdout().is_terminal() {
+        OutputFormat::Heading
+    } else {
+        OutputFormat::Grep
+    }
 }
 
 /// Whether to emit ANSI colour escapes. Strictly TTY-driven so a forced
@@ -391,7 +441,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         return Ok(());
     }
 
-    let render_opts = render_opts_for(opts);
+    let render_opts = render_opts_for(opts, dir);
     let dispatch = dispatch_for(&render_opts);
 
     let start = Instant::now();
@@ -517,7 +567,7 @@ fn run_indexed_search(
         return Ok(());
     }
 
-    let render_opts = render_opts_for(opts);
+    let render_opts = render_opts_for(opts, search_path);
     let dispatch = dispatch_for(&render_opts);
 
     let stdout = std::io::stdout();
@@ -551,16 +601,23 @@ fn run_indexed_search(
     Ok(())
 }
 
-/// Build a `RenderOpts` from CLI flags. Heading honours --heading/--no-heading
-/// then falls back to TTY auto-detect; colour is strictly TTY-driven so a
-/// piped `--heading` doesn't leak escapes.
-fn render_opts_for(opts: &SearchOpts) -> RenderOpts {
+/// Build a `RenderOpts` from the resolved output format and the search root.
+/// `grep` → flat; `heading` → grouped; `compact` → grouped + paths relative to
+/// `root`. Colour stays strictly TTY-driven so a piped format never leaks escapes.
+fn render_opts_for(opts: &SearchOpts, root: &std::path::Path) -> RenderOpts {
+    let (heading, relative) = match opts.format {
+        OutputFormat::Grep => (false, false),
+        OutputFormat::Heading => (true, false),
+        OutputFormat::Compact => (true, true),
+    };
     RenderOpts {
-        heading: use_heading(opts),
+        heading,
         color: use_color(),
         invert: opts.invert,
         only_matching: opts.only_matching,
         pattern: opts.pattern.clone(),
+        rel_base: relative.then(|| root.to_path_buf()),
+        trim: opts.trim,
     }
 }
 
