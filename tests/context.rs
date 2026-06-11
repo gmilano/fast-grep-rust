@@ -43,7 +43,7 @@ fn write_files(tmp: &Path, files: &[(&str, &str)]) {
 /// Build a persistent index inside the temp dir at `.fgr-test`.
 fn build_test_index(tmp: &Path) -> fast_grep::persist::PersistentIndex {
     let idx_dir = tmp.join(".fgr-test");
-    build_index(tmp, &idx_dir, true, &[], false).expect("build index");
+    build_index(tmp, &idx_dir, true, &[], false, false).expect("build index");
     load_index(&idx_dir).expect("load index")
 }
 

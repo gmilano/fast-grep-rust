@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use ignore::WalkBuilder;
 
+use crate::casefold;
 use crate::postenc::PostingWriter;
 use crate::searcher::is_known_text_ext;
 
@@ -37,13 +38,25 @@ pub struct TrigramBuilder {
 pub struct SparseIndex {
     /// Trigram → compact-encoded posting list of (doc_id, line_no, byte_offset)
     pub ngrams: HashMap<[u8; 3], TrigramBuilder>,
+    /// Case-folded trigrams over the *same* documents/lines, built in the same
+    /// filesystem pass when the index is case-insensitive. `None` for a plain
+    /// case-sensitive index. Postings carry the original-file byte offsets, so
+    /// verification still reads the un-folded line.
+    pub ngrams_ci: Option<HashMap<[u8; 3], TrigramBuilder>>,
     pub doc_ids: Vec<PathBuf>,
 }
 
 impl SparseIndex {
-    pub fn new() -> Self {
+    /// Create an index; when `case_insensitive` is set it also accumulates the
+    /// case-folded (CI) trigram map alongside the case-sensitive one.
+    pub fn with_case_insensitive(case_insensitive: bool) -> Self {
         SparseIndex {
             ngrams: HashMap::new(),
+            ngrams_ci: if case_insensitive {
+                Some(HashMap::new())
+            } else {
+                None
+            },
             doc_ids: Vec::new(),
         }
     }
@@ -59,6 +72,9 @@ impl SparseIndex {
         // Index trigrams per line: one posting per (trigram, doc_id, line)
         let mut line_no = 1u32;
         let mut line_start = 0usize;
+        // Scratch buffer for the case-folded copy of each line, reused across
+        // lines so the CI pass doesn't allocate per line.
+        let mut fold_buf = Vec::new();
 
         loop {
             let line_end = content[line_start..]
@@ -83,6 +99,23 @@ impl SparseIndex {
                         b.count += 1;
                     }
                 }
+
+                // Case-insensitive map: same posting, but trigrams come from the
+                // case-folded line. `byte_offset` still points at the original
+                // line so verification reads un-folded text.
+                if let Some(ref mut ci) = self.ngrams_ci {
+                    casefold::fold_into(line, &mut fold_buf);
+                    if fold_buf.len() >= 3 {
+                        for w in fold_buf.windows(3) {
+                            let tri = [w[0], w[1], w[2]];
+                            let b = ci.entry(tri).or_default();
+                            if b.writer.last_dl() != Some((doc_id, line_no)) {
+                                b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
+                                b.count += 1;
+                            }
+                        }
+                    }
+                }
             }
 
             if line_end >= content.len() {
@@ -96,11 +129,14 @@ impl SparseIndex {
     pub fn stats(&self) -> IndexStats {
         let num_docs = self.doc_ids.len();
         let num_ngrams = self.ngrams.len();
-        let estimated_ram: usize = self
+        let mut estimated_ram: usize = self
             .ngrams
             .values()
             .map(|b| 3 + b.bytes.len() + 48) // key + packed postings + overhead
             .sum();
+        if let Some(ci) = &self.ngrams_ci {
+            estimated_ram += ci.values().map(|b| 3 + b.bytes.len() + 48).sum::<usize>();
+        }
         let avg_len = if num_ngrams > 0 {
             self.ngrams.values().map(|b| b.count as f64).sum::<f64>() / num_ngrams as f64
         } else {
@@ -119,6 +155,7 @@ impl SparseIndex {
         no_ignore: bool,
         type_filter: &[String],
         verbose: bool,
+        case_insensitive: bool,
     ) -> Result<Self> {
         // Phase 1: collect all file paths
         let walker = WalkBuilder::new(root)
@@ -142,7 +179,7 @@ impl SparseIndex {
         }
 
         // Phase 2: index all files
-        let mut index = SparseIndex::new();
+        let mut index = SparseIndex::with_case_insensitive(case_insensitive);
         let mut count = 0u32;
         for path in &paths {
             let content = match std::fs::read(path) {
@@ -186,7 +223,7 @@ mod tests {
 
     #[test]
     fn reports_correct_stats() {
-        let mut idx = SparseIndex::new();
+        let mut idx = SparseIndex::with_case_insensitive(false);
         idx.add_document(Path::new("a.ts"), b"hello world");
         idx.add_document(Path::new("b.ts"), b"hello again");
 
@@ -194,5 +231,18 @@ mod tests {
         assert_eq!(stats.num_docs, 2);
         assert!(stats.num_ngrams > 0);
         assert!(stats.avg_postings_len > 0.0);
+    }
+
+    #[test]
+    fn case_insensitive_builds_folded_map() {
+        let mut idx = SparseIndex::with_case_insensitive(true);
+        idx.add_document(Path::new("a.ts"), b"Hello WORLD");
+        let ci = idx.ngrams_ci.as_ref().expect("ci map present");
+        // The folded line "hello world" must yield the lowercase trigram "hel",
+        // and the original-case "Hel" must NOT appear in the CI map.
+        assert!(ci.contains_key(b"hel"));
+        assert!(!ci.contains_key(b"Hel"));
+        // The case-sensitive map keeps the original case.
+        assert!(idx.ngrams.contains_key(b"Hel"));
     }
 }

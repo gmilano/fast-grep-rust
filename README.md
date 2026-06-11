@@ -149,8 +149,14 @@ operations (`index`, `update`, `bench`, `stats`, `daemon`) are subcommands.
 # Build index (one-time, ~60s for Linux kernel)
 fgr index /path/to/codebase --output .fgr
 
+# Build with a case-insensitive companion so `-i` searches stay indexed
+fgr index -i /path/to/codebase --output .fgr
+
 # Search with index — index is auto-built on first use if missing
 fgr "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+
+# Case-insensitive indexed search (uses the CI companion if the index has one)
+fgr -i "export_symbol" /path/to/codebase --index .fgr
 
 # Search without index (ripgrep-equivalent full scan)
 fgr "EXPORT_SYMBOL" /path/to/codebase

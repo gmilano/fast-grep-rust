@@ -450,7 +450,7 @@ fn indexed_search_matches_full_scan_regex_suite() {
 
             // Indexed search via the persistent index — the path the CLI ships.
             let idx_dir = tmp.path().join(".fgr-test");
-            if build_index(tmp.path(), &idx_dir, true, &[], false).is_err() {
+            if build_index(tmp.path(), &idx_dir, true, &[], false, false).is_err() {
                 skipped += 1;
                 continue;
             }

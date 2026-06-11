@@ -150,8 +150,15 @@ merge-sorts; each being delta-encoded internally is irrelevant to the merge.
   on-disk and search results unchanged (EXPORT_SYMBOL 35568, PM_RESUME 39 vs the
   full scan). `update_incremental` keeps its small `Vec<Posting>` delta — no RAM
   concern there.
-- **Phase 3:** the dual case-sensitive / case-insensitive index (`-i` builds both
-  in one filesystem pass), now affordable at ~2 × the compact size.
+- **Phase 3 (done):** the dual case-sensitive / case-insensitive index. `fgr
+  index -i` builds the case-sensitive store plus a case-folded companion
+  (`ngrams.ci.*`) in one filesystem pass; `-i` searches resolve `(?i)` against
+  the folded store, and `update` maintains a lockstep CI delta. Folding uses
+  Unicode *simple* case folding (matching the regex engine) so the trigram
+  filter stays sound — see [`CASE_INSENSITIVE.md`](CASE_INSENSITIVE.md).
+  **Measured** on the kernel: CI postings 2.68 GB (total index ~5.75 GB), build
+  peak 6.6 GB, build 347 s; indexed `-i` is byte-for-byte correct vs the `(?i)`
+  full scan and ~32× faster (1.3 s vs 41 s for EXPORT_SYMBOL).
 
 ## Results (Linux kernel, 79,406 docs — measured)
 
