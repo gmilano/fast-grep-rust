@@ -428,6 +428,8 @@ mod render_tests {
             invert: false,
             only_matching: false,
             pattern: None,
+            rel_base: None,
+            trim: false,
         }
     }
 
@@ -765,6 +767,16 @@ pub struct RenderOpts {
     /// when `only_matching` is on — for enumerating substring positions.
     /// The renderer compiles it once per file. `None` skips highlighting.
     pub pattern: Option<String>,
+    /// When `Some(base)`, emit file paths relative to `base` (the search root)
+    /// instead of as-walked. Used by the `compact` format to drop the repeated
+    /// path prefix that dominates token cost for LLM/agent consumers. Lossless:
+    /// only the shared prefix is removed; line number and content are intact.
+    pub rel_base: Option<PathBuf>,
+    /// `--trim`: strip leading indentation (spaces/tabs) from each emitted
+    /// line's content. LOSSY — discards indentation, which an agent may use to
+    /// read code structure — so it stays opt-in. Composes with any format and
+    /// trims a further few % of tokens, more on deeply-indented matches.
+    pub trim: bool,
 }
 
 /// Process one file end-to-end: iterate lines, find matches, capture
@@ -819,7 +831,21 @@ pub(crate) fn render_file_into(
         None
     };
 
-    let path_str = path.to_string_lossy();
+    // `compact` format relativises paths against the search root and normalises
+    // the OS separator to `/` (portable for cross-platform agent consumers).
+    // Every other format prints the path exactly as walked, preserving drop-in
+    // grep behaviour (and native separators) for scripts.
+    let path_str: std::borrow::Cow<str> = match render.rel_base.as_deref() {
+        Some(base) => {
+            let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy();
+            if std::path::MAIN_SEPARATOR == '/' {
+                rel
+            } else {
+                std::borrow::Cow::Owned(rel.replace(std::path::MAIN_SEPARATOR, "/"))
+            }
+        }
+        None => path.to_string_lossy(),
+    };
 
     // --- --invert-match ---
     //
@@ -1058,6 +1084,18 @@ fn emit_line(
     let delim: u8 = match kind {
         LineKind::Match => b':',
         LineKind::Context => b'-',
+    };
+
+    // `--trim`: drop leading indentation (spaces/tabs) from the displayed
+    // content. Lossy but composes with any format.
+    let content: &[u8] = if render.trim {
+        let n = content
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        &content[n..]
+    } else {
+        content
     };
 
     if !render.heading {

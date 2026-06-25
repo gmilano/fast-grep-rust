@@ -1,0 +1,5 @@
+# Offline tokenizers for the token-cost harness.
+# (Anthropic ground-truth via count_tokens needs no package — it uses urllib +
+#  ANTHROPIC_API_KEY. See README.)
+tokenizers>=0.15
+tiktoken>=0.7

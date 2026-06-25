@@ -198,10 +198,24 @@ single update. State is exchanged over a localhost TCP socket recorded in
 | `--count` | Print match count |
 | `--type <ext>` | Filter by extension (`c`, `rs`, `ts`) |
 | `--no-ignore` | Don't respect `.gitignore` |
+| `--format <grep\|heading\|compact>` | Output layout: `grep` (flat `path:line:content`, piped default), `heading` (grouped, TTY default), `compact` (grouped + relative paths — fewest tokens for agents). Env: `FGR_FORMAT`. |
+| `--trim` | Strip leading indentation from match content (lossy; pairs with `--format compact`) |
 
 ## Why this matters for agents
 
 LLM coding agents (Cursor, Claude Code, Aider) spend significant time grepping large repos. Every search blocks the agent's next reasoning step. fast-grep turns 2.5s waits into <200ms lookups — a 10x reduction in tool-call latency that compounds across an entire coding session.
+
+**Token-efficient output.** An agent also *pays for* every line of grep output — it is fed back into the model as tokens. `--format compact` groups matches under one file heading and prints paths relative to the search root, cutting output tokens **~40–60%** versus the flat `path:line:content` default, with no loss of path, line, or content. `--trim` strips leading indentation for a few % more (lossy). Set `FGR_FORMAT=compact` once to make it the default for piped output, while explicit pipes (`fgr … | script`) keep the grep-compatible `path:line:content` layout.
+
+Measure it yourself on any codebase with the **token-cost harness**: it runs each output format through a Claude-family tokenizer (and the Anthropic `count_tokens` API when `ANTHROPIC_API_KEY` is set) and prints the per-format token deltas.
+
+```bash
+cargo build --release
+pip install -r scripts/token-cost/requirements.txt
+python scripts/token-cost/token_cost.py            # measures this repo's own src/
+```
+
+Details and options in [`scripts/token-cost/README.md`](scripts/token-cost/README.md).
 
 ## Related work
 
