@@ -40,14 +40,31 @@ pub fn has_case_insensitive_flag(pattern: &str) -> bool {
 /// Returns a Vec of Vec<[u8;3]> where the outer vec is OR alternatives,
 /// and each inner vec is AND-required trigrams for that alternative.
 pub fn decompose_pattern(pattern: &str) -> Vec<Vec<[u8; 3]>> {
+    decompose_inner(pattern, false)
+}
+
+/// Like [`decompose_pattern`], but each literal run is Unicode case-folded
+/// (the same fold the CI index applies to content) before trigrams are taken.
+/// Used to resolve `(?i)` queries against the case-insensitive companion index.
+pub fn decompose_pattern_folded(pattern: &str) -> Vec<Vec<[u8; 3]>> {
+    decompose_inner(pattern, true)
+}
+
+fn decompose_inner(pattern: &str, fold: bool) -> Vec<Vec<[u8; 3]>> {
     // Split on top-level '|' (not inside parens/brackets)
     let alternatives = split_alternatives(pattern);
     let mut result = Vec::new();
+    let mut folded = Vec::new();
     for alt in &alternatives {
         let literals = extract_literal_runs(alt);
         let mut trigrams = Vec::new();
         for lit in &literals {
-            let bytes = lit.as_bytes();
+            let bytes: &[u8] = if fold {
+                crate::casefold::fold_into(lit.as_bytes(), &mut folded);
+                &folded
+            } else {
+                lit.as_bytes()
+            };
             if bytes.len() >= 3 {
                 for w in bytes.windows(3) {
                     trigrams.push([w[0], w[1], w[2]]);

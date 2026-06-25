@@ -38,21 +38,19 @@ Built at **[Globant](https://www.globant.com)** for agent harnesses and large co
 | Full build | ~60s (one-time) |
 | Incremental update | <1s for 10–100 files (75x faster than rebuild) |
 | Index load (mmap) | 17ms |
-| Index size | 775 MB postings + 161 MB bitmaps |
+| Index size | ~2.7 GB postings + 162 MB bitmaps |
 
 ## How it works
 
-Five techniques combine to eliminate >99% of I/O before the regex engine runs:
+Four techniques combine to eliminate >99% of I/O before the regex engine runs:
 
-1. **Sparse n-grams with adaptive frequency table** — Variable-length substrings weighted by corpus-specific bigram rarity. Produces fewer, more selective posting lists than fixed trigrams.
+1. **Trigram inverted index** — Each 3-byte trigram maps to the lines that contain it. A query is decomposed into the trigrams it must contain, so only lines carrying *all* of them survive as candidates — typically a tiny fraction of the corpus.
 
-2. **Position masks (Blackbird algorithm)** — Two 8-bit bloom filters per (n-gram, document) encode position and successor character. Drops the false positive rate to 0.42%.
+2. **Two-tier Roaring bitmaps** — Tier 1 is a compressed doc-id set per trigram: the file-level intersection runs as a Roaring-bitmap AND, skipping most files before any posting list is read. Only the surviving files load Tier 2 (the line-level postings).
 
 3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
 
 4. **Line-level index with byte offsets** — Index stores line positions, not just file IDs. Verification jumps directly to candidate lines instead of scanning entire files.
-
-5. **4-byte content prefix filter** — Before running the regex engine, checks a 4-byte content prefix per candidate. Eliminates 95%+ of I/O during verification.
 
 ## Installation
 
@@ -151,8 +149,14 @@ operations (`index`, `update`, `bench`, `stats`, `daemon`) are subcommands.
 # Build index (one-time, ~60s for Linux kernel)
 fgr index /path/to/codebase --output .fgr
 
+# Build with a case-insensitive companion so `-i` searches stay indexed
+fgr index -i /path/to/codebase --output .fgr
+
 # Search with index — index is auto-built on first use if missing
 fgr "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+
+# Case-insensitive indexed search (uses the CI companion if the index has one)
+fgr -i "export_symbol" /path/to/codebase --index .fgr
 
 # Search without index (ripgrep-equivalent full scan)
 fgr "EXPORT_SYMBOL" /path/to/codebase

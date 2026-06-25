@@ -74,7 +74,7 @@ fn setup_test_dir() -> tempfile::TempDir {
 /// collide with anything the search results might match.
 fn build_test_index(tmp: &Path) -> PersistentIndex {
     let idx_dir = tmp.join(".fgr-test");
-    build_index(tmp, &idx_dir, true, &[], false).expect("build persistent index");
+    build_index(tmp, &idx_dir, true, &[], false, false).expect("build persistent index");
     load_index(&idx_dir).expect("load persistent index")
 }
 

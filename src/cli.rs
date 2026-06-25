@@ -42,6 +42,10 @@ struct SearchOpts {
     quiet: bool,
     no_ignore: bool,
     hidden: bool,
+    /// `-i` / `--ignore-case`: the search is case-insensitive (the pattern has
+    /// been wrapped in `(?i)`). Lets the indexed path route to the
+    /// case-insensitive companion index and, on auto-build, build it.
+    ignore_case: bool,
     /// `-v` / `--invert-match`: emit lines that do NOT match. Forces the
     /// CLI to route through the direct-scan path even when --index is
     /// set, since the trigram index can only locate matches.
@@ -308,6 +312,7 @@ pub fn run() -> Result<()> {
         quiet: cli.quiet,
         no_ignore: cli.no_ignore,
         hidden: cli.hidden,
+        ignore_case: cli.ignore_case,
         invert: cli.invert_match,
         only_matching: cli.only_matching,
         file_type: cli.file_type.clone(),
@@ -320,7 +325,13 @@ pub fn run() -> Result<()> {
     };
 
     if let Some(cmd) = cli.command {
-        return run_subcommand(cmd, opts.no_ignore, opts.hidden, &opts.file_type);
+        return run_subcommand(
+            cmd,
+            opts.no_ignore,
+            opts.hidden,
+            &opts.file_type,
+            opts.ignore_case,
+        );
     }
 
     let pattern = match cli.pattern.as_ref() {
@@ -357,13 +368,17 @@ pub fn run() -> Result<()> {
     let mut opts = opts;
     opts.pattern = Some(effective.clone());
 
-    // Case-insensitive search and invert-match can't use the index
-    // reliably — the trigram index locates *matches* (case-sensitive
-    // ones at that), so neither pattern can be answered correctly from
-    // it. Both flags route through the direct-scan path even when
-    // --index is set.
+    // Invert-match can't use the index — the trigram index locates *matches*,
+    // so a "lines that don't match" query can't be answered from it; it always
+    // routes through the direct-scan path.
+    //
+    // Case-insensitive search CAN use the index when a case-insensitive
+    // companion (`fgr index -i`) is present: `search_timed` resolves `(?i)`
+    // against the folded store, and transparently falls back to scanning all
+    // live docs when no CI index exists. Routing it through the indexed path
+    // also lets a first `-i` search auto-build the CI index.
     if let Some(ref idx_path) = cli.index_path {
-        if cli.ignore_case || cli.invert_match {
+        if cli.invert_match {
             run_direct_search(&effective, &dir, &opts)?;
         } else {
             run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
@@ -499,13 +514,26 @@ fn run_indexed_search(
     // meta.json (the same probe persist::load uses internally). The build root
     // is the search PATH the user passed — this matches the natural intent
     // "give me a fast search over this directory."
-    if !idx_path.join("meta.json").exists() {
+    if !persist::is_current(idx_path) {
+        let reason = if idx_path.join("meta.json").exists() {
+            "outdated (format changed)"
+        } else {
+            "not found"
+        };
         eprintln!(
-            "Index not found at {} — building one-time (subsequent searches will be <200ms)…",
+            "Index {} at {} — building one-time (subsequent searches will be <200ms)…",
+            reason,
             idx_path.display()
         );
         let build_start = Instant::now();
-        persist::build(search_path, idx_path, opts.no_ignore, &opts.file_type, true)?;
+        persist::build(
+            search_path,
+            idx_path,
+            opts.no_ignore,
+            &opts.file_type,
+            true,
+            opts.ignore_case,
+        )?;
         eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
     }
 
@@ -704,6 +732,7 @@ fn run_subcommand(
     no_ignore: bool,
     hidden: bool,
     type_filter: &[String],
+    case_insensitive: bool,
 ) -> Result<()> {
     match cmd {
         Commands::Index {
@@ -713,7 +742,14 @@ fn run_subcommand(
         } => {
             let idx_path = dir.join(&output);
             let start = Instant::now();
-            persist::build(&dir, &idx_path, no_ignore, type_filter, true)?;
+            persist::build(
+                &dir,
+                &idx_path,
+                no_ignore,
+                type_filter,
+                true,
+                case_insensitive,
+            )?;
             eprintln!("Index built in {:.2}s", start.elapsed().as_secs_f64());
             #[cfg(feature = "daemon")]
             if daemon {
@@ -777,6 +813,7 @@ fn run_subcommand(
                     &index_path,
                     no_ignore,
                     type_filter,
+                    false,
                     false,
                 )?;
                 let stats = idx.stats();
@@ -849,7 +886,7 @@ fn run_bench(
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let start = Instant::now();
-    persist::build(dir, &tmp_dir, no_ignore, type_filter, false)?;
+    persist::build(dir, &tmp_dir, no_ignore, type_filter, false, false)?;
     let persist_build_time = start.elapsed();
 
     let start = Instant::now();

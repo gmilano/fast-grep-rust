@@ -1,3 +1,4 @@
+mod casefold;
 mod cli;
 #[cfg(feature = "daemon")]
 mod daemon;
@@ -5,6 +6,7 @@ mod index;
 #[cfg(target_os = "macos")]
 pub mod metal;
 mod persist;
+mod postenc;
 mod render;
 mod searcher;
 mod trigram;

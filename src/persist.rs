@@ -12,8 +12,15 @@ use rayon::prelude::*;
 
 use roaring::RoaringBitmap;
 
-use crate::index::{Posting, SparseIndex};
+use crate::casefold;
+use crate::index::{Posting, SparseIndex, TrigramBuilder};
+use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
+
+/// On-disk index format version. Bumped to 4 for the compact (delta-varint)
+/// posting format; the loader rejects older indices so they get rebuilt rather
+/// than decoded with the wrong reader.
+const INDEX_VERSION: u32 = 4;
 
 // --- Zero-copy read helpers ---
 
@@ -37,11 +44,8 @@ fn read_u64_le(data: &[u8], off: usize) -> u64 {
 }
 
 /// Sorted merge intersection of two sorted line-posting slices.
-/// Intersects on (doc_id, line_no), keeps byte_offset and prefix from `a`.
-fn sorted_intersect_lines(
-    a: &[(u32, u32, u32, [u8; 4])],
-    b: &[(u32, u32, u32, [u8; 4])],
-) -> Vec<(u32, u32, u32, [u8; 4])> {
+/// Intersects on (doc_id, line_no), keeps byte_offset from `a`.
+fn sorted_intersect_lines(a: &[(u32, u32, u32)], b: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -61,10 +65,7 @@ fn sorted_intersect_lines(
 }
 
 /// Merge two sorted line-posting slices into a new sorted Vec (union).
-fn merge_sorted_lines(
-    a: &[(u32, u32, u32, [u8; 4])],
-    b: &[(u32, u32, u32, [u8; 4])],
-) -> Vec<(u32, u32, u32, [u8; 4])> {
+fn merge_sorted_lines(a: &[(u32, u32, u32)], b: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -113,7 +114,6 @@ pub struct LineHit<'a> {
     pub path: &'a Path,
     pub line_no: u32,
     pub byte_offset: u32,
-    pub line_prefix: [u8; 4],
 }
 
 /// Search result from the index: either precise line-level hits or fallback to all files.
@@ -143,6 +143,12 @@ pub struct IndexMeta {
     /// Number of docs in the main (non-delta) index. Set on full build.
     #[serde(default)]
     pub main_num_docs: Option<usize>,
+    /// Whether this index was built over case-folded text (a case-insensitive
+    /// index). `false` (default) = case-sensitive. Set when building the CI
+    /// index so `-i` searches can route to it. Reserved in v4 for the planned
+    /// dual case-sensitive / case-insensitive index pair.
+    #[serde(default)]
+    pub case_insensitive: bool,
 }
 
 #[derive(Clone)]
@@ -153,7 +159,6 @@ pub struct LookupEntry {
 }
 
 const LOOKUP_ENTRY_SIZE: usize = 4 + 8 + 4; // 16 bytes
-const POSTING_ENTRY_SIZE: usize = 16; // doc_id(u32) + line_no(u32) + byte_offset(u32) + prefix([u8;4])
 
 pub struct PersistentIndex {
     /// Main lookup table — memory-mapped for zero-copy binary search
@@ -176,6 +181,17 @@ pub struct PersistentIndex {
     pub delta_lookup: Vec<LookupEntry>,
     pub delta_postings: Vec<u8>,
     pub main_num_docs: usize,
+    // Case-insensitive companion index (`ngrams.ci.*`), present only when the
+    // index was built with `-i`. Same docids/delta-docids/deleted set as the
+    // case-sensitive index; only the trigram postings/bitmaps differ (folded).
+    pub lookup_ci_mmap: Option<Mmap>,
+    pub lookup_ci_count: usize,
+    pub postings_ci_mmap: Option<Mmap>,
+    pub bitmap_ci_mmap: Option<Mmap>,
+    pub bitmap_lookup_ci_mmap: Option<Mmap>,
+    pub bitmap_lookup_ci_count: usize,
+    pub delta_lookup_ci: Vec<LookupEntry>,
+    pub delta_postings_ci: Vec<u8>,
 }
 
 impl PersistentIndex {
@@ -203,14 +219,29 @@ impl PersistentIndex {
         self.docid_offsets.len() + self.delta_doc_ids.len()
     }
 
-    // --- Low-level lookup methods (zero-copy) ---
-
-    /// Binary search in mmap'd main lookup table.
+    /// Whether a case-insensitive companion index is loaded.
     #[inline]
-    fn find_in_main_lookup(&self, hash: u32) -> Option<(u64, u32)> {
-        let data = &*self.lookup_mmap;
+    pub fn has_ci(&self) -> bool {
+        self.postings_ci_mmap.is_some()
+    }
+
+    // --- Low-level lookup methods (zero-copy) ---
+    //
+    // Each takes `ci: bool` to select the case-sensitive store (the default
+    // `ngrams.*` mmaps) or the case-insensitive companion (`ngrams.ci.*`). The
+    // search code threads the same flag through so an `(?i)` query resolves
+    // entirely against the folded store.
+
+    /// Binary search in the mmap'd lookup table (CS or CI).
+    #[inline]
+    fn find_in_main_lookup(&self, hash: u32, ci: bool) -> Option<(u64, u32)> {
+        let (data, count) = if ci {
+            (&**self.lookup_ci_mmap.as_ref()?, self.lookup_ci_count)
+        } else {
+            (&*self.lookup_mmap, self.lookup_count)
+        };
         let mut lo = 0usize;
-        let mut hi = self.lookup_count;
+        let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
@@ -227,34 +258,41 @@ impl PersistentIndex {
         None
     }
 
-    /// Get raw posting bytes for a trigram hash from main index.
+    /// Get raw posting bytes for a trigram hash from the main index (CS or CI).
     #[inline]
-    fn main_posting_data(&self, hash: u32) -> Option<&[u8]> {
-        let (offset, len) = self.find_in_main_lookup(hash)?;
+    fn main_posting_data(&self, hash: u32, ci: bool) -> Option<&[u8]> {
+        let (offset, len) = self.find_in_main_lookup(hash, ci)?;
+        let mmap = if ci {
+            &**self.postings_ci_mmap.as_ref()?
+        } else {
+            &*self.postings_mmap
+        };
         let start = offset as usize;
         let end = start + len as usize;
-        if end <= self.postings_mmap.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
-            Some(&self.postings_mmap[start..end])
+        if end <= mmap.len() {
+            Some(&mmap[start..end])
         } else {
             None
         }
     }
 
-    /// Get raw posting bytes for a trigram hash from delta index.
+    /// Get raw posting bytes for a trigram hash from the delta index (CS or CI).
     #[inline]
-    fn delta_posting_data(&self, hash: u32) -> Option<&[u8]> {
-        if self.delta_lookup.is_empty() {
+    fn delta_posting_data(&self, hash: u32, ci: bool) -> Option<&[u8]> {
+        let (lookup, postings) = if ci {
+            (&self.delta_lookup_ci, &self.delta_postings_ci)
+        } else {
+            (&self.delta_lookup, &self.delta_postings)
+        };
+        if lookup.is_empty() {
             return None;
         }
-        let idx = self
-            .delta_lookup
-            .binary_search_by_key(&hash, |e| e.hash)
-            .ok()?;
-        let entry = &self.delta_lookup[idx];
+        let idx = lookup.binary_search_by_key(&hash, |e| e.hash).ok()?;
+        let entry = &lookup[idx];
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
-        if end <= self.delta_postings.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
-            Some(&self.delta_postings[start..end])
+        if end <= postings.len() {
+            Some(&postings[start..end])
         } else {
             None
         }
@@ -262,11 +300,17 @@ impl PersistentIndex {
 
     // --- Roaring bitmap lookup (Tier 1) ---
 
-    /// Binary search in mmap'd bitmap lookup table.
+    /// Binary search in the mmap'd bitmap lookup table (CS or CI).
     #[inline]
-    fn find_in_bitmap_lookup(&self, hash: u32) -> Option<(u64, u32)> {
-        let data = self.bitmap_lookup_mmap.as_ref()?;
-        let count = self.bitmap_lookup_count;
+    fn find_in_bitmap_lookup(&self, hash: u32, ci: bool) -> Option<(u64, u32)> {
+        let (data, count) = if ci {
+            (
+                self.bitmap_lookup_ci_mmap.as_ref()?,
+                self.bitmap_lookup_ci_count,
+            )
+        } else {
+            (self.bitmap_lookup_mmap.as_ref()?, self.bitmap_lookup_count)
+        };
         let mut lo = 0usize;
         let mut hi = count;
         while lo < hi {
@@ -288,9 +332,13 @@ impl PersistentIndex {
     /// Deserialize a RoaringBitmap for a trigram hash from the bitmap mmap.
     /// Uses unchecked deserialization for speed (data was written by us).
     #[inline]
-    fn lookup_bitmap(&self, hash: u32) -> Option<RoaringBitmap> {
-        let (offset, len) = self.find_in_bitmap_lookup(hash)?;
-        let bm_data = self.bitmap_mmap.as_ref()?;
+    fn lookup_bitmap(&self, hash: u32, ci: bool) -> Option<RoaringBitmap> {
+        let (offset, len) = self.find_in_bitmap_lookup(hash, ci)?;
+        let bm_data = if ci {
+            self.bitmap_ci_mmap.as_ref()?
+        } else {
+            self.bitmap_mmap.as_ref()?
+        };
         let start = offset as usize;
         let end = start + len as usize;
         if end > bm_data.len() {
@@ -299,19 +347,12 @@ impl PersistentIndex {
         RoaringBitmap::deserialize_unchecked_from(&bm_data[start..end]).ok()
     }
 
-    /// Extract sorted line postings from raw posting bytes, excluding deleted docs.
-    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32, [u8; 4])> {
-        let num = data.len() / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(num);
-        for i in 0..num {
-            let base = i * POSTING_ENTRY_SIZE;
-            let doc_id = read_u32_le(data, base);
+    /// Extract sorted line postings from a compact posting blob, excluding deleted docs.
+    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32)> {
+        let mut postings = Vec::new();
+        for (doc_id, line_no, byte_offset) in PostingReader::new(data) {
             if !self.deleted_docs.contains(&doc_id) {
-                let line_no = read_u32_le(data, base + 4);
-                let byte_offset = read_u32_le(data, base + 8);
-                let mut prefix = [0u8; 4];
-                prefix.copy_from_slice(&data[base + 12..base + 16]);
-                postings.push((doc_id, line_no, byte_offset, prefix));
+                postings.push((doc_id, line_no, byte_offset));
             }
         }
         postings
@@ -322,18 +363,11 @@ impl PersistentIndex {
         &self,
         data: &[u8],
         filter: &RoaringBitmap,
-    ) -> Vec<(u32, u32, u32, [u8; 4])> {
-        let num = data.len() / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(num / 4); // expect significant filtering
-        for i in 0..num {
-            let base = i * POSTING_ENTRY_SIZE;
-            let doc_id = read_u32_le(data, base);
+    ) -> Vec<(u32, u32, u32)> {
+        let mut postings = Vec::new();
+        for (doc_id, line_no, byte_offset) in PostingReader::new(data) {
             if filter.contains(doc_id) && !self.deleted_docs.contains(&doc_id) {
-                let line_no = read_u32_le(data, base + 4);
-                let byte_offset = read_u32_le(data, base + 8);
-                let mut prefix = [0u8; 4];
-                prefix.copy_from_slice(&data[base + 12..base + 16]);
-                postings.push((doc_id, line_no, byte_offset, prefix));
+                postings.push((doc_id, line_no, byte_offset));
             }
         }
         postings
@@ -345,9 +379,10 @@ impl PersistentIndex {
         &self,
         hash: u32,
         filter: &RoaringBitmap,
-    ) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
-        let main = self.main_posting_data(hash);
-        let delta = self.delta_posting_data(hash);
+        ci: bool,
+    ) -> Option<Vec<(u32, u32, u32)>> {
+        let main = self.main_posting_data(hash, ci);
+        let delta = self.delta_posting_data(hash, ci);
 
         if main.is_none() && delta.is_none() {
             return None;
@@ -376,9 +411,9 @@ impl PersistentIndex {
     }
 
     /// Get merged (main + delta) sorted line postings for a trigram hash.
-    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
-        let main = self.main_posting_data(hash);
-        let delta = self.delta_posting_data(hash);
+    fn trigram_line_postings(&self, hash: u32, ci: bool) -> Option<Vec<(u32, u32, u32)>> {
+        let main = self.main_posting_data(hash, ci);
+        let delta = self.delta_posting_data(hash, ci);
 
         if main.is_none() && delta.is_none() {
             return None;
@@ -410,14 +445,15 @@ impl PersistentIndex {
 
     pub fn search_timed(&self, pattern: &str) -> (SearchResult<'_>, SearchTiming) {
         // Patterns with inline `(?i)` (or any flag group enabling
-        // case-insensitive matching) defeat the trigram index — the
-        // index was built case-sensitively, so `(?i)abc` looking up
-        // the trigram "abc" will miss files containing `ABC`. Fall
-        // back to scanning every live file. Same approach the CLI
-        // already used for the `-i` flag, now applied uniformly so
-        // direct callers of this API (tests, library users) also get
-        // correct results.
-        if trigram::has_case_insensitive_flag(pattern) {
+        // case-insensitive matching) can't be answered from the
+        // case-sensitive store — `(?i)abc` looking up the trigram "abc"
+        // would miss files containing `ABC`. If a case-insensitive
+        // companion index is loaded we resolve against it (folding the
+        // query literals the same way the content was folded); otherwise
+        // we fall back to scanning every live file.
+        let pattern_ci = trigram::has_case_insensitive_flag(pattern);
+        let ci = pattern_ci && self.has_ci();
+        if pattern_ci && !ci {
             let docs = self.live_doc_ids();
             let n = docs.len();
             return (
@@ -435,7 +471,11 @@ impl PersistentIndex {
             );
         }
 
-        let alternatives = trigram::decompose_pattern(pattern);
+        let alternatives = if ci {
+            trigram::decompose_pattern_folded(pattern)
+        } else {
+            trigram::decompose_pattern(pattern)
+        };
 
         if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
             let docs = self.live_doc_ids();
@@ -455,10 +495,14 @@ impl PersistentIndex {
             );
         }
 
-        let mut result_lines: Vec<(u32, u32, u32, [u8; 4])> = Vec::new();
+        let mut result_lines: Vec<(u32, u32, u32)> = Vec::new();
         let mut bitmap_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
-        let has_bitmaps = self.bitmap_mmap.is_some();
+        let has_bitmaps = if ci {
+            self.bitmap_ci_mmap.is_some()
+        } else {
+            self.bitmap_mmap.is_some()
+        };
 
         for alt_trigrams in &alternatives {
             if alt_trigrams.is_empty() {
@@ -491,23 +535,25 @@ impl PersistentIndex {
                 let t_bitmap = Instant::now();
 
                 // Parallel deserialization of all bitmaps
-                let mut bitmaps: Vec<Option<RoaringBitmap>> =
-                    hashes.par_iter().map(|&h| self.lookup_bitmap(h)).collect();
+                let mut bitmaps: Vec<Option<RoaringBitmap>> = hashes
+                    .par_iter()
+                    .map(|&h| self.lookup_bitmap(h, ci))
+                    .collect();
 
                 // If any trigram is missing from bitmaps, fall back to full posting list search
                 if bitmaps.iter().any(|b| b.is_none()) {
                     bitmap_dur += t_bitmap.elapsed();
                     // Fallback: load postings directly without bitmap pre-filter
                     let t_fallback = Instant::now();
-                    let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
+                    let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
                         .par_iter()
-                        .map(|&h| self.trigram_line_postings(h))
+                        .map(|&h| self.trigram_line_postings(h, ci))
                         .collect();
                     if posting_lists.iter().any(|p| p.is_none()) {
                         intersect_dur += t_fallback.elapsed();
                         continue;
                     }
-                    let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                    let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                         posting_lists.into_iter().map(|p| p.unwrap()).collect();
                     posting_lists.sort_by_key(|v| v.len());
                     let mut candidates = posting_lists.swap_remove(0);
@@ -583,27 +629,26 @@ impl PersistentIndex {
                 let t_intersect = Instant::now();
                 let bm_selectivity = bm_card as f64 / self.num_docs().max(1) as f64;
 
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> =
-                    if bm_selectivity < 0.5 {
-                        // Bitmap is selective — use filtered extraction
-                        hashes
-                            .par_iter()
-                            .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
-                            .collect()
-                    } else {
-                        // Bitmap isn't selective — full extraction is faster
-                        hashes
-                            .par_iter()
-                            .map(|&h| self.trigram_line_postings(h))
-                            .collect()
-                    };
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = if bm_selectivity < 0.5 {
+                    // Bitmap is selective — use filtered extraction
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs, ci))
+                        .collect()
+                } else {
+                    // Bitmap isn't selective — full extraction is faster
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings(h, ci))
+                        .collect()
+                };
 
                 if posting_lists.iter().any(|p| p.is_none()) {
                     intersect_dur += t_intersect.elapsed();
                     continue;
                 }
 
-                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -620,9 +665,9 @@ impl PersistentIndex {
                 // === Fallback: original sorted merge approach (no bitmap files) ===
 
                 let t_lookup = Instant::now();
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
                     .par_iter()
-                    .map(|&h| self.trigram_line_postings(h))
+                    .map(|&h| self.trigram_line_postings(h, ci))
                     .collect();
                 bitmap_dur += t_lookup.elapsed();
 
@@ -631,7 +676,7 @@ impl PersistentIndex {
                 }
 
                 let t_intersect = Instant::now();
-                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -654,12 +699,11 @@ impl PersistentIndex {
         let num_candidates = result_lines.len();
         let hits: Vec<LineHit<'_>> = result_lines
             .iter()
-            .filter_map(|&(doc_id, line_no, byte_offset, line_prefix)| {
+            .filter_map(|&(doc_id, line_no, byte_offset)| {
                 self.doc_path(doc_id).map(|path| LineHit {
                     path,
                     line_no,
                     byte_offset,
-                    line_prefix,
                 })
             })
             .collect();
@@ -717,18 +761,105 @@ impl PersistentIndex {
     }
 }
 
+/// Serialize one trigram map to its four on-disk files under `output`, named
+/// `{prefix}.postings`, `{prefix}.lookup`, `{prefix}.bitmaps`,
+/// `{prefix}.bitmaps.lookup`. Used for both the case-sensitive map
+/// (`prefix = "ngrams"`) and the case-insensitive companion
+/// (`prefix = "ngrams.ci"`). Returns the postings byte length.
+fn write_ngram_files(
+    output: &Path,
+    prefix: &str,
+    ngrams: &HashMap<[u8; 3], TrigramBuilder>,
+) -> Result<u64> {
+    // Sort trigrams by hash for binary search
+    let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = ngrams.iter().collect();
+    trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
+
+    // Write compact (delta-varint) postings and build lookup (offset/len per
+    // trigram). Postings are already compact-encoded in `builder.bytes`, so we
+    // write them verbatim — no re-encode pass.
+    let postings_path = output.join(format!("{prefix}.postings"));
+    let mut postings_file = BufWriter::new(File::create(&postings_path)?);
+    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut offset: u64 = 0;
+    for (tri, builder) in &trigram_list {
+        let len = builder.bytes.len() as u32;
+        postings_file.write_all(&builder.bytes)?;
+        lookup_entries.push((crc32fast::hash(*tri), offset, len));
+        offset += len as u64;
+    }
+    postings_file.flush()?;
+    let postings_len = offset;
+
+    let lookup_path = output.join(format!("{prefix}.lookup"));
+    let mut lookup_file = BufWriter::new(File::create(&lookup_path)?);
+    for (hash, off, len) in &lookup_entries {
+        lookup_file.write_u32::<LittleEndian>(*hash)?;
+        lookup_file.write_u64::<LittleEndian>(*off)?;
+        lookup_file.write_u32::<LittleEndian>(*len)?;
+    }
+    lookup_file.flush()?;
+
+    // Write Roaring Bitmaps (Tier 1: doc_id sets per trigram)
+    let bitmaps_path = output.join(format!("{prefix}.bitmaps"));
+    let mut bitmaps_file = BufWriter::new(File::create(&bitmaps_path)?);
+    let mut bitmap_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut bm_offset: u64 = 0;
+    for (tri, builder) in &trigram_list {
+        let mut bitmap = RoaringBitmap::new();
+        for (doc_id, _, _) in PostingReader::new(&builder.bytes) {
+            bitmap.insert(doc_id);
+        }
+        let mut bm_buf = Vec::new();
+        bitmap.serialize_into(&mut bm_buf)?;
+        let bm_len = bm_buf.len() as u32;
+        bitmaps_file.write_all(&bm_buf)?;
+        bitmap_lookup_entries.push((crc32fast::hash(*tri), bm_offset, bm_len));
+        bm_offset += bm_len as u64;
+    }
+    bitmaps_file.flush()?;
+
+    let bitmaps_lookup_path = output.join(format!("{prefix}.bitmaps.lookup"));
+    let mut bm_lookup_file = BufWriter::new(File::create(&bitmaps_lookup_path)?);
+    for (hash, off, len) in &bitmap_lookup_entries {
+        bm_lookup_file.write_u32::<LittleEndian>(*hash)?;
+        bm_lookup_file.write_u64::<LittleEndian>(*off)?;
+        bm_lookup_file.write_u32::<LittleEndian>(*len)?;
+    }
+    bm_lookup_file.flush()?;
+
+    Ok(postings_len)
+}
+
+/// Remove a case-insensitive companion index's files (used when (re)building a
+/// case-sensitive-only index over a directory that previously had a CI index).
+fn remove_ci_files(output: &Path) {
+    for suffix in [
+        "ngrams.ci.postings",
+        "ngrams.ci.lookup",
+        "ngrams.ci.bitmaps",
+        "ngrams.ci.bitmaps.lookup",
+        "delta.ci.postings",
+        "delta.ci.lookup",
+    ] {
+        let _ = fs::remove_file(output.join(suffix));
+    }
+}
+
 pub fn build(
     root: &Path,
     output: &Path,
     no_ignore: bool,
     type_filter: &[String],
     verbose: bool,
+    case_insensitive: bool,
 ) -> Result<()> {
     if verbose {
         eprintln!("Building index for {:?}...", root);
     }
 
-    let index = SparseIndex::build_from_directory(root, no_ignore, type_filter, verbose)?;
+    let index =
+        SparseIndex::build_from_directory(root, no_ignore, type_filter, verbose, case_insensitive)?;
 
     fs::create_dir_all(output).context("creating output directory")?;
 
@@ -743,69 +874,15 @@ pub fn build(
     // Collect directory mtimes for fast stale detection
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
-    // Write postings and build lookup (12 bytes per entry: doc_id + line_no + byte_offset)
-    let postings_path = output.join("ngrams.postings");
-    let mut postings_file = BufWriter::new(File::create(&postings_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut offset: u64 = 0;
-
-    // Sort trigrams by hash for binary search
-    let mut trigram_list: Vec<(&[u8; 3], &Vec<Posting>)> = index.ngrams.iter().collect();
-    trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
-
-    for (tri, postings) in &trigram_list {
-        let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-        for &(doc_id, line_no, byte_offset, prefix) in *postings {
-            buf.write_u32::<LittleEndian>(doc_id)?;
-            buf.write_u32::<LittleEndian>(line_no)?;
-            buf.write_u32::<LittleEndian>(byte_offset)?;
-            buf.write_all(&prefix)?;
-        }
-        let len = buf.len() as u32;
-        postings_file.write_all(&buf)?;
-        lookup_entries.push((crc32fast::hash(*tri), offset, len));
-        offset += len as u64;
+    // Write the case-sensitive trigram files, and the case-insensitive
+    // companion (`ngrams.ci.*`) when this is a CI build.
+    let postings_len = write_ngram_files(output, "ngrams", &index.ngrams)?;
+    if let Some(ci) = &index.ngrams_ci {
+        write_ngram_files(output, "ngrams.ci", ci)?;
+    } else {
+        // A prior CI build over this directory may have left stale CI files.
+        remove_ci_files(output);
     }
-    postings_file.flush()?;
-
-    // Write lookup table
-    let lookup_path = output.join("ngrams.lookup");
-    let mut lookup_file = BufWriter::new(File::create(&lookup_path)?);
-    for (hash, off, len) in &lookup_entries {
-        lookup_file.write_u32::<LittleEndian>(*hash)?;
-        lookup_file.write_u64::<LittleEndian>(*off)?;
-        lookup_file.write_u32::<LittleEndian>(*len)?;
-    }
-    lookup_file.flush()?;
-
-    // Write Roaring Bitmaps (Tier 1: doc_id sets per trigram)
-    let bitmaps_path = output.join("ngrams.bitmaps");
-    let mut bitmaps_file = BufWriter::new(File::create(&bitmaps_path)?);
-    let mut bitmap_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut bm_offset: u64 = 0;
-
-    for (tri, postings) in &trigram_list {
-        let mut bitmap = RoaringBitmap::new();
-        for &(doc_id, _, _, _) in *postings {
-            bitmap.insert(doc_id);
-        }
-        let mut bm_buf = Vec::new();
-        bitmap.serialize_into(&mut bm_buf)?;
-        let bm_len = bm_buf.len() as u32;
-        bitmaps_file.write_all(&bm_buf)?;
-        bitmap_lookup_entries.push((crc32fast::hash(*tri), bm_offset, bm_len));
-        bm_offset += bm_len as u64;
-    }
-    bitmaps_file.flush()?;
-
-    let bitmaps_lookup_path = output.join("ngrams.bitmaps.lookup");
-    let mut bm_lookup_file = BufWriter::new(File::create(&bitmaps_lookup_path)?);
-    for (hash, off, len) in &bitmap_lookup_entries {
-        bm_lookup_file.write_u32::<LittleEndian>(*hash)?;
-        bm_lookup_file.write_u64::<LittleEndian>(*off)?;
-        bm_lookup_file.write_u32::<LittleEndian>(*len)?;
-    }
-    bm_lookup_file.flush()?;
 
     // Write docids
     let docids_path = output.join("docids.bin");
@@ -821,7 +898,7 @@ pub fn build(
     // Write meta
     let num_docs = index.doc_ids.len();
     let meta = IndexMeta {
-        version: 3, // bump version for line-level index format
+        version: INDEX_VERSION,
         num_docs,
         num_ngrams: index.ngrams.len(),
         root_dir: root.to_string_lossy().into_owned(),
@@ -829,6 +906,7 @@ pub fn build(
         file_mtimes,
         dir_mtimes,
         main_num_docs: Some(num_docs),
+        case_insensitive: index.ngrams_ci.is_some(),
     };
     let meta_path = output.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
@@ -844,20 +922,146 @@ pub fn build(
 
     if verbose {
         eprintln!(
-            "Index built: {} docs, {} trigrams, postings {}KB",
+            "Index built: {} docs, {} trigrams, postings {}KB{}",
             meta.num_docs,
             meta.num_ngrams,
-            fs::metadata(&postings_path)?.len() / 1024
+            postings_len / 1024,
+            if meta.case_insensitive {
+                " (+ case-insensitive index)"
+            } else {
+                ""
+            }
         );
     }
 
     Ok(())
 }
 
+/// True if an index exists at `idx_path` and is the current on-disk format
+/// version. Callers use this to decide whether to (re)build before searching or
+/// updating — a missing OR stale-version index returns `false`.
+pub fn is_current(idx_path: &Path) -> bool {
+    match fs::read_to_string(idx_path.join("meta.json")) {
+        Ok(s) => serde_json::from_str::<IndexMeta>(&s)
+            .map(|m| m.version == INDEX_VERSION)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Read a delta lookup + postings pair (used for both the CS and CI deltas).
+/// Returns empty vecs when the lookup file is absent.
+fn read_delta(lookup_path: &Path, postings_path: &Path) -> Result<(Vec<LookupEntry>, Vec<u8>)> {
+    if !lookup_path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let ldata = fs::read(lookup_path)?;
+    let num = ldata.len() / LOOKUP_ENTRY_SIZE;
+    let mut dlookup = Vec::with_capacity(num);
+    let mut cursor = std::io::Cursor::new(&ldata);
+    for _ in 0..num {
+        let hash = cursor.read_u32::<LittleEndian>()?;
+        let offset = cursor.read_u64::<LittleEndian>()?;
+        let len = cursor.read_u32::<LittleEndian>()?;
+        dlookup.push(LookupEntry { hash, offset, len });
+    }
+    let dpostings = fs::read(postings_path).unwrap_or_default();
+    Ok((dlookup, dpostings))
+}
+
+/// Write a delta store's `{postings, lookup}` files (compact-encoded), or
+/// remove them when the trigram map is empty. Doc-ids are shared between the CS
+/// and CI deltas, so this writes only the postings + lookup pair.
+fn write_delta_store(
+    postings_path: &Path,
+    lookup_path: &Path,
+    ngrams: HashMap<u32, Vec<Posting>>,
+) -> Result<()> {
+    let mut sorted: Vec<(u32, Vec<Posting>)> = ngrams.into_iter().collect();
+    sorted.sort_by_key(|(hash, _)| *hash);
+
+    if sorted.is_empty() {
+        let _ = fs::remove_file(postings_path);
+        let _ = fs::remove_file(lookup_path);
+        return Ok(());
+    }
+
+    let mut postings_file = BufWriter::new(File::create(postings_path)?);
+    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut offset: u64 = 0;
+    for (hash, postings) in &sorted {
+        let mut buf = Vec::with_capacity(postings.len() * 3);
+        let mut w = PostingWriter::new();
+        for &(doc_id, line_no, byte_offset) in postings {
+            w.push(&mut buf, doc_id, line_no, byte_offset);
+        }
+        let len = buf.len() as u32;
+        postings_file.write_all(&buf)?;
+        lookup_entries.push((*hash, offset, len));
+        offset += len as u64;
+    }
+    postings_file.flush()?;
+
+    let mut lookup_file = BufWriter::new(File::create(lookup_path)?);
+    for (hash, off, len) in &lookup_entries {
+        lookup_file.write_u32::<LittleEndian>(*hash)?;
+        lookup_file.write_u64::<LittleEndian>(*off)?;
+        lookup_file.write_u32::<LittleEndian>(*len)?;
+    }
+    lookup_file.flush()?;
+    Ok(())
+}
+
+/// Open the four mmaps of a trigram store given its file prefix, returning
+/// `None` for the whole set when the postings file is absent.
+type StoreMmaps = (Mmap, usize, Mmap, Option<Mmap>, Option<Mmap>, usize);
+fn load_store(index_path: &Path, prefix: &str) -> Result<Option<StoreMmaps>> {
+    let postings_path = index_path.join(format!("{prefix}.postings"));
+    if !postings_path.exists() {
+        return Ok(None);
+    }
+    let lf = File::open(index_path.join(format!("{prefix}.lookup")))?;
+    let lookup_mmap = unsafe { Mmap::map(&lf)? };
+    let lookup_count = lookup_mmap.len() / LOOKUP_ENTRY_SIZE;
+    let pf = File::open(&postings_path)?;
+    let postings_mmap = unsafe { Mmap::map(&pf)? };
+
+    let bitmaps_path = index_path.join(format!("{prefix}.bitmaps"));
+    let bitmaps_lookup_path = index_path.join(format!("{prefix}.bitmaps.lookup"));
+    let (bitmap_mmap, bitmap_lookup_mmap, bitmap_lookup_count) =
+        if bitmaps_path.exists() && bitmaps_lookup_path.exists() {
+            let bf = File::open(&bitmaps_path)?;
+            let bm = unsafe { Mmap::map(&bf)? };
+            let blf = File::open(&bitmaps_lookup_path)?;
+            let blm = unsafe { Mmap::map(&blf)? };
+            let count = blm.len() / LOOKUP_ENTRY_SIZE;
+            (Some(bm), Some(blm), count)
+        } else {
+            (None, None, 0)
+        };
+    Ok(Some((
+        lookup_mmap,
+        lookup_count,
+        postings_mmap,
+        bitmap_mmap,
+        bitmap_lookup_mmap,
+        bitmap_lookup_count,
+    )))
+}
+
 pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     let meta_path = index_path.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
+
+    if meta.version != INDEX_VERSION {
+        anyhow::bail!(
+            "index at {} is version {} but this build expects version {} (posting format changed); rebuild with `fgr index`",
+            index_path.display(),
+            meta.version,
+            INDEX_VERSION
+        );
+    }
 
     // Load main lookup via mmap (zero-copy binary search)
     let lookup_path = index_path.join("ngrams.lookup");
@@ -923,27 +1127,32 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     };
 
     // Load delta index (if exists)
-    let delta_lookup_path = index_path.join("delta.lookup");
-    let delta_postings_path = index_path.join("delta.postings");
     let delta_docids_path = index_path.join("delta.docids");
-    let entry_size = 4 + 8 + 4;
+    let (delta_lookup, delta_postings) = read_delta(
+        &index_path.join("delta.lookup"),
+        &index_path.join("delta.postings"),
+    )?;
 
-    let (delta_lookup, delta_postings) = if delta_lookup_path.exists() {
-        let ldata = fs::read(&delta_lookup_path)?;
-        let num = ldata.len() / entry_size;
-        let mut dlookup = Vec::with_capacity(num);
-        let mut cursor = std::io::Cursor::new(&ldata);
-        for _ in 0..num {
-            let hash = cursor.read_u32::<LittleEndian>()?;
-            let offset = cursor.read_u64::<LittleEndian>()?;
-            let len = cursor.read_u32::<LittleEndian>()?;
-            dlookup.push(LookupEntry { hash, offset, len });
-        }
-        let dpostings = fs::read(&delta_postings_path).unwrap_or_default();
-        (dlookup, dpostings)
+    // Load the case-insensitive companion store and its delta (if present).
+    let (
+        lookup_ci_mmap,
+        lookup_ci_count,
+        postings_ci_mmap,
+        bitmap_ci_mmap,
+        bitmap_lookup_ci_mmap,
+        bitmap_lookup_ci_count,
+    ) = match if meta.case_insensitive {
+        load_store(index_path, "ngrams.ci")?
     } else {
-        (Vec::new(), Vec::new())
+        None
+    } {
+        Some((lm, lc, pm, bm, blm, bc)) => (Some(lm), lc, Some(pm), bm, blm, bc),
+        None => (None, 0, None, None, None, 0),
     };
+    let (delta_lookup_ci, delta_postings_ci) = read_delta(
+        &index_path.join("delta.ci.lookup"),
+        &index_path.join("delta.ci.postings"),
+    )?;
 
     // Load delta doc_ids (small count, keep as PathBuf)
     let mut delta_doc_ids = Vec::new();
@@ -977,6 +1186,14 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         delta_lookup,
         delta_postings,
         main_num_docs,
+        lookup_ci_mmap,
+        lookup_ci_count,
+        postings_ci_mmap,
+        bitmap_ci_mmap,
+        bitmap_lookup_ci_mmap,
+        bitmap_lookup_ci_count,
+        delta_lookup_ci,
+        delta_postings_ci,
     })
 }
 
@@ -995,6 +1212,17 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let meta_path = index_path.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
+    // An incremental update only rewrites the delta; it cannot mix a new-format
+    // delta into an old-format main index without corrupting it. Refuse on a
+    // version mismatch — the caller (or the search auto-build) rebuilds instead.
+    if meta.version != INDEX_VERSION {
+        anyhow::bail!(
+            "index at {} is version {} but this build expects version {}; run `fgr index` to rebuild",
+            index_path.display(),
+            meta.version,
+            INDEX_VERSION
+        );
+    }
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
@@ -1100,8 +1328,14 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // Drop the loaded index (releases mmap)
     drop(pidx);
 
-    // 8. Index all delta files with line-level postings
+    // 8. Index all delta files with line-level postings. When the index has a
+    // case-insensitive companion, build the CI delta in lockstep (same delta
+    // docs, case-folded trigrams) so `-i` searches stay correct after updates.
+    let ci_enabled = meta.case_insensitive;
     let mut delta_ngrams: HashMap<u32, Vec<Posting>> = HashMap::new();
+    let mut delta_ngrams_ci: HashMap<u32, Vec<Posting>> = HashMap::new();
+    let mut fold_buf: Vec<u8> = Vec::new();
+    let mut seen_on_line_ci: HashSet<[u8; 3]> = HashSet::new();
     let mut delta_doc_ids: Vec<PathBuf> = Vec::new();
     let mut actual_added = 0usize;
     let mut actual_modified = 0usize;
@@ -1147,19 +1381,33 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             if line.len() >= 3 {
                 seen_on_line.clear();
                 let byte_offset = line_start as u32;
-                let mut prefix = [0u8; 4];
-                let copy_len = line.len().min(4);
-                prefix[..copy_len].copy_from_slice(&line[..copy_len]);
                 for w in line.windows(3) {
                     let tri = [w[0], w[1], w[2]];
                     if seen_on_line.insert(tri) {
                         let hash = crc32fast::hash(&tri);
-                        delta_ngrams.entry(hash).or_default().push((
-                            doc_id,
-                            line_no,
-                            byte_offset,
-                            prefix,
-                        ));
+                        delta_ngrams
+                            .entry(hash)
+                            .or_default()
+                            .push((doc_id, line_no, byte_offset));
+                    }
+                }
+
+                // Lockstep CI delta: same posting, folded trigrams.
+                if ci_enabled {
+                    casefold::fold_into(line, &mut fold_buf);
+                    if fold_buf.len() >= 3 {
+                        seen_on_line_ci.clear();
+                        for w in fold_buf.windows(3) {
+                            let tri = [w[0], w[1], w[2]];
+                            if seen_on_line_ci.insert(tri) {
+                                let hash = crc32fast::hash(&tri);
+                                delta_ngrams_ci.entry(hash).or_default().push((
+                                    doc_id,
+                                    line_no,
+                                    byte_offset,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1209,12 +1457,10 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         let mut offset: u64 = 0;
 
         for (hash, postings) in &sorted_ngrams {
-            let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-            for &(doc_id, line_no, byte_offset, prefix) in postings {
-                buf.write_u32::<LittleEndian>(doc_id)?;
-                buf.write_u32::<LittleEndian>(line_no)?;
-                buf.write_u32::<LittleEndian>(byte_offset)?;
-                buf.write_all(&prefix)?;
+            let mut buf = Vec::with_capacity(postings.len() * 3);
+            let mut w = PostingWriter::new();
+            for &(doc_id, line_no, byte_offset) in postings {
+                w.push(&mut buf, doc_id, line_no, byte_offset);
             }
             let len = buf.len() as u32;
             postings_file.write_all(&buf)?;
@@ -1242,6 +1488,20 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         docids_file.flush()?;
     }
 
+    // 9b. Write the lockstep CI delta (postings + lookup only — docids are
+    // shared with the CS delta written above). When the index has no CI
+    // companion, make sure no stale CI delta lingers.
+    if ci_enabled {
+        write_delta_store(
+            &index_path.join("delta.ci.postings"),
+            &index_path.join("delta.ci.lookup"),
+            delta_ngrams_ci,
+        )?;
+    } else {
+        let _ = fs::remove_file(index_path.join("delta.ci.postings"));
+        let _ = fs::remove_file(index_path.join("delta.ci.lookup"));
+    }
+
     // 10. Update meta.json with current file_mtimes
     let mut new_mtimes: HashMap<String, u64> = HashMap::with_capacity(saved_mtimes.len());
     for (path, &mtime) in &saved_mtimes {
@@ -1262,7 +1522,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
     let total_docs = main_num_docs - main_deleted.len() + delta_doc_ids.len();
     let new_meta = IndexMeta {
-        version: 3,
+        version: INDEX_VERSION,
         num_docs: total_docs,
         num_ngrams: meta.num_ngrams,
         root_dir: root.to_string_lossy().into_owned(),
@@ -1270,6 +1530,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         file_mtimes: new_mtimes,
         dir_mtimes: new_dir_mtimes,
         main_num_docs: Some(main_num_docs),
+        case_insensitive: meta.case_insensitive,
     };
     let meta_json = serde_json::to_string_pretty(&new_meta)?;
     fs::write(&meta_path, meta_json)?;

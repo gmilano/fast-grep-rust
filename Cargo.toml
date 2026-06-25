@@ -32,6 +32,7 @@ path = "src/main.rs"
 
 [dependencies]
 regex = "1"
+regex-syntax = "0.8"
 rayon = "1"
 roaring = "0.10"
 memmap2 = "0.9"
