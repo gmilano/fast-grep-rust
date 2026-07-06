@@ -1197,6 +1197,61 @@ pub fn compact_into(pidx: &PersistentIndex, out_dir: &Path) -> Result<CompactSta
     })
 }
 
+pub struct CompactOutcome {
+    /// Whether a rebaseline actually happened (false = nothing to fold).
+    pub compacted: bool,
+    pub stats: Option<CompactStats>,
+}
+
+/// Rebaseline the index at `index_path`: stage a fresh baseline (delta folded,
+/// tombstones dropped) into the non-live slot, then flip `current` to it and
+/// reclaim the old slot. Serialized with other writers via the index lock;
+/// readers never take the lock, so search is never blocked. A no-op
+/// (`compacted = false`) when there is no delta and no tombstone to fold.
+pub fn compact(index_path: &Path, verbose: bool) -> Result<CompactOutcome> {
+    let (_lock, _waited) = acquire_index_lock(index_path)?;
+    // Do the work in an inner fn so the lock is released on every path.
+    let result = compact_locked(index_path, verbose);
+    release_index_lock(index_path);
+    result
+}
+
+fn compact_locked(index_path: &Path, verbose: bool) -> Result<CompactOutcome> {
+    let pidx = load(index_path)?;
+
+    // Already dense and delta-free → nothing to do.
+    if pidx.delta_doc_ids.is_empty() && pidx.deleted_docs.is_empty() {
+        return Ok(CompactOutcome {
+            compacted: false,
+            stats: None,
+        });
+    }
+
+    // Stage into the non-live slot (reclaim it first — safe even if a reader
+    // still maps it on the target platforms), then commit with a pointer flip.
+    let slot = next_slot(index_path);
+    let slot_dir = index_path.join(slot);
+    let _ = fs::remove_dir_all(&slot_dir);
+    let stats = compact_into(&pidx, &slot_dir)?;
+
+    // Release our own mmaps before flipping + reclaiming the previous slot.
+    drop(pidx);
+    write_current(index_path, slot)?;
+    cleanup_non_live(index_path, slot);
+
+    if verbose {
+        eprintln!(
+            "Compacted: {} live docs ({} dropped), {} trigrams -> {}",
+            stats.live_docs, stats.dropped_docs, stats.num_ngrams, slot
+        );
+    }
+
+    Ok(CompactOutcome {
+        compacted: true,
+        stats: Some(stats),
+    })
+}
+
 pub fn build(
     root: &Path,
     output: &Path,

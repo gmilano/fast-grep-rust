@@ -12,7 +12,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use fast_grep::persist::{
-    build as build_index, compact_into, load as load_index, update_incremental, PersistentIndex,
+    build as build_index, compact, compact_into, load as load_index, update_incremental,
+    PersistentIndex,
 };
 use fast_grep::searcher::{search_full_scan, search_persistent_timed, Match};
 
@@ -467,4 +468,61 @@ fn compaction_matches_full_rebuild_case_insensitive() {
     }
     // Deleted content gone even case-insensitively.
     assert!(hitset(&comp, "(?i)EXPRESS").is_empty(), "deleted file gone");
+}
+
+/// `compact()` swaps the live slot: it stages the folded baseline into the
+/// non-live slot, flips `current`, reclaims the old slot, and clears the delta.
+/// The result matches a full rebuild, and a second compact is a no-op.
+#[test]
+fn compact_swaps_slot_and_folds_delta() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-a"
+    );
+
+    // Mutate + update → delta + tombstones in slot-a.
+    fs::write(tmp.path().join("added.ts"), "const zetaMarker = 5;\n").unwrap();
+    fs::remove_file(tmp.path().join("server.ts")).unwrap();
+    update_incremental(&idx_dir, tmp.path(), false).unwrap();
+    assert!(idx_dir.join("slot-a/delta.postings").exists());
+
+    // Compact → swap to slot-b, reclaim slot-a, no delta/tombstones left.
+    let outcome = compact(&idx_dir, false).expect("compact");
+    assert!(outcome.compacted);
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-b"
+    );
+    assert!(!idx_dir.join("slot-a").exists(), "old slot reclaimed");
+    assert!(
+        !idx_dir.join("slot-b/delta.postings").exists(),
+        "delta folded"
+    );
+    assert!(
+        !idx_dir.join("slot-b/deleted.bin").exists(),
+        "tombstones gone"
+    );
+
+    // Correctness vs a full rebuild of the current on-disk state.
+    let rb_dir = idxtmp.path().join("rebuild");
+    build_index(tmp.path(), &rb_dir, true, &[], false, false).unwrap();
+    let comp = load_index(&idx_dir).unwrap();
+    let rb = load_index(&rb_dir).unwrap();
+    for p in ["function", "zetaMarker", "export", "import", "const"] {
+        assert_eq!(hitset(&comp, p), hitset(&rb, p), "mismatch for '{p}'");
+    }
+    assert!(hitset(&comp, "express").is_empty(), "deleted file gone");
+    drop(comp);
+
+    // Second compact: nothing to fold → no-op, pointer unchanged.
+    let again = compact(&idx_dir, false).expect("compact again");
+    assert!(!again.compacted, "already compact");
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-b"
+    );
 }

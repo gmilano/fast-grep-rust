@@ -237,6 +237,10 @@ pub enum Commands {
     /// (default `.fgr`).
     #[command(name = "stats")]
     Stats,
+    /// Rebaseline the index: fold the delta + tombstones into the primary and
+    /// densify. Index dir from the global `--index` flag (default `.fgr`).
+    #[command(name = "compact")]
+    Compact,
     /// Watch DIR for changes and keep index up-to-date
     #[command(name = "daemon")]
     Daemon {
@@ -824,6 +828,23 @@ fn run_subcommand(
                     stats.estimated_ram_bytes / (1024 * 1024)
                 );
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
+            }
+        }
+        Commands::Compact => {
+            let idx_path = idx_arg();
+            let start = Instant::now();
+            let outcome = persist::compact(&idx_path, false)?;
+            if outcome.compacted {
+                let s = outcome.stats.expect("stats present when compacted");
+                eprintln!(
+                    "Compacted index: {} live docs, {} dropped, {} trigrams in {:.2}s",
+                    s.live_docs,
+                    s.dropped_docs,
+                    s.num_ngrams,
+                    start.elapsed().as_secs_f64()
+                );
+            } else {
+                eprintln!("Index already compact (no delta or tombstones to fold)");
             }
         }
         #[cfg(feature = "daemon")]
