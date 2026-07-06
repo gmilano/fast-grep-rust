@@ -9,7 +9,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use fast_grep::persist::{build as build_index, load as load_index, PersistentIndex};
+use std::time::{Duration, SystemTime};
+
+use fast_grep::persist::{
+    build as build_index, load as load_index, update_incremental, PersistentIndex,
+};
 use fast_grep::searcher::{search_full_scan, search_persistent_timed, Match};
 
 /// Test file contents matching the TypeScript test suite
@@ -182,4 +186,130 @@ fn returns_empty_for_nonexistent_pattern() {
     let idx = build_test_index(tmp.path());
     let results = search(&idx, "xyzxyzxyz_nonexistent");
     assert!(results.is_empty());
+}
+
+/// A fresh build materializes the slot layout: content lives under `slot-a`
+/// and `current` points at it.
+#[test]
+fn build_materializes_slot_layout() {
+    let tmp = setup_test_dir();
+    let idx_dir = tmp.path().join(".fgr-slot");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+
+    let current = fs::read_to_string(idx_dir.join("current")).expect("current pointer");
+    assert_eq!(current.trim(), "slot-a");
+    assert!(idx_dir.join("slot-a/meta.json").exists());
+    // No flat content leaked into the root.
+    assert!(!idx_dir.join("meta.json").exists());
+
+    let idx = load_index(&idx_dir).expect("load");
+    assert!(!search(&idx, "function").is_empty());
+}
+
+/// A pre-slot (flat) index on disk — no `current`, content files in the root —
+/// still loads and searches, so existing indexes keep working without a rebuild.
+#[test]
+fn legacy_flat_index_still_loads() {
+    let tmp = setup_test_dir();
+    let idx_dir = tmp.path().join(".fgr-legacy");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+
+    // Flatten: move the live slot's files up to the root, drop the slot
+    // machinery — this is exactly a pre-slot on-disk layout.
+    let slot = idx_dir.join("slot-a");
+    for entry in fs::read_dir(&slot).unwrap() {
+        let entry = entry.unwrap();
+        fs::rename(entry.path(), idx_dir.join(entry.file_name())).unwrap();
+    }
+    fs::remove_dir_all(&slot).unwrap();
+    fs::remove_file(idx_dir.join("current")).unwrap();
+
+    let idx = load_index(&idx_dir).expect("load flat");
+    let results = search(&idx, "express");
+    assert!(!results.is_empty());
+    assert!(results
+        .iter()
+        .all(|r| r.path.file_name().unwrap() == "server.ts"));
+}
+
+/// Rebuilding an existing index stages into the *other* slot, flips `current`,
+/// and reclaims the previous slot — so exactly one slot dir remains.
+#[test]
+fn rebuild_alternates_slots() {
+    let tmp = setup_test_dir();
+    let idx_dir = tmp.path().join(".fgr-rebuild");
+
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build 1");
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-a"
+    );
+
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build 2");
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-b"
+    );
+    assert!(idx_dir.join("slot-b/meta.json").exists());
+    assert!(
+        !idx_dir.join("slot-a").exists(),
+        "stale slot should be reclaimed"
+    );
+
+    let idx = load_index(&idx_dir).expect("load after rebuild");
+    assert!(!search(&idx, "function").is_empty());
+}
+
+/// An incremental update writes its delta into the live slot (not the root) and
+/// the reloaded index reflects added / modified / deleted files.
+#[test]
+fn update_writes_delta_into_slot() {
+    let tmp = setup_test_dir();
+    let idx_dir = tmp.path().join(".fgr-upd");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+
+    // Added file.
+    fs::write(
+        tmp.path().join("added.ts"),
+        "export const zetaMarker = 42;\n",
+    )
+    .unwrap();
+    // Modified file — bump mtime forward so the 2s-granularity check detects it
+    // deterministically without a sleep.
+    let modpath = tmp.path().join("utils.ts");
+    fs::write(
+        &modpath,
+        "export function newlyModifiedFn() { return 7; }\n",
+    )
+    .unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&modpath).unwrap();
+    f.set_modified(SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+    // Deleted file.
+    fs::remove_file(tmp.path().join("server.ts")).unwrap();
+
+    update_incremental(&idx_dir, tmp.path(), false).expect("update");
+
+    // Delta landed inside the slot, not the root.
+    assert!(idx_dir.join("slot-a/delta.postings").exists());
+    assert!(!idx_dir.join("delta.postings").exists());
+
+    let idx = load_index(&idx_dir).expect("reload");
+    assert!(
+        !search(&idx, "zetaMarker").is_empty(),
+        "added file searchable"
+    );
+    assert!(
+        !search(&idx, "newlyModifiedFn").is_empty(),
+        "modified content searchable"
+    );
+    assert!(
+        search(&idx, "capitalize").is_empty(),
+        "pre-modification content gone (old doc tombstoned)"
+    );
+    assert!(
+        search(&idx, "express").is_empty(),
+        "deleted file's content gone"
+    );
 }

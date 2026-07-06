@@ -22,6 +22,101 @@ use crate::trigram;
 /// than decoded with the wrong reader.
 const INDEX_VERSION: u32 = 4;
 
+// --- Slot layout (two-slot baseline swap) ---
+//
+// The index *root* (the `.fgr` dir the user/daemon points at) holds only
+// coordination files: the `current` pointer, the daemon pid/port, and the
+// `lock`. The actual index content lives in a *slot* subdirectory named by
+// `current` (`slot-a` / `slot-b`). Writers stage a fresh baseline into the
+// non-live slot and flip `current` atomically, so readers mapped on the live
+// slot are never disturbed. Absent `current` → legacy flat layout, where the
+// content files sit directly in the root; `live_slot_dir` falls back to it so
+// pre-slot indexes keep loading without a rebuild.
+
+/// Pointer file (in the index root) naming the live slot. Absent → flat layout.
+const CURRENT_FILE: &str = "current";
+
+/// Content filenames that live inside a slot. The root additionally holds
+/// `current`, the daemon pid/port/lock, and (later) `config.toml` — none of
+/// which appear here, so cleanup never touches them.
+const CONTENT_FILES: &[&str] = &[
+    "meta.json",
+    "docids.bin",
+    "deleted.bin",
+    "delta.postings",
+    "delta.lookup",
+    "delta.docids",
+    "ngrams.postings",
+    "ngrams.lookup",
+    "ngrams.bitmaps",
+    "ngrams.bitmaps.lookup",
+    "ngrams.ci.postings",
+    "ngrams.ci.lookup",
+    "ngrams.ci.bitmaps",
+    "ngrams.ci.bitmaps.lookup",
+    "delta.ci.postings",
+    "delta.ci.lookup",
+];
+
+/// Read the `current` pointer, returning the live slot name if set.
+fn read_current(index_dir: &Path) -> Option<String> {
+    let s = fs::read_to_string(index_dir.join(CURRENT_FILE)).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Atomically point `current` at `slot` (write temp, then rename over — the
+/// pointer is never mmapped, so replacing it is safe on all platforms).
+fn write_current(index_dir: &Path, slot: &str) -> Result<()> {
+    let tmp = index_dir.join("current.tmp");
+    fs::write(&tmp, slot)?;
+    fs::rename(&tmp, index_dir.join(CURRENT_FILE))?;
+    Ok(())
+}
+
+/// Resolve the directory holding the live index content. A valid `current`
+/// pointer naming an existing slot wins; otherwise the index root itself
+/// (legacy flat layout).
+fn live_slot_dir(index_dir: &Path) -> PathBuf {
+    if let Some(slot) = read_current(index_dir) {
+        let p = index_dir.join(&slot);
+        if p.join("meta.json").exists() {
+            return p;
+        }
+    }
+    index_dir.to_path_buf()
+}
+
+/// Pick the slot to stage a fresh baseline into: the one that is NOT currently
+/// live, so readers mapped on the live slot are undisturbed. Defaults to
+/// `slot-a` when there is no live slot yet.
+fn next_slot(index_dir: &Path) -> &'static str {
+    match read_current(index_dir).as_deref() {
+        Some("slot-a") => "slot-b",
+        _ => "slot-a",
+    }
+}
+
+/// After flipping `current` to `live_slot`, best-effort reclaim disk: drop the
+/// other slot and any legacy flat content files left in the root. Safe even if
+/// a reader still maps them — on the target platforms the delete succeeds and
+/// the reader keeps its existing mapping.
+fn cleanup_non_live(index_dir: &Path, live_slot: &str) {
+    let other = if live_slot == "slot-a" {
+        "slot-b"
+    } else {
+        "slot-a"
+    };
+    let _ = fs::remove_dir_all(index_dir.join(other));
+    for f in CONTENT_FILES {
+        let _ = fs::remove_file(index_dir.join(f));
+    }
+}
+
 // --- Zero-copy read helpers ---
 
 #[inline(always)]
@@ -863,6 +958,13 @@ pub fn build(
 
     fs::create_dir_all(output).context("creating output directory")?;
 
+    // Stage the fresh baseline into the non-live slot, then flip `current` — so
+    // any reader mapped on the previous baseline is undisturbed until the swap.
+    let slot = next_slot(output);
+    let slot_dir = output.join(slot);
+    let _ = fs::remove_dir_all(&slot_dir);
+    fs::create_dir_all(&slot_dir).context("creating slot directory")?;
+
     // Collect file mtimes
     let mut file_mtimes = HashMap::new();
     for path in &index.doc_ids {
@@ -871,21 +973,22 @@ pub fn build(
         }
     }
 
-    // Collect directory mtimes for fast stale detection
+    // Collect directory mtimes for fast stale detection. Exclude the whole
+    // index root (`output`) so slots never count as corpus dirs.
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
     // Write the case-sensitive trigram files, and the case-insensitive
     // companion (`ngrams.ci.*`) when this is a CI build.
-    let postings_len = write_ngram_files(output, "ngrams", &index.ngrams)?;
+    let postings_len = write_ngram_files(&slot_dir, "ngrams", &index.ngrams)?;
     if let Some(ci) = &index.ngrams_ci {
-        write_ngram_files(output, "ngrams.ci", ci)?;
+        write_ngram_files(&slot_dir, "ngrams.ci", ci)?;
     } else {
         // A prior CI build over this directory may have left stale CI files.
-        remove_ci_files(output);
+        remove_ci_files(&slot_dir);
     }
 
     // Write docids
-    let docids_path = output.join("docids.bin");
+    let docids_path = slot_dir.join("docids.bin");
     let mut docids_file = BufWriter::new(File::create(&docids_path)?);
     for path in &index.doc_ids {
         let path_bytes = path.to_string_lossy();
@@ -908,17 +1011,22 @@ pub fn build(
         main_num_docs: Some(num_docs),
         case_insensitive: index.ngrams_ci.is_some(),
     };
-    let meta_path = output.join("meta.json");
+    let meta_path = slot_dir.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
     fs::write(&meta_path, meta_json)?;
 
-    // Clean up any delta files and stale lock from previous runs
-    let _ = fs::remove_file(output.join("delta.postings"));
-    let _ = fs::remove_file(output.join("delta.lookup"));
-    let _ = fs::remove_file(output.join("delta.docids"));
-    let _ = fs::remove_file(output.join("deleted.bin"));
+    // A full build has no delta/deleted overlay — make sure none linger in the
+    // freshly staged slot (it was just recreated, so these are normally no-ops).
+    let _ = fs::remove_file(slot_dir.join("delta.postings"));
+    let _ = fs::remove_file(slot_dir.join("delta.lookup"));
+    let _ = fs::remove_file(slot_dir.join("delta.docids"));
+    let _ = fs::remove_file(slot_dir.join("deleted.bin"));
+
+    // Commit: flip the pointer to the new slot, drop a stale root lock, then
+    // reclaim the previous slot and any legacy flat content in the root.
+    write_current(output, slot)?;
     let _ = fs::remove_file(output.join("lock"));
-    // Old bitmap files are overwritten by the new ones above
+    cleanup_non_live(output, slot);
 
     if verbose {
         eprintln!(
@@ -941,12 +1049,20 @@ pub fn build(
 /// version. Callers use this to decide whether to (re)build before searching or
 /// updating — a missing OR stale-version index returns `false`.
 pub fn is_current(idx_path: &Path) -> bool {
+    let idx_path = live_slot_dir(idx_path);
     match fs::read_to_string(idx_path.join("meta.json")) {
         Ok(s) => serde_json::from_str::<IndexMeta>(&s)
             .map(|m| m.version == INDEX_VERSION)
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// True if an index (of any format version) exists at `idx_path`, resolving the
+/// live slot. Unlike `is_current`, this does not check the format version — it
+/// only answers "is there something to load here?".
+pub fn index_exists(idx_path: &Path) -> bool {
+    live_slot_dir(idx_path).join("meta.json").exists()
 }
 
 /// Read a delta lookup + postings pair (used for both the CS and CI deltas).
@@ -1050,6 +1166,10 @@ fn load_store(index_path: &Path, prefix: &str) -> Result<Option<StoreMmaps>> {
 }
 
 pub fn load(index_path: &Path) -> Result<PersistentIndex> {
+    // Resolve the live slot up front; every content path below is relative to
+    // it. Legacy flat indexes resolve back to the root, so they keep loading.
+    let slot = live_slot_dir(index_path);
+    let index_path = slot.as_path();
     let meta_path = index_path.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
@@ -1205,11 +1325,35 @@ pub struct UpdateStats {
     pub duration_ms: u64,
 }
 
+/// Express the index directory in the *walk's* path space so `starts_with`
+/// reliably excludes it from the corpus. `index_path` (from `--index`) and
+/// `walk_root` (from the index's stored root) can be relative or absolute in any
+/// mix, so a raw `starts_with` mismatches (e.g. absolute walk paths vs a
+/// relative `.fgr`). We canonicalize both to find the index dir relative to the
+/// root, then re-join it onto `walk_root` in its own form. Costs two syscalls
+/// total (not per entry). Falls back to the raw index path.
+fn index_dir_in_walk(index_path: &Path, walk_root: &Path) -> PathBuf {
+    if let (Ok(idx_c), Ok(root_c)) = (fs::canonicalize(index_path), fs::canonicalize(walk_root)) {
+        if let Ok(rel) = idx_c.strip_prefix(&root_c) {
+            return walk_root.join(rel);
+        }
+    }
+    index_path.to_path_buf()
+}
+
 pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Result<UpdateStats> {
     let start = Instant::now();
 
+    // Content files live in the live slot; `index_path` (the root) is still used
+    // for `load` (which resolves the slot itself) and for excluding the whole
+    // index dir from the corpus walk below.
+    let slot_dir = live_slot_dir(index_path);
+    // The index dir as it appears within the walk, so we never index our own
+    // files (`current`, the slots, meta/postings) as if they were corpus.
+    let index_in_walk = index_dir_in_walk(index_path, root);
+
     // 1. Load meta.json — get saved file_mtimes
-    let meta_path = index_path.join("meta.json");
+    let meta_path = slot_dir.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
     // An incremental update only rewrites the delta; it cannot mix a new-format
@@ -1236,7 +1380,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     for entry in walker.flatten() {
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
             // Exclude the index directory itself to avoid self-invalidation
-            if !entry.path().starts_with(index_path) {
+            if !entry.path().starts_with(&index_in_walk) {
                 if let Ok(m) = entry.metadata() {
                     new_dir_mtimes
                         .insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
@@ -1249,7 +1393,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         }
         let path = entry.path();
         // Skip files inside the index directory
-        if path.starts_with(index_path) {
+        if path.starts_with(&index_in_walk) {
             continue;
         }
         if let Ok(m) = fs::metadata(path) {
@@ -1423,7 +1567,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // 9. Write delta files (small -- only changed files)
 
     // Write deleted.bin: only main doc_ids that are deleted
-    let deleted_path = index_path.join("deleted.bin");
+    let deleted_path = slot_dir.join("deleted.bin");
     let main_deleted: Vec<u32> = new_deleted
         .iter()
         .filter(|&&id| (id as usize) < main_num_docs)
@@ -1443,9 +1587,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let mut sorted_ngrams: Vec<(u32, Vec<Posting>)> = delta_ngrams.into_iter().collect();
     sorted_ngrams.sort_by_key(|(hash, _)| *hash);
 
-    let delta_postings_path = index_path.join("delta.postings");
-    let delta_lookup_path = index_path.join("delta.lookup");
-    let delta_docids_path = index_path.join("delta.docids");
+    let delta_postings_path = slot_dir.join("delta.postings");
+    let delta_lookup_path = slot_dir.join("delta.lookup");
+    let delta_docids_path = slot_dir.join("delta.docids");
 
     if sorted_ngrams.is_empty() && delta_doc_ids.is_empty() {
         let _ = fs::remove_file(&delta_postings_path);
@@ -1493,13 +1637,13 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // companion, make sure no stale CI delta lingers.
     if ci_enabled {
         write_delta_store(
-            &index_path.join("delta.ci.postings"),
-            &index_path.join("delta.ci.lookup"),
+            &slot_dir.join("delta.ci.postings"),
+            &slot_dir.join("delta.ci.lookup"),
             delta_ngrams_ci,
         )?;
     } else {
-        let _ = fs::remove_file(index_path.join("delta.ci.postings"));
-        let _ = fs::remove_file(index_path.join("delta.ci.lookup"));
+        let _ = fs::remove_file(slot_dir.join("delta.ci.postings"));
+        let _ = fs::remove_file(slot_dir.join("delta.ci.lookup"));
     }
 
     // 10. Update meta.json with current file_mtimes

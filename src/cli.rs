@@ -229,19 +229,14 @@ pub enum Commands {
     /// Benchmark PATTERN search in DIR
     #[command(name = "bench")]
     Bench { pattern: String, dir: PathBuf },
-    /// Incrementally update an existing index
+    /// Incrementally update an existing index. Index dir from the global
+    /// `--index` flag (default `.fgr`).
     #[command(name = "update")]
-    Update {
-        dir: Option<PathBuf>,
-        #[arg(long, default_value = ".fgr")]
-        index: PathBuf,
-    },
-    /// Show index statistics
+    Update { dir: Option<PathBuf> },
+    /// Show index statistics. Index dir from the global `--index` flag
+    /// (default `.fgr`).
     #[command(name = "stats")]
-    Stats {
-        #[arg(long, default_value = ".fgr")]
-        index: PathBuf,
-    },
+    Stats,
     /// Watch DIR for changes and keep index up-to-date
     #[command(name = "daemon")]
     Daemon {
@@ -327,6 +322,7 @@ pub fn run() -> Result<()> {
     if let Some(cmd) = cli.command {
         return run_subcommand(
             cmd,
+            cli.index_path.clone(),
             opts.no_ignore,
             opts.hidden,
             &opts.file_type,
@@ -515,7 +511,7 @@ fn run_indexed_search(
     // is the search PATH the user passed — this matches the natural intent
     // "give me a fast search over this directory."
     if !persist::is_current(idx_path) {
-        let reason = if idx_path.join("meta.json").exists() {
+        let reason = if persist::index_exists(idx_path) {
             "outdated (format changed)"
         } else {
             "not found"
@@ -729,11 +725,15 @@ fn output_summary(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
 
 fn run_subcommand(
     cmd: Commands,
+    index_path: Option<PathBuf>,
     no_ignore: bool,
     hidden: bool,
     type_filter: &[String],
     case_insensitive: bool,
 ) -> Result<()> {
+    // `update` and `stats` take the index dir from the global `--index` flag,
+    // defaulting to `.fgr` when it is omitted.
+    let idx_arg = || index_path.clone().unwrap_or_else(|| PathBuf::from(".fgr"));
     match cmd {
         Commands::Index {
             dir,
@@ -763,10 +763,8 @@ fn run_subcommand(
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, hidden, type_filter)?;
         }
-        Commands::Update {
-            dir,
-            index: idx_path,
-        } => {
+        Commands::Update { dir } => {
+            let idx_path = idx_arg();
             let root = if let Some(d) = dir {
                 d
             } else {
@@ -795,7 +793,8 @@ fn run_subcommand(
                 );
             }
         }
-        Commands::Stats { index: index_path } => {
+        Commands::Stats => {
+            let index_path = idx_arg();
             if index_path.exists() {
                 let idx = persist::load(&index_path)?;
                 println!("Persistent Index Stats:");

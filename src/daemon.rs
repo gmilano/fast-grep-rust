@@ -138,7 +138,7 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     }
 
     // Verify index exists
-    if !index_path.join("meta.json").exists() {
+    if !persist::index_exists(index_path) {
         anyhow::bail!(
             "No index found at {:?}. Build one first with: fgr index {:?}",
             index_path,
