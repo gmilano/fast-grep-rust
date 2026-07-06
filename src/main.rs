@@ -1,5 +1,6 @@
 mod casefold;
 mod cli;
+mod config;
 #[cfg(feature = "daemon")]
 mod daemon;
 mod index;

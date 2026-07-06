@@ -811,6 +811,18 @@ fn run_subcommand(
                 if let Some(ref bm) = idx.bitmap_mmap {
                     println!("  Bitmaps size:  {}KB", bm.len() / 1024);
                 }
+                // Divergence from the frozen baseline + whether the config's
+                // thresholds say a rebaseline is due (see `fgr compact`).
+                let delta_docs = idx.delta_doc_ids.len();
+                let tombstones = idx.deleted_docs.len();
+                let cfg = crate::config::load(&index_path);
+                println!("  Delta docs:   {}", delta_docs);
+                println!("  Tombstones:   {}", tombstones);
+                println!(
+                    "  Compaction due: {}",
+                    cfg.compaction
+                        .should_compact(idx.main_num_docs, delta_docs, tombstones)
+                );
             } else {
                 let idx = index::SparseIndex::build_from_directory(
                     &index_path,

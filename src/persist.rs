@@ -1339,6 +1339,11 @@ pub fn build(
     let _ = fs::remove_file(output.join("lock"));
     cleanup_non_live(output, slot);
 
+    // Drop a commented default config in the root (never clobbers an existing
+    // one, so user edits survive rebuilds). Lives outside the slots, so
+    // compaction never touches it.
+    crate::config::write_default_if_absent(output);
+
     if verbose {
         eprintln!(
             "Index built: {} docs, {} trigrams, postings {}KB{}",

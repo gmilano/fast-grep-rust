@@ -526,3 +526,40 @@ fn compact_swaps_slot_and_folds_delta() {
         "slot-b"
     );
 }
+
+/// `build` drops a default `config.toml` in the index root (not a slot), and a
+/// user's edits survive every update / compact / rebuild — it is never clobbered.
+#[test]
+fn config_written_on_build_and_survives_mutations() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+
+    let cfg_path = idx_dir.join("config.toml");
+    assert!(cfg_path.exists(), "default config written on build");
+    assert!(
+        !idx_dir.join("slot-a/config.toml").exists(),
+        "config lives in the root, not a slot"
+    );
+    // Defaults load correctly.
+    assert!(fast_grep::config::load(&idx_dir).compaction.auto);
+
+    // User edits the file.
+    fs::write(
+        &cfg_path,
+        "[compaction]\nauto = false\ndelta_docs_abs = 7\n",
+    )
+    .unwrap();
+
+    // Mutate + update + compact — none of these may touch config.toml.
+    fs::write(tmp.path().join("added.ts"), "let somethingNew = 1;\n").unwrap();
+    update_incremental(&idx_dir, tmp.path(), false).unwrap();
+    compact(&idx_dir, false).unwrap();
+    // Rebuild too (write_default_if_absent must not clobber).
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+
+    let cfg = fast_grep::config::load(&idx_dir);
+    assert!(!cfg.compaction.auto, "user edit preserved");
+    assert_eq!(cfg.compaction.delta_docs_abs, 7, "user edit preserved");
+}
