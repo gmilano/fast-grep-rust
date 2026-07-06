@@ -115,6 +115,10 @@ impl Daemon {
         }
         let (_lock, _waited) = persist::acquire_index_lock(&self.index_path)?;
         let stats = persist::update_incremental(&self.index_path, &self.root_dir, false)?;
+        // Auto-rebaseline under the same lock when divergence crosses the
+        // configured threshold. We are single-writer here, and this happens
+        // right after a debounced update — i.e. when the tree is quiet.
+        let compaction = persist::maybe_auto_compact(&self.index_path, &stats, false)?;
         persist::release_index_lock(&self.index_path);
         self.pending_changes.clear();
         self.dirty = false;
@@ -122,6 +126,12 @@ impl Daemon {
             eprintln!(
                 "[daemon] Updated index: +{} added, {} modified, {} deleted in {}ms",
                 stats.added, stats.modified, stats.deleted, stats.duration_ms
+            );
+        }
+        if let Some(s) = compaction.and_then(|c| c.stats) {
+            eprintln!(
+                "[daemon] Auto-compacted: {} live docs, {} dropped, {} trigrams",
+                s.live_docs, s.dropped_docs, s.num_ngrams
             );
         }
         Ok(())
@@ -159,11 +169,18 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
         eprintln!("[daemon] Index is stale, updating...");
         let (_lock, _) = persist::acquire_index_lock(index_path)?;
         let stats = persist::update_incremental(index_path, &root_dir, true)?;
+        let compaction = persist::maybe_auto_compact(index_path, &stats, false)?;
         persist::release_index_lock(index_path);
         eprintln!(
             "[daemon] Startup update: +{} added, {} modified, {} deleted in {}ms",
             stats.added, stats.modified, stats.deleted, stats.duration_ms
         );
+        if let Some(s) = compaction.and_then(|c| c.stats) {
+            eprintln!(
+                "[daemon] Startup auto-compacted: {} live docs, {} dropped, {} trigrams",
+                s.live_docs, s.dropped_docs, s.num_ngrams
+            );
+        }
     } else {
         eprintln!("[daemon] Index is up to date");
     }

@@ -795,22 +795,13 @@ fn run_subcommand(
             let stats = persist::update_incremental(&idx_path, &root, true)?;
 
             // Auto-rebaseline while we still hold the lock, if the config's
-            // thresholds say divergence is high enough. Runs the no-lock
-            // compaction (the lock is not reentrant); the cost is paid by this
-            // updater, never by a search. `--no-compact` opts out per run.
+            // thresholds say divergence is high enough. Folds in-place under the
+            // held lock; the cost is paid by this updater, never by a search.
+            // `--no-compact` opts out per run.
             let compaction = if no_compact {
                 None
             } else {
-                let cfg = crate::config::load(&idx_path);
-                if cfg.compaction.should_compact(
-                    stats.main_docs,
-                    stats.delta_docs,
-                    stats.tombstones,
-                ) {
-                    Some(persist::compact_no_lock(&idx_path, false)?)
-                } else {
-                    None
-                }
+                persist::maybe_auto_compact(&idx_path, &stats, false)?
             };
             persist::release_index_lock(&idx_path);
 

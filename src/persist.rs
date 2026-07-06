@@ -1255,6 +1255,26 @@ pub fn compact_no_lock(index_path: &Path, verbose: bool) -> Result<CompactOutcom
     })
 }
 
+/// Consult the index config and rebaseline (via [`compact_no_lock`]) when the
+/// post-update divergence in `stats` crosses the configured thresholds. The
+/// caller MUST already hold the index lock (this folds in-place under it).
+/// Returns `Ok(None)` when compaction isn't warranted or is disabled.
+pub fn maybe_auto_compact(
+    index_path: &Path,
+    stats: &UpdateStats,
+    verbose: bool,
+) -> Result<Option<CompactOutcome>> {
+    let cfg = crate::config::load(index_path);
+    if cfg
+        .compaction
+        .should_compact(stats.main_docs, stats.delta_docs, stats.tombstones)
+    {
+        Ok(Some(compact_no_lock(index_path, verbose)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn build(
     root: &Path,
     output: &Path,
