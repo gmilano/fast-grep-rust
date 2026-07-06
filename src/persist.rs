@@ -941,6 +941,262 @@ fn remove_ci_files(output: &Path) {
     }
 }
 
+// --- Compaction (rebaseline: fold delta + drop tombstones) ---
+
+pub struct CompactStats {
+    /// Live docs in the new baseline (main survivors + live delta).
+    pub live_docs: usize,
+    /// Docs dropped (tombstoned main + deleted delta).
+    pub dropped_docs: usize,
+    /// Trigrams in the compacted case-sensitive store.
+    pub num_ngrams: usize,
+}
+
+/// Read one `(hash, offset, len)` lookup entry from a raw mmap'd lookup table.
+#[inline]
+fn lookup_entry_at(data: &[u8], i: usize) -> (u32, u64, u32) {
+    let base = i * LOOKUP_ENTRY_SIZE;
+    (
+        read_u32_le(data, base),
+        read_u64_le(data, base + 4),
+        read_u32_le(data, base + 12),
+    )
+}
+
+/// Decode a compact posting blob and remap its doc_ids to the dense new space,
+/// dropping deleted docs (`remap[old] == u32::MAX`). Input is sorted by
+/// (doc_id, line); a monotonic remap keeps the output sorted.
+fn remap_postings(bytes: &[u8], remap: &[u32]) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    for (doc_id, line_no, byte_offset) in PostingReader::new(bytes) {
+        let new = remap[doc_id as usize];
+        if new != u32::MAX {
+            out.push((new, line_no, byte_offset));
+        }
+    }
+    out
+}
+
+/// Write a `(hash, offset, len)` lookup table to `path`.
+fn write_lookup_file(path: &Path, entries: &[(u32, u64, u32)]) -> Result<()> {
+    let mut f = BufWriter::new(File::create(path)?);
+    for (hash, off, len) in entries {
+        f.write_u32::<LittleEndian>(*hash)?;
+        f.write_u64::<LittleEndian>(*off)?;
+        f.write_u32::<LittleEndian>(*len)?;
+    }
+    f.flush()?;
+    Ok(())
+}
+
+/// Stream-merge one trigram store (CS or CI) from its main + delta postings into
+/// a fresh, dense baseline under `out_dir`, writing the four `{prefix}.*` files.
+/// Returns the trigram count. Holds at most one trigram's postings in memory.
+#[allow(clippy::too_many_arguments)]
+fn write_compacted_store(
+    out_dir: &Path,
+    prefix: &str,
+    main_lookup: &[u8],
+    main_count: usize,
+    main_postings: &[u8],
+    delta_lookup: &[LookupEntry],
+    delta_postings: &[u8],
+    remap: &[u32],
+) -> Result<usize> {
+    let postings_path = out_dir.join(format!("{prefix}.postings"));
+    let mut pf = BufWriter::new(File::create(&postings_path)?);
+    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut poff: u64 = 0;
+
+    let bitmaps_path = out_dir.join(format!("{prefix}.bitmaps"));
+    let mut bf = BufWriter::new(File::create(&bitmaps_path)?);
+    let mut bm_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut boff: u64 = 0;
+
+    // Merge-join the two hash-sorted lookups. On an equal hash we take main
+    // first, then delta — main's remapped ids are all below delta's, so the
+    // concatenation stays globally sorted.
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < main_count || j < delta_lookup.len() {
+        let hmain = (i < main_count).then(|| lookup_entry_at(main_lookup, i));
+        let hdelta = (j < delta_lookup.len()).then(|| &delta_lookup[j]);
+
+        let (take_main, take_delta) = match (hmain, hdelta) {
+            (Some(m), Some(d)) => match m.0.cmp(&d.hash) {
+                std::cmp::Ordering::Less => (true, false),
+                std::cmp::Ordering::Greater => (false, true),
+                std::cmp::Ordering::Equal => (true, true),
+            },
+            (Some(_), None) => (true, false),
+            (None, Some(_)) => (false, true),
+            (None, None) => unreachable!(),
+        };
+        let hash = if take_main {
+            hmain.unwrap().0
+        } else {
+            hdelta.unwrap().hash
+        };
+
+        let mut combined: Vec<(u32, u32, u32)> = Vec::new();
+        if take_main {
+            let (_, off, len) = hmain.unwrap();
+            let (s, e) = (off as usize, off as usize + len as usize);
+            combined.extend(remap_postings(&main_postings[s..e], remap));
+            i += 1;
+        }
+        if take_delta {
+            let d = hdelta.unwrap();
+            let (s, e) = (d.offset as usize, d.offset as usize + d.len as usize);
+            combined.extend(remap_postings(&delta_postings[s..e], remap));
+            j += 1;
+        }
+        // Trigram present only in dropped docs → omit it entirely.
+        if combined.is_empty() {
+            continue;
+        }
+
+        let mut buf = Vec::with_capacity(combined.len() * 3);
+        let mut w = PostingWriter::new();
+        for &(doc_id, line_no, byte_offset) in &combined {
+            w.push(&mut buf, doc_id, line_no, byte_offset);
+        }
+        pf.write_all(&buf)?;
+        lookup_entries.push((hash, poff, buf.len() as u32));
+        poff += buf.len() as u64;
+
+        let mut bitmap = RoaringBitmap::new();
+        for &(doc_id, _, _) in &combined {
+            bitmap.insert(doc_id);
+        }
+        let mut bm_buf = Vec::new();
+        bitmap.serialize_into(&mut bm_buf)?;
+        bf.write_all(&bm_buf)?;
+        bm_entries.push((hash, boff, bm_buf.len() as u32));
+        boff += bm_buf.len() as u64;
+    }
+    pf.flush()?;
+    bf.flush()?;
+
+    write_lookup_file(&out_dir.join(format!("{prefix}.lookup")), &lookup_entries)?;
+    write_lookup_file(
+        &out_dir.join(format!("{prefix}.bitmaps.lookup")),
+        &bm_entries,
+    )?;
+    Ok(lookup_entries.len())
+}
+
+/// Fold `pidx`'s delta and tombstones into a fresh, dense baseline written into
+/// `out_dir`. Pure with respect to the live index: it does not touch `current`,
+/// reclaim slots, or re-read any source file — it only remaps and re-encodes the
+/// postings already in `pidx`. The atomic slot swap is layered on top separately.
+pub fn compact_into(pidx: &PersistentIndex, out_dir: &Path) -> Result<CompactStats> {
+    fs::create_dir_all(out_dir).context("creating compaction output dir")?;
+
+    // Dense remap: walk old ids in order (main before delta), skip deleted,
+    // assign sequential new ids. Live main ids land below live delta ids.
+    let total = pidx.num_docs();
+    let mut remap = vec![u32::MAX; total];
+    let mut new_paths: Vec<PathBuf> = Vec::new();
+    for old in 0..total as u32 {
+        if pidx.deleted_docs.contains(&old) {
+            continue;
+        }
+        let path = pidx
+            .doc_path(old)
+            .ok_or_else(|| anyhow::anyhow!("compaction: missing path for doc {old}"))?
+            .to_path_buf();
+        remap[old as usize] = new_paths.len() as u32;
+        new_paths.push(path);
+    }
+    let live_docs = new_paths.len();
+
+    // Case-sensitive store.
+    let num_ngrams = write_compacted_store(
+        out_dir,
+        "ngrams",
+        &pidx.lookup_mmap,
+        pidx.lookup_count,
+        &pidx.postings_mmap,
+        &pidx.delta_lookup,
+        &pidx.delta_postings,
+        &remap,
+    )?;
+
+    // Case-insensitive companion, in lockstep with the same remap.
+    if pidx.has_ci() {
+        write_compacted_store(
+            out_dir,
+            "ngrams.ci",
+            pidx.lookup_ci_mmap.as_ref().unwrap(),
+            pidx.lookup_ci_count,
+            pidx.postings_ci_mmap.as_ref().unwrap(),
+            &pidx.delta_lookup_ci,
+            &pidx.delta_postings_ci,
+            &remap,
+        )?;
+    } else {
+        remove_ci_files(out_dir);
+    }
+
+    // Dense docids.
+    let mut docids_file = BufWriter::new(File::create(out_dir.join("docids.bin"))?);
+    for path in &new_paths {
+        let bytes = path.to_string_lossy();
+        let bytes = bytes.as_bytes();
+        docids_file.write_u16::<LittleEndian>(bytes.len() as u16)?;
+        docids_file.write_all(bytes)?;
+    }
+    docids_file.flush()?;
+
+    // Carry forward mtimes for survivors only — compaction reuses existing
+    // postings, so the recorded mtime must match the indexed content, not a
+    // fresh stat. A file changed since it was indexed keeps its old mtime here
+    // and gets picked up by the next stale check / update.
+    let survivors: HashSet<String> = new_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let file_mtimes: HashMap<String, u64> = pidx
+        .meta
+        .file_mtimes
+        .iter()
+        .filter(|(p, _)| survivors.contains(*p))
+        .map(|(p, m)| (p.clone(), *m))
+        .collect();
+
+    let meta = IndexMeta {
+        version: INDEX_VERSION,
+        num_docs: live_docs,
+        num_ngrams,
+        root_dir: pidx.meta.root_dir.clone(),
+        built_at: chrono_now(),
+        file_mtimes,
+        dir_mtimes: pidx.meta.dir_mtimes.clone(),
+        main_num_docs: Some(live_docs),
+        case_insensitive: pidx.has_ci(),
+    };
+    fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
+
+    // A compacted baseline has no delta/deleted overlay.
+    for f in [
+        "delta.postings",
+        "delta.lookup",
+        "delta.docids",
+        "deleted.bin",
+    ] {
+        let _ = fs::remove_file(out_dir.join(f));
+    }
+
+    Ok(CompactStats {
+        live_docs,
+        dropped_docs: total - live_docs,
+        num_ngrams,
+    })
+}
+
 pub fn build(
     root: &Path,
     output: &Path,

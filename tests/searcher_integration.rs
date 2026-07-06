@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use fast_grep::persist::{
-    build as build_index, load as load_index, update_incremental, PersistentIndex,
+    build as build_index, compact_into, load as load_index, update_incremental, PersistentIndex,
 };
 use fast_grep::searcher::{search_full_scan, search_persistent_timed, Match};
 
@@ -86,6 +86,17 @@ fn search(index: &PersistentIndex, pattern: &str) -> Vec<Match> {
     search_persistent_timed(index, pattern, None, false, &[], &[], &[])
         .expect("search")
         .0
+}
+
+/// Sorted `path:line` hits for a pattern — used to compare two indexes for
+/// exact search-result equivalence.
+fn hitset(index: &PersistentIndex, pattern: &str) -> Vec<String> {
+    let mut v: Vec<String> = search(index, pattern)
+        .iter()
+        .map(|m| format!("{}:{}", m.path.display(), m.line_number))
+        .collect();
+    v.sort();
+    v
 }
 
 #[test]
@@ -312,4 +323,148 @@ fn update_writes_delta_into_slot() {
         search(&idx, "express").is_empty(),
         "deleted file's content gone"
     );
+}
+
+/// A compacted baseline (delta folded, tombstones dropped, doc_ids densified)
+/// answers every query identically to a full rebuild of the same on-disk state.
+#[test]
+fn compaction_matches_full_rebuild() {
+    let tmp = setup_test_dir();
+    // Keep all index dirs OUTSIDE the corpus, so a rebuild walking the corpus
+    // never picks up a sibling index's files as documents.
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("cmp");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+
+    // Mutate the corpus: add, modify (bump mtime so it's detected), delete.
+    fs::write(
+        tmp.path().join("added.ts"),
+        "export const zetaMarker = 42;\nfunction addedHelper() {}\n",
+    )
+    .unwrap();
+    let modpath = tmp.path().join("utils.ts");
+    fs::write(
+        &modpath,
+        "export function newlyModifiedFn() { return 7; }\n",
+    )
+    .unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&modpath).unwrap();
+    f.set_modified(SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+    fs::remove_file(tmp.path().join("server.ts")).unwrap();
+
+    // Update → delta + tombstones present.
+    update_incremental(&idx_dir, tmp.path(), false).unwrap();
+    let pidx = load_index(&idx_dir).unwrap();
+    assert!(
+        idx_dir.join("slot-a/delta.postings").exists(),
+        "precondition: delta present before compaction"
+    );
+
+    // Compact into a standalone flat dir (no `current` → loads as flat).
+    let comp_dir = idxtmp.path().join("compacted");
+    let stats = compact_into(&pidx, &comp_dir).expect("compact");
+    drop(pidx);
+    assert!(
+        !comp_dir.join("delta.postings").exists(),
+        "no delta overlay"
+    );
+    assert!(!comp_dir.join("deleted.bin").exists(), "no tombstones");
+
+    // Full rebuild of the current on-disk state, for reference.
+    let rb_dir = idxtmp.path().join("rebuild");
+    build_index(tmp.path(), &rb_dir, true, &[], false, false).unwrap();
+
+    let comp = load_index(&comp_dir).unwrap();
+    let rb = load_index(&rb_dir).unwrap();
+    assert_eq!(
+        stats.live_docs,
+        rb.num_docs(),
+        "same live doc count (compact={} rebuild={})",
+        stats.live_docs,
+        rb.num_docs()
+    );
+
+    for p in [
+        "function",
+        "zetaMarker",
+        "newlyModifiedFn",
+        "addedHelper",
+        "export",
+        "import",
+        "Hello",
+        "const",
+        "return",
+        "localhost",
+    ] {
+        assert_eq!(
+            hitset(&comp, p),
+            hitset(&rb, p),
+            "compacted vs rebuild mismatch for '{p}'"
+        );
+    }
+    // Deleted-file and modified-away content is gone in the compacted baseline.
+    assert!(hitset(&comp, "express").is_empty(), "deleted file gone");
+    assert!(hitset(&comp, "capitalize").is_empty(), "old content gone");
+}
+
+/// Compaction folds the case-insensitive companion (`ngrams.ci.*`) in lockstep,
+/// so `(?i)` queries on a compacted CI index match a CI rebuild.
+#[test]
+fn compaction_matches_full_rebuild_case_insensitive() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("cmp");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true).unwrap();
+
+    // Add mixed-case content, modify, delete.
+    fs::write(
+        tmp.path().join("added.ts"),
+        "const ZetaMARKER = 1;\nfunction MixedCaseHelper() {}\n",
+    )
+    .unwrap();
+    let modpath = tmp.path().join("app.ts");
+    fs::write(&modpath, "export function ReNamedThing() { return 1; }\n").unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&modpath).unwrap();
+    f.set_modified(SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+    fs::remove_file(tmp.path().join("server.ts")).unwrap();
+
+    update_incremental(&idx_dir, tmp.path(), false).unwrap();
+    let pidx = load_index(&idx_dir).unwrap();
+    assert!(pidx.has_ci(), "precondition: CI companion present");
+
+    let comp_dir = idxtmp.path().join("compacted");
+    compact_into(&pidx, &comp_dir).expect("compact");
+    drop(pidx);
+    assert!(
+        comp_dir.join("ngrams.ci.postings").exists(),
+        "CI store folded into compacted baseline"
+    );
+
+    let rb_dir = idxtmp.path().join("rebuild");
+    build_index(tmp.path(), &rb_dir, true, &[], false, true).unwrap();
+
+    let comp = load_index(&comp_dir).unwrap();
+    let rb = load_index(&rb_dir).unwrap();
+    assert!(comp.has_ci());
+
+    // Case-insensitive queries (mixed case in the pattern) must match a rebuild.
+    for p in [
+        "(?i)zetamarker",
+        "(?i)mixedcasehelper",
+        "(?i)renamedthing",
+        "(?i)FUNCTION",
+        "(?i)EXPORT",
+    ] {
+        assert_eq!(
+            hitset(&comp, p),
+            hitset(&rb, p),
+            "compacted vs rebuild (CI) mismatch for '{p}'"
+        );
+    }
+    // Deleted content gone even case-insensitively.
+    assert!(hitset(&comp, "(?i)EXPRESS").is_empty(), "deleted file gone");
 }
