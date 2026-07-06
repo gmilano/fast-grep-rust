@@ -1210,13 +1210,16 @@ pub struct CompactOutcome {
 /// (`compacted = false`) when there is no delta and no tombstone to fold.
 pub fn compact(index_path: &Path, verbose: bool) -> Result<CompactOutcome> {
     let (_lock, _waited) = acquire_index_lock(index_path)?;
-    // Do the work in an inner fn so the lock is released on every path.
-    let result = compact_locked(index_path, verbose);
+    // Release the lock on every path (the index lock is not reentrant).
+    let result = compact_no_lock(index_path, verbose);
     release_index_lock(index_path);
     result
 }
 
-fn compact_locked(index_path: &Path, verbose: bool) -> Result<CompactOutcome> {
+/// Same as [`compact`] but WITHOUT acquiring the index lock — for callers that
+/// already hold it (`fgr update`'s auto-compaction, the daemon). The lock is not
+/// reentrant, so calling [`compact`] while holding it would deadlock.
+pub fn compact_no_lock(index_path: &Path, verbose: bool) -> Result<CompactOutcome> {
     let pidx = load(index_path)?;
 
     // Already dense and delta-free → nothing to do.
@@ -1639,6 +1642,15 @@ pub struct UpdateStats {
     pub deleted: usize,
     pub unchanged: usize,
     pub duration_ms: u64,
+    /// Post-update divergence, for the auto-compaction decision (see
+    /// `CompactionConfig::should_compact`). `main_docs` is the baseline size,
+    /// `delta_docs` the live delta count, `tombstones` the deleted-baseline
+    /// count. The no-change early return leaves these at 0 (nothing new to
+    /// fold — accumulated delta is handled by `fgr compact` / the next real
+    /// update).
+    pub main_docs: usize,
+    pub delta_docs: usize,
+    pub tombstones: usize,
 }
 
 /// Express the index directory in the *walk's* path space so `starts_with`
@@ -1746,6 +1758,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             deleted: 0,
             unchanged: saved_mtimes.len(),
             duration_ms: start.elapsed().as_millis() as u64,
+            main_docs: main_num_docs,
+            delta_docs: 0,
+            tombstones: 0,
         });
     }
 
@@ -2012,6 +2027,9 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         deleted: deleted_set.len(),
         unchanged,
         duration_ms: start.elapsed().as_millis() as u64,
+        main_docs: main_num_docs,
+        delta_docs: delta_doc_ids.len(),
+        tombstones: main_deleted.len(),
     })
 }
 

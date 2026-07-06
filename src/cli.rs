@@ -232,7 +232,13 @@ pub enum Commands {
     /// Incrementally update an existing index. Index dir from the global
     /// `--index` flag (default `.fgr`).
     #[command(name = "update")]
-    Update { dir: Option<PathBuf> },
+    Update {
+        dir: Option<PathBuf>,
+        /// Skip the automatic rebaseline even if divergence crosses the
+        /// configured threshold (see config.toml `[compaction]`).
+        #[arg(long = "no-compact")]
+        no_compact: bool,
+    },
     /// Show index statistics. Index dir from the global `--index` flag
     /// (default `.fgr`).
     #[command(name = "stats")]
@@ -767,7 +773,7 @@ fn run_subcommand(
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, hidden, type_filter)?;
         }
-        Commands::Update { dir } => {
+        Commands::Update { dir, no_compact } => {
             let idx_path = idx_arg();
             let root = if let Some(d) = dir {
                 d
@@ -787,7 +793,27 @@ fn run_subcommand(
                 }
             }
             let stats = persist::update_incremental(&idx_path, &root, true)?;
+
+            // Auto-rebaseline while we still hold the lock, if the config's
+            // thresholds say divergence is high enough. Runs the no-lock
+            // compaction (the lock is not reentrant); the cost is paid by this
+            // updater, never by a search. `--no-compact` opts out per run.
+            let compaction = if no_compact {
+                None
+            } else {
+                let cfg = crate::config::load(&idx_path);
+                if cfg.compaction.should_compact(
+                    stats.main_docs,
+                    stats.delta_docs,
+                    stats.tombstones,
+                ) {
+                    Some(persist::compact_no_lock(&idx_path, false)?)
+                } else {
+                    None
+                }
+            };
             persist::release_index_lock(&idx_path);
+
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
@@ -795,6 +821,14 @@ fn run_subcommand(
                     "Updated index: +{} added, {} modified, {} deleted (unchanged: {}) in {}ms",
                     stats.added, stats.modified, stats.deleted, stats.unchanged, stats.duration_ms
                 );
+            }
+            if let Some(out) = compaction {
+                if let Some(s) = out.stats {
+                    eprintln!(
+                        "Auto-compacted: {} live docs, {} dropped, {} trigrams",
+                        s.live_docs, s.dropped_docs, s.num_ngrams
+                    );
+                }
             }
         }
         Commands::Stats => {

@@ -563,3 +563,70 @@ fn config_written_on_build_and_survives_mutations() {
     assert!(!cfg.compaction.auto, "user edit preserved");
     assert_eq!(cfg.compaction.delta_docs_abs, 7, "user edit preserved");
 }
+
+fn current_slot(idx_dir: &Path) -> String {
+    fs::read_to_string(idx_dir.join("current"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn run_fgr_update(idx_dir: &Path, extra: &[&str]) {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgr"))
+        .arg("update")
+        .arg("--index")
+        .arg(idx_dir)
+        .args(extra)
+        .status()
+        .expect("run fgr update");
+    assert!(status.success(), "fgr update exited with {status}");
+}
+
+/// `fgr update` auto-compacts once divergence crosses the config threshold, and
+/// `--no-compact` opts out of that for a single run.
+#[test]
+fn update_auto_compacts_past_threshold() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+    // Aggressive thresholds so a single added file trips the auto-compaction.
+    fs::write(
+        idx_dir.join("config.toml"),
+        "[compaction]\nauto = true\ndelta_docs_abs = 1\nmin_main_docs = 0\n",
+    )
+    .unwrap();
+    assert_eq!(current_slot(&idx_dir), "slot-a");
+
+    // Add a file, then `fgr update` → auto-compaction should fire and swap slot.
+    fs::write(tmp.path().join("newfile.ts"), "const autoCompactMe = 1;\n").unwrap();
+    run_fgr_update(&idx_dir, &[]);
+    assert_eq!(
+        current_slot(&idx_dir),
+        "slot-b",
+        "auto-compaction swapped the slot"
+    );
+    assert!(
+        !idx_dir.join("slot-b/delta.postings").exists(),
+        "delta folded away"
+    );
+    let idx = load_index(&idx_dir).unwrap();
+    assert!(
+        !search(&idx, "autoCompactMe").is_empty(),
+        "added content searchable after auto-compact"
+    );
+    drop(idx);
+
+    // With --no-compact, a further change updates the delta but must NOT swap.
+    fs::write(tmp.path().join("newfile2.ts"), "const secondFile = 2;\n").unwrap();
+    run_fgr_update(&idx_dir, &["--no-compact"]);
+    assert_eq!(
+        current_slot(&idx_dir),
+        "slot-b",
+        "--no-compact left the slot in place"
+    );
+    assert!(
+        idx_dir.join("slot-b/delta.postings").exists(),
+        "delta present, not folded"
+    );
+}
