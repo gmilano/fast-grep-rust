@@ -25,13 +25,17 @@ primary — cheaply, and without disturbing concurrent searches.
 A full `fgr index` re-reads and re-trigrams every file (I/O-bound; on Windows
 also Defender-bound) and peaks memory building the whole map. Compaction instead
 **reuses the postings already on disk** — it only remaps doc-ids and re-encodes
-integers, in parallel across trigrams. Measured on the 79K-file Linux kernel
-(2.8 GB of postings, 28 cores):
+integers, in parallel across trigrams, overlapping the encode with the file
+writes. Measured on the 79K-file Linux kernel (2.8 GB of postings, 28 cores):
 
 | Operation | Time |
 |---|---|
 | Full rebuild (`fgr index`) | ~183 s |
-| Compaction (`fgr compact`) | **~9 s** (~20× faster) |
+| Compaction (`fgr compact`) | **~3 s** (~60× faster) |
+
+Phase split (via `FGR_TIMING=1`): parallel encode ≈ 1.5 s, file write ≈ 2.1 s
+(overlapped with the encode; ~1.4 GB/s — the disk's sequential write speed, i.e.
+the hard floor for rewriting a 2.8 GB baseline).
 
 ## Two-slot layout + `current` pointer
 
@@ -63,10 +67,17 @@ falls back to it, so pre-slot indexes keep working without a rebuild.
    the delta postings, remap; concatenate (primary-remapped ids are all below
    delta-remapped ids, so the result stays globally sorted); re-encode and
    rebuild the Roaring bitmap. Trigrams left empty after dropping tombstones are
-   omitted. This per-trigram work runs **in parallel** (rayon) in bounded chunks
-   — order-preserving, so the lookup tables stay hash-sorted — while the ~2.8 GB
-   of encoded postings are written serially in hash order (the remaining
-   bottleneck, which is why the speedup is sub-linear in core count).
+   omitted. This per-trigram work runs **in parallel** (rayon) in bounded
+   chunks — order-preserving, so the lookup tables stay hash-sorted — and is
+   decode→encode **streaming** (no intermediate tuple list is materialized;
+   the bitmap gets one insert per doc run, not per line). A dedicated writer
+   thread drains a small bounded channel, so the hash-order file write overlaps
+   the encode: total ≈ max(encode, write) instead of their sum, and the write
+   runs at the disk's sequential speed. Parallelizing the write itself would
+   not help — trigram offsets depend on all previous sizes (so positional
+   parallel writes need either the whole 2.8 GB in RAM or per-chunk temp files
+   plus a serial concat), and N threads writing one file don't make the disk
+   faster than saturated sequential streaming.
 3. The case-insensitive companion (`ngrams.ci.*`) folds in lockstep with the
    same remap.
 4. `docids.bin` is rewritten in the dense order; `meta.json` gets

@@ -184,10 +184,10 @@ diverges the delta grows and every query pays a small, growing overhead.
 
 **Compaction** folds the delta and drops the tombstones back into a fresh, dense
 primary baseline. It reuses the existing postings (no re-reading or
-re-trigramming of source files) and re-encodes them in parallel, so it is
-**far faster than a full rebuild** (~9s vs ~183s on the 79K-file Linux kernel).
-The swap is atomic and never blocks in-flight searches (see
-[REBASELINE.md](REBASELINE.md) for the design).
+re-trigramming of source files), re-encodes them in parallel, and overlaps the
+encode with the file writes, so it is **far faster than a full rebuild** (~3s vs
+~183s on the 79K-file Linux kernel). The swap is atomic and never blocks
+in-flight searches (see [REBASELINE.md](REBASELINE.md) for the design).
 
 - **Manual:** `fgr compact --index .fgr` always folds whatever is pending.
 - **Automatic:** `fgr update` and the daemon rebaseline on their own once

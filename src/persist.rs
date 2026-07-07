@@ -963,20 +963,6 @@ fn lookup_entry_at(data: &[u8], i: usize) -> (u32, u64, u32) {
     )
 }
 
-/// Decode a compact posting blob and remap its doc_ids to the dense new space,
-/// dropping deleted docs (`remap[old] == u32::MAX`). Input is sorted by
-/// (doc_id, line); a monotonic remap keeps the output sorted.
-fn remap_postings(bytes: &[u8], remap: &[u32]) -> Vec<(u32, u32, u32)> {
-    let mut out = Vec::new();
-    for (doc_id, line_no, byte_offset) in PostingReader::new(bytes) {
-        let new = remap[doc_id as usize];
-        if new != u32::MAX {
-            out.push((new, line_no, byte_offset));
-        }
-    }
-    out
-}
-
 /// Write a `(hash, offset, len)` lookup table to `path`.
 fn write_lookup_file(path: &Path, entries: &[(u32, u64, u32)]) -> Result<()> {
     let mut f = BufWriter::new(File::create(path)?);
@@ -1043,44 +1029,88 @@ fn write_compacted_store(
     }
 
     // 2. Encode postings + build bitmaps in parallel (each trigram is
-    //    independent), chunked so peak memory stays bounded, then write each
-    //    chunk serially in hash order. rayon's collect preserves input order,
-    //    so the lookup tables stay hash-sorted. This is the compaction hot path.
+    //    independent) in bounded chunks, OVERLAPPED with the file writes: a
+    //    dedicated writer thread drains a small bounded channel while the rayon
+    //    pool encodes the next chunk. Chunks arrive in hash order (FIFO) and
+    //    rayon's collect preserves input order, so the lookup tables stay
+    //    hash-sorted. Total time ≈ max(encode, write) instead of their sum.
+    let timing = std::env::var_os("FGR_TIMING").is_some();
     let postings_path = out_dir.join(format!("{prefix}.postings"));
-    let mut pf = BufWriter::new(File::create(&postings_path)?);
     let bitmaps_path = out_dir.join(format!("{prefix}.bitmaps"));
-    let mut bf = BufWriter::new(File::create(&bitmaps_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(items.len());
-    let mut bm_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(items.len());
-    let mut poff: u64 = 0;
-    let mut boff: u64 = 0;
 
-    // ~16K trigrams/chunk keeps each batch's encoded output in the low hundreds
-    // of MB even on a huge index.
-    const CHUNK: usize = 16_384;
+    // ~8K trigrams/chunk bounds peak memory (≤ ~4 chunks in flight) while
+    // keeping every core busy within a chunk.
+    const CHUNK: usize = 8_192;
+    type Encoded = Vec<(u32, Vec<u8>, Vec<u8>)>;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Encoded>(2);
+
+    type WriterOut = (Vec<(u32, u64, u32)>, Vec<(u32, u64, u32)>, Duration);
+    let writer: std::thread::JoinHandle<Result<WriterOut>> = std::thread::spawn(move || {
+        let mut pf = BufWriter::with_capacity(8 << 20, File::create(&postings_path)?);
+        let mut bf = BufWriter::with_capacity(8 << 20, File::create(&bitmaps_path)?);
+        let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+        let mut bm_entries: Vec<(u32, u64, u32)> = Vec::new();
+        let (mut poff, mut boff) = (0u64, 0u64);
+        let mut t_write = Duration::ZERO;
+        while let Ok(chunk) = rx.recv() {
+            let t0 = Instant::now();
+            for (hash, buf, bm_buf) in chunk {
+                pf.write_all(&buf)?;
+                lookup_entries.push((hash, poff, buf.len() as u32));
+                poff += buf.len() as u64;
+                bf.write_all(&bm_buf)?;
+                bm_entries.push((hash, boff, bm_buf.len() as u32));
+                boff += bm_buf.len() as u64;
+            }
+            t_write += t0.elapsed();
+        }
+        let t0 = Instant::now();
+        pf.flush()?;
+        bf.flush()?;
+        t_write += t0.elapsed();
+        Ok((lookup_entries, bm_entries, t_write))
+    });
+
+    let mut t_encode = Duration::ZERO;
+    let mut t_send = Duration::ZERO;
     for chunk in items.chunks(CHUNK) {
-        let encoded: Vec<(u32, Vec<u8>, Vec<u8>)> = chunk
+        let t0 = Instant::now();
+        let encoded: Encoded = chunk
             .par_iter()
             .filter_map(|&(hash, mr, dr)| {
-                let mut combined: Vec<(u32, u32, u32)> = Vec::new();
+                // Stream decode → remap → re-encode without materializing the
+                // combined tuple list. Source blob sizes bound the output size
+                // (remapped ids only get smaller). Main is pushed before delta,
+                // so the stream stays globally sorted.
+                let cap = mr.map_or(0, |(s, e)| e - s) + dr.map_or(0, |(s, e)| e - s);
+                let mut buf = Vec::with_capacity(cap);
+                let mut w = PostingWriter::new();
+                let mut bitmap = RoaringBitmap::new();
+                let mut last_doc = u32::MAX;
+                let mut encode_range = |bytes: &[u8], buf: &mut Vec<u8>| {
+                    for (doc_id, line_no, byte_offset) in PostingReader::new(bytes) {
+                        let nd = remap[doc_id as usize];
+                        if nd == u32::MAX {
+                            continue;
+                        }
+                        w.push(buf, nd, line_no, byte_offset);
+                        // Postings are doc-sorted: insert once per doc run
+                        // instead of once per line.
+                        if nd != last_doc {
+                            bitmap.insert(nd);
+                            last_doc = nd;
+                        }
+                    }
+                };
                 if let Some((s, e)) = mr {
-                    combined.extend(remap_postings(&main_postings[s..e], remap));
+                    encode_range(&main_postings[s..e], &mut buf);
                 }
                 if let Some((s, e)) = dr {
-                    combined.extend(remap_postings(&delta_postings[s..e], remap));
+                    encode_range(&delta_postings[s..e], &mut buf);
                 }
                 // Trigram present only in dropped docs → omit it entirely.
-                if combined.is_empty() {
+                if buf.is_empty() {
                     return None;
-                }
-                let mut buf = Vec::with_capacity(combined.len() * 3);
-                let mut w = PostingWriter::new();
-                for &(doc_id, line_no, byte_offset) in &combined {
-                    w.push(&mut buf, doc_id, line_no, byte_offset);
-                }
-                let mut bitmap = RoaringBitmap::new();
-                for &(doc_id, _, _) in &combined {
-                    bitmap.insert(doc_id);
                 }
                 let mut bm_buf = Vec::new();
                 bitmap
@@ -1089,18 +1119,28 @@ fn write_compacted_store(
                 Some((hash, buf, bm_buf))
             })
             .collect();
+        t_encode += t0.elapsed();
 
-        for (hash, buf, bm_buf) in encoded {
-            pf.write_all(&buf)?;
-            lookup_entries.push((hash, poff, buf.len() as u32));
-            poff += buf.len() as u64;
-            bf.write_all(&bm_buf)?;
-            bm_entries.push((hash, boff, bm_buf.len() as u32));
-            boff += bm_buf.len() as u64;
+        let t0 = Instant::now();
+        if tx.send(encoded).is_err() {
+            break; // writer died; join below surfaces its error
         }
+        t_send += t0.elapsed();
     }
-    pf.flush()?;
-    bf.flush()?;
+    drop(tx);
+    let (lookup_entries, bm_entries, t_write) = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("compaction writer thread panicked"))??;
+
+    if timing {
+        eprintln!(
+            "[timing] {prefix}: encode={:.2}s send-wait={:.2}s write-thread={:.2}s trigrams={}",
+            t_encode.as_secs_f64(),
+            t_send.as_secs_f64(),
+            t_write.as_secs_f64(),
+            lookup_entries.len()
+        );
+    }
 
     write_lookup_file(&out_dir.join(format!("{prefix}.lookup")), &lookup_entries)?;
     write_lookup_file(
