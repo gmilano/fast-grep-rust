@@ -989,9 +989,10 @@ fn write_lookup_file(path: &Path, entries: &[(u32, u64, u32)]) -> Result<()> {
     Ok(())
 }
 
-/// Stream-merge one trigram store (CS or CI) from its main + delta postings into
-/// a fresh, dense baseline under `out_dir`, writing the four `{prefix}.*` files.
-/// Returns the trigram count. Holds at most one trigram's postings in memory.
+/// Merge one trigram store (CS or CI) from its main + delta postings into a
+/// fresh, dense baseline under `out_dir`, writing the four `{prefix}.*` files.
+/// Returns the trigram count. Encodes trigrams in parallel in bounded chunks and
+/// writes them serially in hash order.
 #[allow(clippy::too_many_arguments)]
 fn write_compacted_store(
     out_dir: &Path,
@@ -1003,24 +1004,16 @@ fn write_compacted_store(
     delta_postings: &[u8],
     remap: &[u32],
 ) -> Result<usize> {
-    let postings_path = out_dir.join(format!("{prefix}.postings"));
-    let mut pf = BufWriter::new(File::create(&postings_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut poff: u64 = 0;
-
-    let bitmaps_path = out_dir.join(format!("{prefix}.bitmaps"));
-    let mut bf = BufWriter::new(File::create(&bitmaps_path)?);
-    let mut bm_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut boff: u64 = 0;
-
-    // Merge-join the two hash-sorted lookups. On an equal hash we take main
-    // first, then delta — main's remapped ids are all below delta's, so the
-    // concatenation stays globally sorted.
+    // 1. Build the hash-ordered merge-join work list: per trigram, its byte
+    //    range in the main postings and/or the delta postings. On an equal hash
+    //    we take main then delta — main's remapped ids are all below delta's, so
+    //    the concatenation stays globally sorted. Cheap and serial.
+    type Ranges = (u32, Option<(usize, usize)>, Option<(usize, usize)>);
+    let mut items: Vec<Ranges> = Vec::with_capacity(main_count + delta_lookup.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < main_count || j < delta_lookup.len() {
         let hmain = (i < main_count).then(|| lookup_entry_at(main_lookup, i));
         let hdelta = (j < delta_lookup.len()).then(|| &delta_lookup[j]);
-
         let (take_main, take_delta) = match (hmain, hdelta) {
             (Some(m), Some(d)) => match m.0.cmp(&d.hash) {
                 std::cmp::Ordering::Less => (true, false),
@@ -1036,43 +1029,75 @@ fn write_compacted_store(
         } else {
             hdelta.unwrap().hash
         };
-
-        let mut combined: Vec<(u32, u32, u32)> = Vec::new();
-        if take_main {
+        let mr = take_main.then(|| {
             let (_, off, len) = hmain.unwrap();
-            let (s, e) = (off as usize, off as usize + len as usize);
-            combined.extend(remap_postings(&main_postings[s..e], remap));
             i += 1;
-        }
-        if take_delta {
+            (off as usize, off as usize + len as usize)
+        });
+        let dr = take_delta.then(|| {
             let d = hdelta.unwrap();
-            let (s, e) = (d.offset as usize, d.offset as usize + d.len as usize);
-            combined.extend(remap_postings(&delta_postings[s..e], remap));
             j += 1;
-        }
-        // Trigram present only in dropped docs → omit it entirely.
-        if combined.is_empty() {
-            continue;
-        }
+            (d.offset as usize, d.offset as usize + d.len as usize)
+        });
+        items.push((hash, mr, dr));
+    }
 
-        let mut buf = Vec::with_capacity(combined.len() * 3);
-        let mut w = PostingWriter::new();
-        for &(doc_id, line_no, byte_offset) in &combined {
-            w.push(&mut buf, doc_id, line_no, byte_offset);
-        }
-        pf.write_all(&buf)?;
-        lookup_entries.push((hash, poff, buf.len() as u32));
-        poff += buf.len() as u64;
+    // 2. Encode postings + build bitmaps in parallel (each trigram is
+    //    independent), chunked so peak memory stays bounded, then write each
+    //    chunk serially in hash order. rayon's collect preserves input order,
+    //    so the lookup tables stay hash-sorted. This is the compaction hot path.
+    let postings_path = out_dir.join(format!("{prefix}.postings"));
+    let mut pf = BufWriter::new(File::create(&postings_path)?);
+    let bitmaps_path = out_dir.join(format!("{prefix}.bitmaps"));
+    let mut bf = BufWriter::new(File::create(&bitmaps_path)?);
+    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(items.len());
+    let mut bm_entries: Vec<(u32, u64, u32)> = Vec::with_capacity(items.len());
+    let mut poff: u64 = 0;
+    let mut boff: u64 = 0;
 
-        let mut bitmap = RoaringBitmap::new();
-        for &(doc_id, _, _) in &combined {
-            bitmap.insert(doc_id);
+    // ~16K trigrams/chunk keeps each batch's encoded output in the low hundreds
+    // of MB even on a huge index.
+    const CHUNK: usize = 16_384;
+    for chunk in items.chunks(CHUNK) {
+        let encoded: Vec<(u32, Vec<u8>, Vec<u8>)> = chunk
+            .par_iter()
+            .filter_map(|&(hash, mr, dr)| {
+                let mut combined: Vec<(u32, u32, u32)> = Vec::new();
+                if let Some((s, e)) = mr {
+                    combined.extend(remap_postings(&main_postings[s..e], remap));
+                }
+                if let Some((s, e)) = dr {
+                    combined.extend(remap_postings(&delta_postings[s..e], remap));
+                }
+                // Trigram present only in dropped docs → omit it entirely.
+                if combined.is_empty() {
+                    return None;
+                }
+                let mut buf = Vec::with_capacity(combined.len() * 3);
+                let mut w = PostingWriter::new();
+                for &(doc_id, line_no, byte_offset) in &combined {
+                    w.push(&mut buf, doc_id, line_no, byte_offset);
+                }
+                let mut bitmap = RoaringBitmap::new();
+                for &(doc_id, _, _) in &combined {
+                    bitmap.insert(doc_id);
+                }
+                let mut bm_buf = Vec::new();
+                bitmap
+                    .serialize_into(&mut bm_buf)
+                    .expect("serialize bitmap into Vec");
+                Some((hash, buf, bm_buf))
+            })
+            .collect();
+
+        for (hash, buf, bm_buf) in encoded {
+            pf.write_all(&buf)?;
+            lookup_entries.push((hash, poff, buf.len() as u32));
+            poff += buf.len() as u64;
+            bf.write_all(&bm_buf)?;
+            bm_entries.push((hash, boff, bm_buf.len() as u32));
+            boff += bm_buf.len() as u64;
         }
-        let mut bm_buf = Vec::new();
-        bitmap.serialize_into(&mut bm_buf)?;
-        bf.write_all(&bm_buf)?;
-        bm_entries.push((hash, boff, bm_buf.len() as u32));
-        boff += bm_buf.len() as u64;
     }
     pf.flush()?;
     bf.flush()?;

@@ -25,13 +25,13 @@ primary — cheaply, and without disturbing concurrent searches.
 A full `fgr index` re-reads and re-trigrams every file (I/O-bound; on Windows
 also Defender-bound) and peaks memory building the whole map. Compaction instead
 **reuses the postings already on disk** — it only remaps doc-ids and re-encodes
-integers, streaming one trigram at a time. Measured on the 79K-file Linux
-kernel (2.8 GB of postings):
+integers, in parallel across trigrams. Measured on the 79K-file Linux kernel
+(2.8 GB of postings, 28 cores):
 
 | Operation | Time |
 |---|---|
 | Full rebuild (`fgr index`) | ~183 s |
-| Compaction (`fgr compact`) | **~31 s** (~6× faster) |
+| Compaction (`fgr compact`) | **~9 s** (~20× faster) |
 
 ## Two-slot layout + `current` pointer
 
@@ -58,12 +58,15 @@ falls back to it, so pre-slot indexes keep working without a rebuild.
 1. **Dense remap.** Walk old doc-ids in order (all primary ids before all delta
    ids), skip tombstones, assign sequential new ids. Live primary ids land below
    live delta ids.
-2. **Per trigram (streaming merge-join over the primary + delta lookups, both
+2. **Per trigram (merge-join over the primary + delta lookups, both
    hash-sorted).** Decode the primary postings, drop tombstones, remap; decode
    the delta postings, remap; concatenate (primary-remapped ids are all below
    delta-remapped ids, so the result stays globally sorted); re-encode and
    rebuild the Roaring bitmap. Trigrams left empty after dropping tombstones are
-   omitted. Only one trigram's postings are held in memory at a time.
+   omitted. This per-trigram work runs **in parallel** (rayon) in bounded chunks
+   — order-preserving, so the lookup tables stay hash-sorted — while the ~2.8 GB
+   of encoded postings are written serially in hash order (the remaining
+   bottleneck, which is why the speedup is sub-linear in core count).
 3. The case-insensitive companion (`ngrams.ci.*`) folds in lockstep with the
    same remap.
 4. `docids.bin` is rewritten in the dense order; `meta.json` gets
@@ -107,9 +110,9 @@ One primitive, three entry points:
   thread** so the event loop keeps serving the socket. `run_update` takes the
   lock non-blockingly (`try_acquire_index_lock`): while the worker holds the
   lock for the fold, the loop simply skips the next update round and retries, so
-  only one compaction runs at a time with no extra bookkeeping. This drops the
-  worst-case daemon stall during a 31s compaction from ~30s (inline) to ~4s
-  (just the on-loop update phase).
+  only one compaction runs at a time with no extra bookkeeping. Moving the
+  multi-second compaction off the loop bounds the worst-case daemon stall by the
+  (smaller) on-loop update phase, instead of update + compaction combined.
 
 ## Configuration
 
