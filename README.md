@@ -143,7 +143,8 @@ In the meantime, `cargo install fast-grep` works on all of them.
 ## Usage
 
 Searching is the default — pass PATTERN and PATH as positional args. Other
-operations (`index`, `update`, `bench`, `stats`, `daemon`) are subcommands.
+operations (`index`, `update`, `compact`, `bench`, `stats`, `daemon`) are
+subcommands.
 
 ```bash
 # Build index (one-time, ~60s for Linux kernel)
@@ -164,12 +165,46 @@ fgr "EXPORT_SYMBOL" /path/to/codebase
 # Incrementally update an existing index after files changed
 fgr update /path/to/codebase --index .fgr
 
+# Rebaseline: fold the accumulated delta back into the primary index
+fgr compact --index .fgr
+
 # Benchmark against ripgrep
 fgr bench "static.*inline" /path/to/codebase
 
-# Index stats
+# Index stats (also shows delta / tombstone divergence + "Compaction due")
 fgr stats --index .fgr
 ```
+
+### Keeping the index fresh: delta, then rebaseline
+
+An `fgr update` doesn't rewrite the primary index — it records changed files in
+a small **delta** overlay (and tombstones the stale docs). Searches read the
+primary + delta together, so results stay correct, but as the working tree
+diverges the delta grows and every query pays a small, growing overhead.
+
+**Compaction** folds the delta and drops the tombstones back into a fresh, dense
+primary baseline. It reuses the existing postings (no re-reading or
+re-trigramming of source files), so it is **~6× faster than a full rebuild**
+(~31s vs ~183s on the 79K-file Linux kernel). The swap is atomic and never
+blocks in-flight searches (see [REBASELINE.md](REBASELINE.md) for the design).
+
+- **Manual:** `fgr compact --index .fgr` always folds whatever is pending.
+- **Automatic:** `fgr update` and the daemon rebaseline on their own once
+  divergence crosses a threshold. The thresholds live in an editable
+  `<index>/config.toml` (written with commented defaults on first build):
+
+  ```toml
+  [compaction]
+  auto = true              # set false to only ever compact via `fgr compact`
+  delta_docs_abs = 2000    # compact once the live delta exceeds this many docs
+  delta_docs_ratio = 0.10  # ...or this fraction of the baseline
+  tombstone_ratio = 0.20   # ...or once tombstones exceed this fraction of it
+  min_main_docs = 500      # never auto-compact a baseline smaller than this
+  ```
+
+  Pass `fgr update --no-compact` to skip the automatic rebaseline for one run.
+  The auto-compaction cost is paid by the updater (or the daemon, off its event
+  loop) — never by a search.
 
 ### Daemon mode (auto-incremental updates)
 

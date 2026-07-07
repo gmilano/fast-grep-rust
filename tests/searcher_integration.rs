@@ -12,8 +12,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use fast_grep::persist::{
-    build as build_index, compact, compact_into, load as load_index, update_incremental,
-    PersistentIndex,
+    acquire_index_lock, build as build_index, compact, compact_into, load as load_index,
+    release_index_lock, try_acquire_index_lock, update_incremental, PersistentIndex,
 };
 use fast_grep::searcher::{search_full_scan, search_persistent_timed, Match};
 
@@ -629,4 +629,25 @@ fn update_auto_compacts_past_threshold() {
         idx_dir.join("slot-b/delta.postings").exists(),
         "delta present, not folded"
     );
+}
+
+/// `try_acquire_index_lock` is non-blocking: it returns None while the lock is
+/// held (letting the daemon skip an update round during a background
+/// compaction) and Some once it is released.
+#[test]
+fn try_lock_is_nonblocking_when_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let idx = tmp.path();
+
+    let (_held, _waited) = acquire_index_lock(idx).unwrap();
+    assert!(
+        try_acquire_index_lock(idx).unwrap().is_none(),
+        "held → None (no wait)"
+    );
+    release_index_lock(idx);
+
+    let got = try_acquire_index_lock(idx).unwrap();
+    assert!(got.is_some(), "released → Some");
+    drop(got);
+    release_index_lock(idx);
 }

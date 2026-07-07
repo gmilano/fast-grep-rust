@@ -113,13 +113,17 @@ impl Daemon {
         if self.pending_changes.is_empty() && !self.dirty {
             return Ok(());
         }
-        let (_lock, _waited) = persist::acquire_index_lock(&self.index_path)?;
+        // Non-blocking lock: if a background compaction holds it, skip this
+        // round (keep dirty/pending) and retry on the next debounce — the event
+        // loop must never block, so it keeps answering `status` while a
+        // compaction runs and searches never stall.
+        let lock = match persist::try_acquire_index_lock(&self.index_path)? {
+            Some(l) => l,
+            None => return Ok(()),
+        };
         let stats = persist::update_incremental(&self.index_path, &self.root_dir, false)?;
-        // Auto-rebaseline under the same lock when divergence crosses the
-        // configured threshold. We are single-writer here, and this happens
-        // right after a debounced update — i.e. when the tree is quiet.
-        let compaction = persist::maybe_auto_compact(&self.index_path, &stats, false)?;
         persist::release_index_lock(&self.index_path);
+        drop(lock);
         self.pending_changes.clear();
         self.dirty = false;
         if stats.added > 0 || stats.modified > 0 || stats.deleted > 0 {
@@ -128,11 +132,29 @@ impl Daemon {
                 stats.added, stats.modified, stats.deleted, stats.duration_ms
             );
         }
-        if let Some(s) = compaction.and_then(|c| c.stats) {
-            eprintln!(
-                "[daemon] Auto-compacted: {} live docs, {} dropped, {} trigrams",
-                s.live_docs, s.dropped_docs, s.num_ngrams
-            );
+
+        // Rebaseline OFF the event loop when divergence crosses the threshold.
+        // The worker re-acquires the lock itself; since it holds the lock for
+        // the whole fold, the loop's next try-lock update simply skips until it
+        // finishes — so only one compaction runs at a time without any tracking.
+        let cfg = crate::config::load(&self.index_path);
+        if cfg
+            .compaction
+            .should_compact(stats.main_docs, stats.delta_docs, stats.tombstones)
+        {
+            let idx = self.index_path.clone();
+            eprintln!("[daemon] Divergence over threshold — compacting in background...");
+            std::thread::spawn(move || match persist::compact(&idx, false) {
+                Ok(out) => {
+                    if let Some(s) = out.stats {
+                        eprintln!(
+                            "[daemon] Auto-compacted: {} live docs, {} dropped, {} trigrams",
+                            s.live_docs, s.dropped_docs, s.num_ngrams
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[daemon] Compaction error: {}", e),
+            });
         }
         Ok(())
     }

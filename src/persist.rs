@@ -2171,6 +2171,22 @@ pub fn acquire_index_lock(idx_path: &Path) -> anyhow::Result<(fs::File, bool)> {
     }
 }
 
+/// Non-blocking variant of [`acquire_index_lock`]: returns `Ok(None)` when the
+/// lock is already held (e.g. by a background compaction) instead of waiting.
+/// Lets the daemon's event loop skip an update round rather than block.
+pub fn try_acquire_index_lock(idx_path: &Path) -> anyhow::Result<Option<fs::File>> {
+    let lock_path = idx_path.join("lock");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn release_index_lock(idx_path: &Path) {
     let _ = fs::remove_file(idx_path.join("lock"));
 }
