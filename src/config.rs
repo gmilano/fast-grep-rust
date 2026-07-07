@@ -27,9 +27,9 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # always runs regardless of these; they only gate the automatic triggers
 # (`fgr update` and the daemon).
 auto = true              # enable automatic compaction
-delta_docs_abs = 2000    # compact once the live delta exceeds this many docs
-delta_docs_ratio = 0.10  # ...or once it exceeds this fraction of the baseline
-tombstone_ratio = 0.20   # ...or once tombstones exceed this fraction of it
+delta_docs_abs = 500     # compact once the live delta exceeds this many docs
+delta_docs_ratio = 0.05  # ...or once it exceeds this fraction of the baseline
+tombstone_ratio = 0.10   # ...or once tombstones exceed this fraction of it
 min_main_docs = 500      # never auto-compact a baseline smaller than this
 ";
 
@@ -58,17 +58,27 @@ pub struct CompactionConfig {
     pub min_main_docs: usize,
 }
 
+// Default thresholds, calibrated on the 79K-file Linux kernel corpus:
+// - Every update re-reads + re-trigrams the whole carried delta (~1 ms/file),
+//   so an uncompacted delta makes ALL subsequent updates slower — 500 caps
+//   that carry cost at ~0.5 s.
+// - While the delta sits below the selective-bitmap fast-path threshold
+//   (max(500, 0.7% of docs)), every selective query full-scans every live
+//   delta file (~0.14 ms/file/query measured) — 500 keeps that transient
+//   penalty at ~70 ms and short-lived.
+// - Compaction itself costs ~3 s on that corpus (parallel + overlapped), so
+//   folding at 500 changed docs is cheap.
 fn default_auto() -> bool {
     true
 }
 fn default_delta_docs_abs() -> usize {
-    2000
+    500
 }
 fn default_delta_docs_ratio() -> f64 {
-    0.10
+    0.05
 }
 fn default_tombstone_ratio() -> f64 {
-    0.20
+    0.10
 }
 fn default_min_main_docs() -> usize {
     500
@@ -139,7 +149,7 @@ mod tests {
     fn defaults_are_sane() {
         let c = CompactionConfig::default();
         assert!(c.auto);
-        assert_eq!(c.delta_docs_abs, 2000);
+        assert_eq!(c.delta_docs_abs, 500);
         assert_eq!(c.min_main_docs, 500);
     }
 
@@ -148,16 +158,16 @@ mod tests {
         let c = CompactionConfig::default();
         // Below min_main_docs: never, no matter how diverged.
         assert!(!c.should_compact(100, 999_999, 999_999));
-        // Absolute delta threshold (2000) — big baseline so the ratio doesn't
-        // fire first (2000/1_000_000 = 0.2% << 10%).
-        assert!(c.should_compact(1_000_000, 2000, 0));
-        assert!(!c.should_compact(1_000_000, 1999, 0));
-        // Delta ratio (10%).
-        assert!(c.should_compact(10_000, 1000, 0));
-        assert!(!c.should_compact(10_000, 999, 0));
-        // Tombstone ratio (20%).
-        assert!(c.should_compact(10_000, 0, 2000));
-        assert!(!c.should_compact(10_000, 0, 1999));
+        // Absolute delta threshold (500) — big baseline so the ratio doesn't
+        // fire first (500/1_000_000 = 0.05% << 5%).
+        assert!(c.should_compact(1_000_000, 500, 0));
+        assert!(!c.should_compact(1_000_000, 499, 0));
+        // Delta ratio (5%) — small-enough baseline that it fires before abs.
+        assert!(c.should_compact(4_000, 200, 0));
+        assert!(!c.should_compact(4_000, 199, 0));
+        // Tombstone ratio (10%).
+        assert!(c.should_compact(10_000, 0, 1000));
+        assert!(!c.should_compact(10_000, 0, 999));
         // auto = false disables the automatic decision entirely.
         let mut off = c.clone();
         off.auto = false;
@@ -168,7 +178,7 @@ mod tests {
     fn partial_toml_fills_missing_with_defaults() {
         let cfg: Config = toml::from_str("[compaction]\nauto = false\n").unwrap();
         assert!(!cfg.compaction.auto);
-        assert_eq!(cfg.compaction.delta_docs_abs, 2000);
+        assert_eq!(cfg.compaction.delta_docs_abs, 500);
     }
 
     #[test]

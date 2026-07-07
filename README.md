@@ -197,9 +197,9 @@ in-flight searches (see [REBASELINE.md](REBASELINE.md) for the design).
   ```toml
   [compaction]
   auto = true              # set false to only ever compact via `fgr compact`
-  delta_docs_abs = 2000    # compact once the live delta exceeds this many docs
-  delta_docs_ratio = 0.10  # ...or this fraction of the baseline
-  tombstone_ratio = 0.20   # ...or once tombstones exceed this fraction of it
+  delta_docs_abs = 500     # compact once the live delta exceeds this many docs
+  delta_docs_ratio = 0.05  # ...or this fraction of the baseline
+  tombstone_ratio = 0.10   # ...or once tombstones exceed this fraction of it
   min_main_docs = 500      # never auto-compact a baseline smaller than this
   ```
 

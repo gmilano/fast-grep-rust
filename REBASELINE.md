@@ -7,15 +7,23 @@ overlay. `fgr update` never rewrites the primary: it appends changed files to
 the delta and tombstones the stale primary docs (in `deleted.bin`). Searches
 read primary + delta together and filter tombstones, so results stay correct.
 
-But the delta only grows. Two costs accumulate as the working tree diverges from
-the frozen baseline:
+But the delta only grows. Three costs accumulate as the working tree diverges
+from the frozen baseline (all measured on the 79K-file Linux kernel):
 
-1. **Per-query overhead.** Delta docs have no Roaring bitmap, so every query
-   force-adds *all* live delta doc-ids to its candidate set (and they always get
-   verified). A large delta also inflates the candidate count enough to defeat
-   the selective-bitmap fast path. The penalty is worst on *selective* queries.
-2. **Tombstone garbage.** Modified/deleted files leave dead postings in the
-   primary that are filtered at scan time but still produce false candidates.
+1. **Every update re-pays the whole delta.** An incremental update rewrites the
+   delta from scratch, re-reading and re-trigramming every *carried* delta file
+   (~1 ms/file) — a 2,000-file delta adds ~2 s to every subsequent update,
+   forever, until a rebaseline resets it.
+2. **Selective queries full-scan the delta.** Delta docs have no Roaring
+   bitmap, so they are force-added to every query's candidate set. While the
+   candidate count stays below the selective-bitmap fast-path threshold
+   (`max(500, 0.7%·docs)`), that fast path scans candidate *files* whole — all
+   of the delta, every query (~0.14 ms/file/query: +55 ms at a 400-file
+   delta). Past the threshold the query falls back to posting intersection,
+   which handles the delta precisely — so the penalty is a hump that peaks
+   just below the threshold, exactly the zone a growing delta lives in.
+3. **Tombstone garbage.** Modified/deleted files leave dead postings and stale
+   bitmap entries in the primary — wasted lookups and disk bloat.
 
 Rebaselining folds the delta and drops the tombstones back into a fresh, dense
 primary — cheaply, and without disturbing concurrent searches.
@@ -133,23 +141,25 @@ first build and never clobbered afterwards (hand edits stick):
 ```toml
 [compaction]
 auto = true              # gates the automatic triggers (not `fgr compact`)
-delta_docs_abs = 2000    # compact once the live delta exceeds this many docs
-delta_docs_ratio = 0.10  # ...or this fraction of the baseline
-tombstone_ratio = 0.20   # ...or once tombstones exceed this fraction of it
+delta_docs_abs = 500     # compact once the live delta exceeds this many docs
+delta_docs_ratio = 0.05  # ...or this fraction of the baseline
+tombstone_ratio = 0.10   # ...or once tombstones exceed this fraction of it
 min_main_docs = 500      # never auto-compact a baseline smaller than this
 ```
 
-The defaults are deliberately high: `delta_docs_abs = 2000` means a real
-divergence (a big refactor, a branch switch) before paying a compaction, which
-amortizes the one-time fold cost against the per-query penalty it removes.
-`fgr stats` reports the current `Delta docs` / `Tombstones` and whether
-`Compaction due`.
+The defaults follow from the measured costs above: at 500 delta docs the
+carried-delta tax on every update is capped at ~0.5 s and the selective-query
+scan hump at ~70 ms, while the fold that resets both costs ~3 s (background in
+the daemon, updater-paid otherwise). They were originally 4× higher — tuned for
+a ~31 s serial compaction; the parallel + overlapped rewrite made folding cheap
+enough to trigger 4× earlier. `fgr stats` reports the current `Delta docs` /
+`Tombstones` and whether `Compaction due`.
 
 ## Known limitation
 
-Compaction rewrites the whole baseline (2.8 GB on the Linux kernel), so it
-saturates disk I/O for its duration regardless of the worker thread — anything
-else touching the disk on the box (including a cold-cache search load) is slower
-while it runs. The mitigation is to compact *rarely* (the high default
-thresholds), not to make a multi-GB rewrite free. `auto = false` disables it
-entirely in favor of scheduled `fgr compact`.
+Compaction rewrites the whole baseline (2.8 GB on the Linux kernel), so for its
+~3 s it saturates disk I/O regardless of the worker thread — anything else
+touching the disk on the box (including a cold-cache search load) is slower
+while it runs. The thresholds keep that to once per ~500 changed files; raise
+them (or set `auto = false` in favor of scheduled `fgr compact`) if the write
+churn matters more than update/query latency on your box.
