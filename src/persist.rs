@@ -675,6 +675,15 @@ impl PersistentIndex {
                     }
                 }
 
+                // Main-index bitmaps are stale w.r.t. tombstones — drop deleted
+                // docs now so (a) the fast path below never emits a tombstoned
+                // doc's path (a modified file would otherwise appear twice: once
+                // via its dead main doc and once via its delta doc → duplicate
+                // matches), and (b) bm_card reflects real candidates.
+                for &id in &self.deleted_docs {
+                    candidate_docs.remove(id);
+                }
+
                 // Delta docs don't have bitmap entries — add all live delta
                 // doc_ids so incremental updates are never invisible.
                 let main_count = self.main_num_docs as u32;
@@ -1754,6 +1763,136 @@ fn index_dir_in_walk(index_path: &Path, walk_root: &Path) -> PathBuf {
     index_path.to_path_buf()
 }
 
+/// Walk `root` with the parallel walker, collecting `(file mtimes, dir mtimes)`
+/// keyed by path string, skipping the index directory subtree entirely.
+/// The stat syscalls dominate a big tree's walk, so parallelizing brings the
+/// 79K-file scan from ~3s to well under a second. `exclude_dir` must be in the
+/// walk's path space (see `index_dir_in_walk`).
+fn collect_tree_state(
+    root: &Path,
+    exclude_dir: &Path,
+) -> (HashMap<String, u64>, HashMap<String, u64>) {
+    use ignore::WalkState;
+    let files: std::sync::Mutex<HashMap<String, u64>> = std::sync::Mutex::new(HashMap::new());
+    let dirs: std::sync::Mutex<HashMap<String, u64>> = std::sync::Mutex::new(HashMap::new());
+    let walker = WalkBuilder::new(root)
+        .git_ignore(true)
+        .hidden(false)
+        .build_parallel();
+    walker.run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            let path = entry.path();
+            if path.starts_with(exclude_dir) {
+                // Skip prunes the whole index subtree instead of visiting it.
+                return WalkState::Skip;
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Ok(m) = entry.metadata() {
+                    dirs.lock()
+                        .unwrap()
+                        .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                }
+            } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                if let Ok(m) = entry.metadata() {
+                    files
+                        .lock()
+                        .unwrap()
+                        .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    (files.into_inner().unwrap(), dirs.into_inner().unwrap())
+}
+
+/// One delta file's line-level trigram postings, doc-id-free: hash →
+/// sorted `(line_no, byte_offset)` pairs. Built in parallel per file; the doc
+/// id is assigned later during the serial in-order merge.
+struct DeltaFileIndex {
+    ngrams: HashMap<u32, Vec<(u32, u32)>>,
+    ngrams_ci: HashMap<u32, Vec<(u32, u32)>>,
+}
+
+/// Read + trigram one delta file (same line-level logic as
+/// `SparseIndex::add_document`, plus the lockstep case-folded map when the
+/// index has a CI companion). Returns `None` for unreadable or binary files —
+/// those get no doc id, mirroring the previous serial loop.
+fn index_delta_file(path_str: &str, ci_enabled: bool) -> Option<DeltaFileIndex> {
+    let content = fs::read(Path::new(path_str)).ok()?;
+    // Skip binary files
+    if content.iter().take(512).any(|&b| b == 0) {
+        return None;
+    }
+
+    let mut dfi = DeltaFileIndex {
+        ngrams: HashMap::new(),
+        ngrams_ci: HashMap::new(),
+    };
+    if content.len() < 3 {
+        return Some(dfi);
+    }
+
+    let mut fold_buf: Vec<u8> = Vec::new();
+    let mut seen_on_line: HashSet<[u8; 3]> = HashSet::new();
+    let mut seen_on_line_ci: HashSet<[u8; 3]> = HashSet::new();
+    let mut line_no = 1u32;
+    let mut line_start = 0usize;
+
+    loop {
+        let line_end = content[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| line_start + p)
+            .unwrap_or(content.len());
+
+        let line = &content[line_start..line_end];
+        if line.len() >= 3 {
+            seen_on_line.clear();
+            let byte_offset = line_start as u32;
+            for w in line.windows(3) {
+                let tri = [w[0], w[1], w[2]];
+                if seen_on_line.insert(tri) {
+                    let hash = crc32fast::hash(&tri);
+                    dfi.ngrams
+                        .entry(hash)
+                        .or_default()
+                        .push((line_no, byte_offset));
+                }
+            }
+
+            // Lockstep CI delta: same posting, folded trigrams.
+            if ci_enabled {
+                casefold::fold_into(line, &mut fold_buf);
+                if fold_buf.len() >= 3 {
+                    seen_on_line_ci.clear();
+                    for w in fold_buf.windows(3) {
+                        let tri = [w[0], w[1], w[2]];
+                        if seen_on_line_ci.insert(tri) {
+                            let hash = crc32fast::hash(&tri);
+                            dfi.ngrams_ci
+                                .entry(hash)
+                                .or_default()
+                                .push((line_no, byte_offset));
+                        }
+                    }
+                }
+            }
+        }
+
+        if line_end >= content.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        line_no += 1;
+    }
+    Some(dfi)
+}
+
 pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Result<UpdateStats> {
     let start = Instant::now();
 
@@ -1783,36 +1922,8 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
-    // 2. Walk root — get current file mtimes and directory mtimes
-    let walker = WalkBuilder::new(root)
-        .git_ignore(true)
-        .hidden(false)
-        .build();
-    let mut current_files: HashMap<String, u64> = HashMap::new();
-    let mut new_dir_mtimes: HashMap<String, u64> = HashMap::new();
-    for entry in walker.flatten() {
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            // Exclude the index directory itself to avoid self-invalidation
-            if !entry.path().starts_with(&index_in_walk) {
-                if let Ok(m) = entry.metadata() {
-                    new_dir_mtimes
-                        .insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
-                }
-            }
-            continue;
-        }
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        // Skip files inside the index directory
-        if path.starts_with(&index_in_walk) {
-            continue;
-        }
-        if let Ok(m) = fs::metadata(path) {
-            current_files.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
-        }
-    }
+    // 2. Walk root — get current file mtimes and directory mtimes (parallel)
+    let (current_files, new_dir_mtimes) = collect_tree_state(root, &index_in_walk);
 
     // 3. Classify: added, modified, deleted (vs last known state)
     let mut added_set: HashSet<String> = HashSet::new();
@@ -1891,29 +2002,30 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // 8. Index all delta files with line-level postings. When the index has a
     // case-insensitive companion, build the CI delta in lockstep (same delta
     // docs, case-folded trigrams) so `-i` searches stay correct after updates.
+    //
+    // Two phases: read + trigram every file in PARALLEL into per-file maps
+    // (doc-id-free), then merge serially in list order assigning doc ids — so
+    // the id assignment is identical to the old serial loop (files that are
+    // unreadable or binary get no id), and postings within a hash stay sorted
+    // by (doc_id, line).
     let ci_enabled = meta.case_insensitive;
+    let per_file: Vec<Option<DeltaFileIndex>> = delta_files_to_index
+        .par_iter()
+        .map(|path_str| index_delta_file(path_str, ci_enabled))
+        .collect();
+
     let mut delta_ngrams: HashMap<u32, Vec<Posting>> = HashMap::new();
     let mut delta_ngrams_ci: HashMap<u32, Vec<Posting>> = HashMap::new();
-    let mut fold_buf: Vec<u8> = Vec::new();
-    let mut seen_on_line_ci: HashSet<[u8; 3]> = HashSet::new();
     let mut delta_doc_ids: Vec<PathBuf> = Vec::new();
     let mut actual_added = 0usize;
     let mut actual_modified = 0usize;
 
-    for path_str in &delta_files_to_index {
-        let path = Path::new(path_str);
-        let content = match fs::read(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        // Skip binary files
-        if content.iter().take(512).any(|&b| b == 0) {
-            continue;
-        }
+    for (path_str, dfi) in delta_files_to_index.iter().zip(per_file) {
+        let Some(dfi) = dfi else { continue };
 
         // Doc_id in combined space: main_num_docs + delta_doc_ids.len()
         let doc_id = (main_num_docs + delta_doc_ids.len()) as u32;
-        delta_doc_ids.push(path.to_path_buf());
+        delta_doc_ids.push(PathBuf::from(path_str));
 
         if added_set.contains(path_str) {
             actual_added += 1;
@@ -1921,62 +2033,17 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             actual_modified += 1;
         }
 
-        if content.len() < 3 {
-            continue;
+        for (hash, lines) in dfi.ngrams {
+            delta_ngrams
+                .entry(hash)
+                .or_default()
+                .extend(lines.iter().map(|&(l, o)| (doc_id, l, o)));
         }
-
-        // Line-level trigram indexing (same as SparseIndex::add_document)
-        let mut line_no = 1u32;
-        let mut line_start = 0usize;
-        let mut seen_on_line: HashSet<[u8; 3]> = HashSet::new();
-
-        loop {
-            let line_end = content[line_start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| line_start + p)
-                .unwrap_or(content.len());
-
-            let line = &content[line_start..line_end];
-            if line.len() >= 3 {
-                seen_on_line.clear();
-                let byte_offset = line_start as u32;
-                for w in line.windows(3) {
-                    let tri = [w[0], w[1], w[2]];
-                    if seen_on_line.insert(tri) {
-                        let hash = crc32fast::hash(&tri);
-                        delta_ngrams
-                            .entry(hash)
-                            .or_default()
-                            .push((doc_id, line_no, byte_offset));
-                    }
-                }
-
-                // Lockstep CI delta: same posting, folded trigrams.
-                if ci_enabled {
-                    casefold::fold_into(line, &mut fold_buf);
-                    if fold_buf.len() >= 3 {
-                        seen_on_line_ci.clear();
-                        for w in fold_buf.windows(3) {
-                            let tri = [w[0], w[1], w[2]];
-                            if seen_on_line_ci.insert(tri) {
-                                let hash = crc32fast::hash(&tri);
-                                delta_ngrams_ci.entry(hash).or_default().push((
-                                    doc_id,
-                                    line_no,
-                                    byte_offset,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if line_end >= content.len() {
-                break;
-            }
-            line_start = line_end + 1;
-            line_no += 1;
+        for (hash, lines) in dfi.ngrams_ci {
+            delta_ngrams_ci
+                .entry(hash)
+                .or_default()
+                .extend(lines.iter().map(|&(l, o)| (doc_id, l, o)));
         }
     }
 
@@ -2170,42 +2237,27 @@ fn chrono_now() -> String {
 /// negatives. Used by the daemon at startup.
 pub fn full_stale_check(index: &PersistentIndex, index_path: &Path) -> bool {
     let root = Path::new(&index.meta.root_dir);
-    let walker = ignore::WalkBuilder::new(root)
-        .git_ignore(true)
-        .hidden(false)
-        .build();
-    for entry in walker.flatten() {
-        let path = entry.path();
-        if path.starts_with(index_path) {
-            continue;
-        }
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            let key = path.to_string_lossy();
-            if let Some(&stored) = index.meta.dir_mtimes.get(key.as_ref()) {
-                if let Ok(m) = entry.metadata() {
-                    if mtime_secs(&m) != stored {
-                        return true;
-                    }
-                }
-            } else {
-                return true; // new directory
-            }
-        } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            let key = path.to_string_lossy();
-            if let Some(&stored) = index.meta.file_mtimes.get(key.as_ref()) {
-                if let Ok(m) = fs::metadata(path) {
-                    if mtime_secs(&m) != stored {
-                        return true;
-                    }
-                }
-            } else {
-                return true; // new file
-            }
+    // Same parallel collector as update_incremental (and the same walk-space
+    // index-dir exclusion), so "stale" here agrees exactly with what an update
+    // would classify as changed.
+    let exclude = index_dir_in_walk(index_path, root);
+    let (files, dirs) = collect_tree_state(root, &exclude);
+
+    for (path, mtime) in &dirs {
+        match index.meta.dir_mtimes.get(path) {
+            Some(&stored) if stored == *mtime => {}
+            _ => return true, // new or changed directory
         }
     }
-    // Also check for deleted files (in index but not on disk)
+    for (path, mtime) in &files {
+        match index.meta.file_mtimes.get(path) {
+            Some(&stored) if stored == *mtime => {}
+            _ => return true, // new or changed file
+        }
+    }
+    // Deleted files: indexed but no longer produced by the walk.
     for path_str in index.meta.file_mtimes.keys() {
-        if !Path::new(path_str).exists() {
+        if !files.contains_key(path_str) {
             return true;
         }
     }

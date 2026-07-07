@@ -631,6 +631,40 @@ fn update_auto_compacts_past_threshold() {
     );
 }
 
+/// Regression: a modified file must not yield duplicate matches. Its old doc is
+/// tombstoned but still present in the main bitmaps; if the bitmap fast path
+/// doesn't drop tombstones, the same path is returned twice (dead main doc +
+/// live delta doc) and every match on it is emitted twice.
+#[test]
+fn modified_file_yields_no_duplicate_matches() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).unwrap();
+
+    // New content shares trigrams with the old ("export function ...") so the
+    // tombstoned old doc still matches the query's trigrams.
+    let modpath = tmp.path().join("utils.ts");
+    fs::write(
+        &modpath,
+        "export function capitalizeBetter(s: string): string { return s; }\n",
+    )
+    .unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&modpath).unwrap();
+    f.set_modified(SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+
+    update_incremental(&idx_dir, tmp.path(), false).unwrap();
+    let idx = load_index(&idx_dir).unwrap();
+
+    let hits = hitset(&idx, "export function");
+    assert!(!hits.is_empty());
+    let mut deduped = hits.clone();
+    deduped.dedup();
+    assert_eq!(hits, deduped, "duplicate match lines for a modified file");
+}
+
 /// `try_acquire_index_lock` is non-blocking: it returns None while the lock is
 /// held (letting the daemon skip an update round during a background
 /// compaction) and Some once it is released.
