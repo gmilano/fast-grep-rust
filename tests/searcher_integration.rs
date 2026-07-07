@@ -244,6 +244,64 @@ fn legacy_flat_index_still_loads() {
         .all(|r| r.path.file_name().unwrap() == "server.ts"));
 }
 
+/// Full backward-compat lifecycle for a pre-slot (flat) index: updates keep
+/// working in place (still flat), and the first compaction migrates it to the
+/// slot layout, leaving ZERO legacy content files behind in the root.
+#[test]
+fn legacy_flat_index_updates_then_migrates_cleanly_on_compact() {
+    let tmp = setup_test_dir();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+
+    // Flatten to the pre-slot on-disk layout (content in the root, no
+    // `current`), exactly what an older fgr version left behind.
+    let slot = idx_dir.join("slot-a");
+    for entry in fs::read_dir(&slot).unwrap() {
+        let entry = entry.unwrap();
+        fs::rename(entry.path(), idx_dir.join(entry.file_name())).unwrap();
+    }
+    fs::remove_dir_all(&slot).unwrap();
+    fs::remove_file(idx_dir.join("current")).unwrap();
+
+    // An update on the flat index works and stays flat (no forced migration).
+    fs::write(tmp.path().join("added.ts"), "const legacyFlatMarker = 1;\n").unwrap();
+    fs::remove_file(tmp.path().join("server.ts")).unwrap();
+    update_incremental(&idx_dir, tmp.path(), false).expect("update on flat");
+    assert!(
+        idx_dir.join("delta.postings").exists(),
+        "flat delta in root"
+    );
+    assert!(!idx_dir.join("current").exists(), "still flat after update");
+    let idx = load_index(&idx_dir).unwrap();
+    assert!(!search(&idx, "legacyFlatMarker").is_empty());
+    drop(idx);
+
+    // First compaction migrates to the slot layout...
+    assert!(compact(&idx_dir, false).expect("compact").compacted);
+    assert_eq!(
+        fs::read_to_string(idx_dir.join("current")).unwrap().trim(),
+        "slot-a"
+    );
+    let idx = load_index(&idx_dir).unwrap();
+    assert!(!search(&idx, "legacyFlatMarker").is_empty());
+    assert!(search(&idx, "express").is_empty(), "deleted file gone");
+    drop(idx);
+
+    // ...and leaves no legacy garbage: the root may only hold the pointer,
+    // the config, and the live slot dir.
+    let allowed = ["current", "config.toml", "slot-a"];
+    let leftovers: Vec<String> = fs::read_dir(&idx_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !allowed.contains(&name.as_str()))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "legacy content files left in index root after migration: {leftovers:?}"
+    );
+}
+
 /// Rebuilding an existing index stages into the *other* slot, flips `current`,
 /// and reclaims the previous slot — so exactly one slot dir remains.
 #[test]
