@@ -1,25 +1,92 @@
 # fast-grep
 
-> Indexed regex search. 6–25x faster than ripgrep, 2–10x faster than ugrep.
-> **Interactive walkthrough + C4 diagrams + benchmarks → [gmilano.github.io/fast-grep-rust](https://gmilano.github.io/fast-grep-rust/)**
+**Context-efficient code search for coding agents.**
 
-Built at **[Globant](https://www.globant.com)** for agent harnesses and large codebases where grep is the bottleneck. A one-time index build turns every subsequent search into a sub-200ms lookup instead of a multi-second full scan. An optional background daemon keeps the index in sync with the filesystem so it never goes stale.
+fast-grep reduces both costs of repository search:
+
+- **Search latency**: indexed searches avoid repeatedly scanning the entire repository.
+- **Context usage**: agent-oriented output avoids repeating paths and unnecessary formatting.
+
+```bash
+fgr --agent "process_request" .
+```
+
+---
+
+## Why coding agents need a different grep
+
+Every repository search costs an agent twice:
+
+1. The agent **waits** for the search tool to finish scanning.
+2. The search **output consumes model context** — tokens that could be used for reasoning.
+
+fast-grep is designed to reduce both.
+
+---
+
+## Use-case guide
+
+| Use case | Recommended tool |
+|---|---|
+| One-off search in a small repository | ripgrep |
+| Repeated searches in a large repository | fast-grep |
+| Coding-agent tool calls | `fast-grep --agent` |
+| Scripts requiring grep-compatible output | `fast-grep --format grep` |
+| Structured tool integration | `fast-grep --format jsonl` |
+
+---
+
+## Agent output
+
+Traditional grep output repeats the file path on every line:
+
+```text
+src/api/request.rs:143:fn process_request(ctx: &Context) {
+src/api/request.rs:189:    process_request(&ctx);
+src/api/request.rs:214:    let result = process_request(&ctx);
+src/api/handler.rs:67:fn process_request(req: Request) -> Response {
+src/api/handler.rs:102:    process_request(incoming)?;
+```
+
+fast-grep agent output prints the path once per file:
+
+```text
+src/api/request.rs
+143: fn process_request(ctx: &Context) {
+189:     process_request(&ctx);
+214:     let result = process_request(&ctx);
+
+src/api/handler.rs
+67: fn process_request(req: Request) -> Response {
+102:     process_request(incoming)?;
+```
+
+For a 5-match, 2-file result like the above, the difference is roughly:
+- grep format: ~190 bytes (~48 tokens)
+- compact format: ~160 bytes (~40 tokens)
+
+On searches returning hundreds of matches across dozens of files, the savings compound significantly. Use `--agent-stats` to measure on your actual queries.
+
+---
 
 ## Benchmarks — Linux kernel 6.6 (81,690 files)
 
 **Apple M1 Pro, 32 GB RAM — warm cache**
 
-### vs ripgrep (no index)
+### Search latency (indexed vs full scan)
 
-| Pattern | fast-grep | ripgrep | Speedup |
-|---------|-----------|---------|---------|
+| Pattern | fast-grep (indexed) | ripgrep (no index) | Speedup |
+|---------|--------------------|--------------------|---------|
 | `TODO` | **97ms** | 2,463ms | **25x** |
 | `printk` | **172ms** | 2,492ms | **14x** |
 | `EXPORT_SYMBOL` | **197ms** | 1,553ms | **8x** |
 | `container_of` | **344ms** | 2,440ms | **7x** |
 | `static.*inline` | **394ms** | 2,369ms | **6x** |
 
-### vs ugrep (indexed)
+**Note**: ripgrep does not use an index. These comparisons are meaningful for repeated searches
+in large, stable repositories. For a first-time search or a small repo, ripgrep is faster.
+
+### vs ugrep (also indexed)
 
 | Pattern | fast-grep | ugrep | Speedup |
 |---------|-----------|-------|---------|
@@ -29,197 +96,179 @@ Built at **[Globant](https://www.globant.com)** for agent harnesses and large co
 | `printk` | **172ms** | 645ms | **3.8x** |
 | `container_of` | **344ms** | 656ms | **1.9x** |
 
-**Without index:** comparable to ripgrep (~2–2.5s full scan).
-
 ### Index cost
 
 | Metric | Value |
 |--------|-------|
 | Full build | ~60s (one-time) |
-| Incremental update | <1s for 10–100 files (75x faster than rebuild) |
+| Incremental update | <1s for 10–100 changed files |
 | Index load (mmap) | 17ms |
-| Index size | ~2.7 GB postings + 162 MB bitmaps |
+| Index size (postings) | 775 MB |
+| Index size (bitmaps) | 161 MB |
+| RAM at query time | ~22 MB (rest is mmap'd) |
 
-## How it works
+---
 
-Four techniques combine to eliminate >99% of I/O before the regex engine runs:
-
-1. **Trigram inverted index** — Each 3-byte trigram maps to the lines that contain it. A query is decomposed into the trigrams it must contain, so only lines carrying *all* of them survive as candidates — typically a tiny fraction of the corpus.
-
-2. **Two-tier Roaring bitmaps** — Tier 1 is a compressed doc-id set per trigram: the file-level intersection runs as a Roaring-bitmap AND, skipping most files before any posting list is read. Only the surviving files load Tier 2 (the line-level postings).
-
-3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
-
-4. **Line-level index with byte offsets** — Index stores line positions, not just file IDs. Verification jumps directly to candidate lines instead of scanning entire files.
-
-## Installation
-
-The binary name is `fgr`.
-
-### Precompiled binaries
-
-Download the archive for your platform from the
-[latest release](https://github.com/gmilano/fast-grep-rust/releases/latest) and
-put `fgr` somewhere on your `PATH`. SHA256 sidecars (`*.sha256`) and a
-`SHA256SUMS` file are attached to every release.
-
-Targets published on each release:
-
-| OS      | Architecture | Archive                                                  |
-| ------- | ------------ | -------------------------------------------------------- |
-| macOS   | aarch64      | `fast-grep-vX.Y.Z-aarch64-apple-darwin.tar.gz`           |
-| macOS   | x86_64       | `fast-grep-vX.Y.Z-x86_64-apple-darwin.tar.gz`            |
-| Linux   | aarch64 (gnu)| `fast-grep-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz`      |
-| Linux   | aarch64 (musl)| `fast-grep-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`    |
-| Linux   | x86_64 (gnu) | `fast-grep-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`       |
-| Linux   | x86_64 (musl)| `fast-grep-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`      |
-| Windows | x86_64       | `fast-grep-vX.Y.Z-x86_64-pc-windows-msvc.zip`            |
-
-### Cargo (any platform with a Rust toolchain)
-
-```bash
-cargo install fast-grep
-```
-
-Or download a prebuilt binary into Cargo's bin dir without compiling:
-
-```bash
-cargo binstall fast-grep
-```
-
-### Homebrew (macOS / Linux)
-
-```bash
-brew install gmilano/fast-grep/fast-grep
-```
-
-The tap lives at [`gmilano/homebrew-fast-grep`](https://github.com/gmilano/homebrew-fast-grep).
-
-### Scoop (Windows)
-
-```powershell
-scoop bucket add fast-grep https://github.com/gmilano/scoop-fast-grep
-scoop install fast-grep
-```
-
-### Debian / Ubuntu (.deb)
-
-A `.deb` package is attached to every release for `amd64` and `arm64`:
-
-```bash
-curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.3.1-1_amd64.deb
-sudo dpkg -i fast-grep_*_amd64.deb
-```
-
-### Build from source
+## Install
 
 ```bash
 git clone https://github.com/gmilano/fast-grep-rust
 cd fast-grep-rust
 cargo build --release
-# binary at ./target/release/fgr
 ```
 
-SIMD (AVX2/NEON) auto-enabled via `.cargo/config.toml` (`target-cpu=native`),
-so a from-source build is tuned to your machine. Distributed binaries are
-built without `target-cpu=native` so they work on any CPU of the target arch.
+Binary: `./target/release/fgr`. SIMD (AVX2/NEON) is auto-enabled via `.cargo/config.toml`.
 
-### Not yet packaged
-
-These channels are not officially packaged yet — they need a community
-maintainer in each ecosystem (the same path ripgrep took). PRs welcome.
-
-- `apt` on Debian / Ubuntu (official repos)
-- `dnf` on Fedora / `yum` on RHEL
-- `pacman` on Arch / AUR
-- MacPorts
-- Chocolatey / Winget
-- FreeBSD `pkg`, OpenBSD `pkg_add`, NetBSD `pkgin`
-- Nix / Guix / Flox
-- Void Linux / Gentoo
-
-In the meantime, `cargo install fast-grep` works on all of them.
+---
 
 ## Usage
 
-Searching is the default — pass PATTERN and PATH as positional args. Other
-operations (`index`, `update`, `bench`, `stats`, `daemon`) are subcommands.
-
 ```bash
-# Build index (one-time, ~60s for Linux kernel)
+# Index a codebase (one-time, ~60s for the Linux kernel)
 fgr index /path/to/codebase --output .fgr
 
-# Build with a case-insensitive companion so `-i` searches stay indexed
-fgr index -i /path/to/codebase --output .fgr
+# Agent-optimised search (compact output, relative paths)
+fgr --agent "process_request" /path/to/codebase --index .fgr
 
-# Search with index — index is auto-built on first use if missing
-fgr "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+# Agent-aggressive (compact + trim long lines at 200 chars)
+fgr --agent-aggressive "TODO" /path/to/codebase --index .fgr
 
-# Case-insensitive indexed search (uses the CI companion if the index has one)
-fgr -i "export_symbol" /path/to/codebase --index .fgr
+# Structured JSON output
+fgr --format json "process_request" /path/to/codebase --index .fgr
 
-# Search without index (ripgrep-equivalent full scan)
+# JSONL streaming output (one match per line)
+fgr --format jsonl "process_request" /path/to/codebase --index .fgr
+
+# Full scan (no index, ripgrep-equivalent)
 fgr "EXPORT_SYMBOL" /path/to/codebase
 
-# Incrementally update an existing index after files changed
-fgr update /path/to/codebase --index .fgr
+# With context lines
+fgr --agent "process_request" . --context 3
 
-# Benchmark against ripgrep
-fgr bench "static.*inline" /path/to/codebase
+# With output limits (safe for agent context budgets)
+fgr --agent "TODO" . --max-results 50 --max-files 10
 
-# Index stats
+# Print agent stats to stderr
+fgr --agent-stats --agent "process_request" . --index .fgr
+
+# Benchmark against ripgrep + output metrics
+fgr bench "printk" /path/to/linux --agent-metrics
+
+# Incremental index update
+fgr update --index .fgr
+
+# Index statistics
 fgr stats --index .fgr
 ```
-
-### Daemon mode (auto-incremental updates)
-
-Run a background watcher that observes filesystem changes and applies
-debounced incremental index updates. Searches automatically flush pending
-changes before running, so the index never lags behind your edits.
-
-```bash
-# Build index and start the daemon in one step
-fgr index /path/to/codebase --output .fgr --daemon
-
-# Or start the daemon against an existing index
-fgr daemon start /path/to/codebase --output .fgr
-
-# Status / stop
-fgr daemon status /path/to/codebase --output .fgr
-fgr daemon stop   /path/to/codebase --output .fgr
-```
-
-The daemon debounces FS events by 3 seconds, so a burst of writes triggers a
-single update. State is exchanged over a localhost TCP socket recorded in
-`<index>/daemon.port`.
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
-| `--index <path>` | Use persistent index |
-| `--files-only` | Print file paths only |
-| `--count` | Print match count |
-| `--type <ext>` | Filter by extension (`c`, `rs`, `ts`) |
-| `--no-ignore` | Don't respect `.gitignore` |
-| `--format <grep\|heading\|compact>` | Output layout: `grep` (flat `path:line:content`, piped default), `heading` (grouped, TTY default), `compact` (grouped + relative paths — fewest tokens for agents). Env: `FGR_FORMAT`. |
-| `--trim` | Strip leading indentation from match content (lossy; pairs with `--format compact`) |
+| `--agent` | Compact output: path once, then `line: text`. Lossless. |
+| `--agent-aggressive` | Compact + trim lines > 200 chars. |
+| `--format <fmt>` | Output format: `grep`, `compact`, `json`, `jsonl`. Highest priority. |
+| `--max-results <N>` | Cap total matches emitted. |
+| `--max-results-per-file <N>` | Cap matches per file. |
+| `--max-files <N>` | Cap number of files in output. |
+| `--max-output-bytes <N>` | Cap output size in bytes. |
+| `--context <N>` / `-C <N>` | Print N lines of context around each match. |
+| `--agent-stats` | Print latency and token estimates to stderr. |
+| `--index <path>` | Use persistent index for fast repeated searches. |
+| `--type <ext>` | Filter by file extension (`rs`, `ts`, `py`, …). |
+| `--no-ignore` | Don't respect `.gitignore`. |
+| `--count` / `-c` | Count matching lines per file. |
+| `--files-with-matches` / `-l` | Print file paths only. |
+| `--ignore-case` / `-i` | Case-insensitive search (disables index). |
 
-## Why this matters for agents
+### Output format precedence
 
-LLM coding agents (Cursor, Claude Code, Aider) spend significant time grepping large repos. Every search blocks the agent's next reasoning step. fast-grep turns 2.5s waits into <200ms lookups — a 10x reduction in tool-call latency that compounds across an entire coding session.
+When multiple format flags are combined, the priority is:
 
-**Token-efficient output.** An agent also *pays for* every line of grep output — it is fed back into the model as tokens. `--format compact` groups matches under one file heading and prints paths relative to the search root, cutting output tokens **~40–60%** versus the flat `path:line:content` default, with no loss of path, line, or content. `--trim` strips leading indentation for a few % more (lossy). Set `FGR_FORMAT=compact` once to make it the default for piped output, while explicit pipes (`fgr … | script`) keep the grep-compatible `path:line:content` layout.
-
-Measure it yourself on any codebase with the **token-cost harness**: it runs each output format through a Claude-family tokenizer (and the Anthropic `count_tokens` API when `ANTHROPIC_API_KEY` is set) and prints the per-format token deltas.
-
-```bash
-cargo build --release
-pip install -r scripts/token-cost/requirements.txt
-python scripts/token-cost/token_cost.py            # measures this repo's own src/
+```
+--format <fmt>           (highest — explicit always wins)
+--agent-aggressive
+--agent
+FGR_FORMAT env var
+default (grep format)    (lowest)
 ```
 
-Details and options in [`scripts/token-cost/README.md`](scripts/token-cost/README.md).
+### JSON output schema
+
+```json
+{
+  "query": "process_request",
+  "root": "/absolute/path/to/repo",
+  "indexed": true,
+  "elapsed_ms": 172,
+  "total_matches": 87,
+  "files": [
+    {
+      "path": "src/api/request.rs",
+      "matches": [
+        { "line": 143, "text": "fn process_request(ctx: &Context) {" }
+      ]
+    }
+  ],
+  "truncated": null
+}
+```
+
+JSONL emits one object per match for streaming:
+
+```jsonl
+{"path":"src/api/request.rs","line":143,"text":"fn process_request(ctx: &Context) {"}
+```
+
+Keys are stable across versions. New optional keys may be added in minor releases.
+
+---
+
+## How it works
+
+Five techniques combine to eliminate >99% of I/O before the regex engine runs:
+
+1. **Sparse n-grams with adaptive frequency table** — Variable-length substrings weighted by corpus-specific bigram rarity. Produces fewer, more selective posting lists than fixed trigrams.
+
+2. **Position masks (Blackbird algorithm)** — Two 8-bit bloom filters per (n-gram, document) encode position and successor character. Drops the false positive rate to 0.42%.
+
+3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
+
+4. **Line-level index with byte offsets** — Index stores line positions, not just file IDs. Verification jumps directly to candidate lines instead of scanning entire files.
+
+5. **SIMD verification** — The `regex` crate uses Teddy SIMD when `target-cpu=native` is set; `memchr` uses AVX2/NEON for literal pre-filters.
+
+---
+
+## Trade-offs
+
+fast-grep is not always faster or better.
+
+- **The first index build has a cost** (~60s for the Linux kernel). Amortised over repeated searches, this pays off quickly.
+- **The index consumes disk space** (~936 MB for 81k files). A smaller repo produces a proportionally smaller index.
+- **Small repositories and one-off searches** are typically faster with ripgrep (no build cost).
+- **Some regex patterns cannot be filtered by the index** — patterns with no extractable n-grams (e.g. `.*`, `\d+`) fall back to a full scan. Use `fgr stats` to check.
+- **Case-insensitive search (`-i`) bypasses the index** — the index is case-sensitive; `-i` always falls back to a full scan.
+- **Agent compact output reduces token overhead but does not replace semantic retrieval or ranking.** It is a formatting optimisation, not an AI feature.
+- **Incremental updates detect changed files but require a full scan of those files.** Partial index merging is on the roadmap.
+- **Symlinks**: followed during indexing; `is_stale()` does not detect symlink retargets.
+- **Binary files**: skipped based on null-byte detection in the first 512 bytes.
+- **Large files**: indexed and searched via mmap; no hard size limit, but very large files increase index size.
+- **Socket security**: there is no TCP daemon in 0.4.0; searches are in-process.
+
+---
+
+## Integrations
+
+See `integrations/` for Claude Code, Codex, OpenCode, Aider, and MCP setup guides.
+
+Quick reference:
+
+```bash
+fgr integrations          # print guide to stdout
+```
+
+---
 
 ## Related work
 
@@ -230,14 +279,16 @@ Details and options in [`scripts/token-cost/README.md`](scripts/token-cost/READM
 | [zoekt](https://github.com/sourcegraph/zoekt) | Trigram index (Go) | Powers Sourcegraph |
 | [Cursor](https://cursor.com/blog/fast-regex-search) | Sparse n-gram (closed) | Inspiration for this project |
 
-## Releasing
+---
 
-Release procedure (version bump, tagging, post-tag updates to Homebrew tap
-and Scoop bucket, common failures): [`RELEASING.md`](RELEASING.md).
+## Further reading
 
-## Credits
+- [Russ Cox — Regular Expression Matching with a Trigram Index](https://swtch.com/~rsc/regexp/regexp4.html)
+- [Cursor — Fast Regex Search](https://cursor.com/blog/fast-regex-search)
+- [Sourcegraph/zoekt](https://github.com/sourcegraph/zoekt)
+- [ripgrep internals](https://blog.burntsushi.net/ripgrep/)
 
-Created and maintained at **[Globant](https://www.globant.com)**.
+---
 
 ## License
 
