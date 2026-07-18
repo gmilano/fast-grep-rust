@@ -123,6 +123,10 @@ Binary: `./target/release/fgr`. SIMD (AVX2/NEON) is auto-enabled via `.cargo/con
 
 ## Usage
 
+Searching is the default — pass PATTERN and PATH as positional args. Other
+operations (`index`, `update`, `compact`, `bench`, `stats`, `daemon`) are
+subcommands.
+
 ```bash
 # Index a codebase (one-time, ~60s for the Linux kernel)
 fgr index /path/to/codebase --output .fgr
@@ -151,16 +155,72 @@ fgr --agent "TODO" . --max-results 50 --max-files 10
 # Print agent stats to stderr
 fgr --agent-stats --agent "process_request" . --index .fgr
 
-# Benchmark against ripgrep + output metrics
-fgr bench "printk" /path/to/linux --agent-metrics
+# Rebaseline: fold the accumulated delta back into the primary index
+fgr compact --index .fgr
 
 # Incremental index update
 fgr update --index .fgr
 
-# Index statistics
+# Benchmark against ripgrep + output metrics
+fgr bench "static.*inline" /path/to/codebase
+
+# Index stats (also shows delta / tombstone divergence + "Compaction due")
 fgr stats --index .fgr
 ```
 
+### Keeping the index fresh: delta, then rebaseline
+
+An `fgr update` doesn't rewrite the primary index — it records changed files in
+a small **delta** overlay (and tombstones the stale docs). Searches read the
+primary + delta together, so results stay correct, but as the working tree
+diverges the delta grows and every query pays a small, growing overhead.
+
+**Compaction** folds the delta and drops the tombstones back into a fresh, dense
+primary baseline. It reuses the existing postings (no re-reading or
+re-trigramming of source files), re-encodes them in parallel, and overlaps the
+encode with the file writes, so it is **far faster than a full rebuild** (~3s vs
+~183s on the 79K-file Linux kernel). The swap is atomic and never blocks
+in-flight searches (see [REBASELINE.md](REBASELINE.md) for the design).
+
+- **Manual:** `fgr compact --index .fgr` always folds whatever is pending.
+- **Automatic:** `fgr update` and the daemon rebaseline on their own once
+  divergence crosses a threshold. The thresholds live in an editable
+  `<index>/config.toml` (written with commented defaults on first build):
+
+  ```toml
+  [compaction]
+  auto = true              # set false to only ever compact via `fgr compact`
+  delta_docs_abs = 500     # compact once the live delta exceeds this many docs
+  delta_docs_ratio = 0.05  # ...or this fraction of the baseline
+  tombstone_ratio = 0.10   # ...or once tombstones exceed this fraction of it
+  min_main_docs = 500      # never auto-compact a baseline smaller than this
+  ```
+
+  Pass `fgr update --no-compact` to skip the automatic rebaseline for one run.
+  The auto-compaction cost is paid by the updater (or the daemon, off its event
+  loop) — never by a search.
+
+### Daemon mode (auto-incremental updates)
+
+Run a background watcher that observes filesystem changes and applies
+debounced incremental index updates. Searches automatically flush pending
+changes before running, so the index never lags behind your edits.
+
+```bash
+# Build index and start the daemon in one step
+fgr index /path/to/codebase --output .fgr --daemon
+
+# Or start the daemon against an existing index
+fgr daemon start /path/to/codebase --output .fgr
+
+# Status / stop
+fgr daemon status /path/to/codebase --output .fgr
+fgr daemon stop   /path/to/codebase --output .fgr
+```
+
+The daemon debounces FS events by 3 seconds, so a burst of writes triggers a
+single update. State is exchanged over a localhost TCP socket recorded in
+`<index>/daemon.port`.
 ### Flags
 
 | Flag | Description |

@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use fast_grep::persist::{build as build_index, load as load_index, update_incremental};
+use fast_grep::persist::{build as build_index, compact, load as load_index, update_incremental};
 use fast_grep::searcher::{search_full_scan, search_persistent_timed, Match};
 
 const FILES: &[(&str, &str)] = &[
@@ -125,6 +125,98 @@ fn cs_only_index_still_correct_for_ignore_case() {
     assert_eq!(
         search_set(&idx, tmp.path(), "(?i)hello"),
         full_scan_set(tmp.path(), "(?i)hello"),
+    );
+}
+
+/// The full lifecycle a CI index goes through under the rebaseline feature:
+/// build -i → mutate (add/modify/delete, mixed case) → update (CI delta) →
+/// `compact()` slot swap (CI folded into the new slot) → further update (CI
+/// delta must STILL be built against the compacted baseline) → compact again.
+/// Every step's `(?i)` answers must match a full scan.
+#[test]
+fn ci_survives_update_and_slot_compact_cycle() {
+    let tmp = setup();
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI index");
+
+    // Mutate: add mixed-case, modify alpha.ts (mtime bumped for detection),
+    // delete beta.rs.
+    fs::write(tmp.path().join("gamma.ts"), "Goodbye MOON and STARS").unwrap();
+    let modpath = tmp.path().join("alpha.ts");
+    fs::write(&modpath, "Replaced CONTENT with NewCasing here").unwrap();
+    let f = fs::OpenOptions::new().write(true).open(&modpath).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+    fs::remove_file(tmp.path().join("beta.rs")).unwrap();
+
+    update_incremental(&idx_dir, tmp.path(), false).expect("update");
+
+    // Pre-compact (delta + tombstones live): (?i) must already be exact.
+    let idx = load_index(&idx_dir).expect("load pre-compact");
+    for pattern in [
+        "(?i)goodbye",
+        "(?i)newcasing",
+        "(?i)temperature",
+        "(?i)kelvin",
+    ] {
+        assert_eq!(
+            search_set(&idx, tmp.path(), pattern),
+            full_scan_set(tmp.path(), pattern),
+            "CI mismatch pre-compact for {pattern:?}"
+        );
+    }
+    drop(idx);
+
+    // Slot-swap compaction: CI store must be folded into the new slot.
+    let outcome = compact(&idx_dir, false).expect("compact");
+    assert!(outcome.compacted);
+    let slot = fs::read_to_string(idx_dir.join("current")).unwrap();
+    let slot = slot.trim();
+    assert_eq!(slot, "slot-b", "compaction swapped the slot");
+    assert!(
+        idx_dir.join(slot).join("ngrams.ci.postings").exists(),
+        "CI store missing from compacted slot"
+    );
+
+    let idx = load_index(&idx_dir).expect("load post-compact");
+    assert!(idx.has_ci(), "CI companion lost across compaction");
+    for pattern in [
+        "(?i)goodbye",
+        "(?i)newcasing",
+        "(?i)temperature",
+        "(?i)kelvin",
+    ] {
+        assert_eq!(
+            search_set(&idx, tmp.path(), pattern),
+            full_scan_set(tmp.path(), pattern),
+            "CI mismatch post-compact for {pattern:?}"
+        );
+    }
+    drop(idx);
+
+    // A further update must still build the CI delta (meta.case_insensitive
+    // carried through the compacted baseline).
+    fs::write(tmp.path().join("delta2.ts"), "PostCompact MiXeD content").unwrap();
+    update_incremental(&idx_dir, tmp.path(), false).expect("update post-compact");
+    let idx = load_index(&idx_dir).expect("reload");
+    assert!(idx.has_ci());
+    let hits = search_set(&idx, tmp.path(), "(?i)postcompact");
+    assert_eq!(
+        hits,
+        full_scan_set(tmp.path(), "(?i)postcompact"),
+        "CI delta not built after compaction"
+    );
+    assert!(hits.iter().any(|k| k.starts_with("delta2.ts")));
+    drop(idx);
+
+    // Second compaction folds that CI delta too.
+    assert!(compact(&idx_dir, false).expect("compact 2").compacted);
+    let idx = load_index(&idx_dir).expect("load post-compact 2");
+    assert_eq!(
+        search_set(&idx, tmp.path(), "(?i)postcompact"),
+        full_scan_set(tmp.path(), "(?i)postcompact"),
     );
 }
 

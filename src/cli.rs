@@ -229,19 +229,24 @@ pub enum Commands {
     /// Benchmark PATTERN search in DIR
     #[command(name = "bench")]
     Bench { pattern: String, dir: PathBuf },
-    /// Incrementally update an existing index
+    /// Incrementally update an existing index. Index dir from the global
+    /// `--index` flag (default `.fgr`).
     #[command(name = "update")]
     Update {
         dir: Option<PathBuf>,
-        #[arg(long, default_value = ".fgr")]
-        index: PathBuf,
+        /// Skip the automatic rebaseline even if divergence crosses the
+        /// configured threshold (see config.toml `[compaction]`).
+        #[arg(long = "no-compact")]
+        no_compact: bool,
     },
-    /// Show index statistics
+    /// Show index statistics. Index dir from the global `--index` flag
+    /// (default `.fgr`).
     #[command(name = "stats")]
-    Stats {
-        #[arg(long, default_value = ".fgr")]
-        index: PathBuf,
-    },
+    Stats,
+    /// Rebaseline the index: fold the delta + tombstones into the primary and
+    /// densify. Index dir from the global `--index` flag (default `.fgr`).
+    #[command(name = "compact")]
+    Compact,
     /// Watch DIR for changes and keep index up-to-date
     #[command(name = "daemon")]
     Daemon {
@@ -327,6 +332,7 @@ pub fn run() -> Result<()> {
     if let Some(cmd) = cli.command {
         return run_subcommand(
             cmd,
+            cli.index_path.clone(),
             opts.no_ignore,
             opts.hidden,
             &opts.file_type,
@@ -515,7 +521,7 @@ fn run_indexed_search(
     // is the search PATH the user passed — this matches the natural intent
     // "give me a fast search over this directory."
     if !persist::is_current(idx_path) {
-        let reason = if idx_path.join("meta.json").exists() {
+        let reason = if persist::index_exists(idx_path) {
             "outdated (format changed)"
         } else {
             "not found"
@@ -729,11 +735,15 @@ fn output_summary(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
 
 fn run_subcommand(
     cmd: Commands,
+    index_path: Option<PathBuf>,
     no_ignore: bool,
     hidden: bool,
     type_filter: &[String],
     case_insensitive: bool,
 ) -> Result<()> {
+    // `update` and `stats` take the index dir from the global `--index` flag,
+    // defaulting to `.fgr` when it is omitted.
+    let idx_arg = || index_path.clone().unwrap_or_else(|| PathBuf::from(".fgr"));
     match cmd {
         Commands::Index {
             dir,
@@ -763,10 +773,8 @@ fn run_subcommand(
         Commands::Bench { pattern, dir } => {
             run_bench(&pattern, &dir, no_ignore, hidden, type_filter)?;
         }
-        Commands::Update {
-            dir,
-            index: idx_path,
-        } => {
+        Commands::Update { dir, no_compact } => {
+            let idx_path = idx_arg();
             let root = if let Some(d) = dir {
                 d
             } else {
@@ -785,7 +793,18 @@ fn run_subcommand(
                 }
             }
             let stats = persist::update_incremental(&idx_path, &root, true)?;
+
+            // Auto-rebaseline while we still hold the lock, if the config's
+            // thresholds say divergence is high enough. Folds in-place under the
+            // held lock; the cost is paid by this updater, never by a search.
+            // `--no-compact` opts out per run.
+            let compaction = if no_compact {
+                None
+            } else {
+                persist::maybe_auto_compact(&idx_path, &stats, false)?
+            };
             persist::release_index_lock(&idx_path);
+
             if stats.added == 0 && stats.modified == 0 && stats.deleted == 0 {
                 eprintln!("Index is up to date ({} files)", stats.unchanged);
             } else {
@@ -794,8 +813,17 @@ fn run_subcommand(
                     stats.added, stats.modified, stats.deleted, stats.unchanged, stats.duration_ms
                 );
             }
+            if let Some(out) = compaction {
+                if let Some(s) = out.stats {
+                    eprintln!(
+                        "Auto-compacted: {} live docs, {} dropped, {} trigrams",
+                        s.live_docs, s.dropped_docs, s.num_ngrams
+                    );
+                }
+            }
         }
-        Commands::Stats { index: index_path } => {
+        Commands::Stats => {
+            let index_path = idx_arg();
             if index_path.exists() {
                 let idx = persist::load(&index_path)?;
                 println!("Persistent Index Stats:");
@@ -808,6 +836,18 @@ fn run_subcommand(
                 if let Some(ref bm) = idx.bitmap_mmap {
                     println!("  Bitmaps size:  {}KB", bm.len() / 1024);
                 }
+                // Divergence from the frozen baseline + whether the config's
+                // thresholds say a rebaseline is due (see `fgr compact`).
+                let delta_docs = idx.delta_doc_ids.len();
+                let tombstones = idx.deleted_docs.len();
+                let cfg = crate::config::load(&index_path);
+                println!("  Delta docs:   {}", delta_docs);
+                println!("  Tombstones:   {}", tombstones);
+                println!(
+                    "  Compaction due: {}",
+                    cfg.compaction
+                        .should_compact(idx.main_num_docs, delta_docs, tombstones)
+                );
             } else {
                 let idx = index::SparseIndex::build_from_directory(
                     &index_path,
@@ -825,6 +865,23 @@ fn run_subcommand(
                     stats.estimated_ram_bytes / (1024 * 1024)
                 );
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
+            }
+        }
+        Commands::Compact => {
+            let idx_path = idx_arg();
+            let start = Instant::now();
+            let outcome = persist::compact(&idx_path, false)?;
+            if outcome.compacted {
+                let s = outcome.stats.expect("stats present when compacted");
+                eprintln!(
+                    "Compacted index: {} live docs, {} dropped, {} trigrams in {:.2}s",
+                    s.live_docs,
+                    s.dropped_docs,
+                    s.num_ngrams,
+                    start.elapsed().as_secs_f64()
+                );
+            } else {
+                eprintln!("Index already compact (no delta or tombstones to fold)");
             }
         }
         #[cfg(feature = "daemon")]
