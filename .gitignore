@@ -6,3 +6,8 @@
 
 # stray PDFs (briefs, exports) — keep them out of the public repo
 *.pdf
+
+benchmarks/results/*.json
+benchmarks/results/*.md
+docs/assets/*.gif
+docs/assets/*.cast
