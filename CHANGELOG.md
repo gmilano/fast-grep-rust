@@ -1,0 +1,85 @@
+# Changelog
+
+All notable changes to fast-grep are documented here.
+
+## [0.4.0] — 2026-07-18
+
+### Highlights
+
+fast-grep 0.4.0 introduces an explicit agent mode designed to reduce both
+repository-search latency and the number of tokens returned to coding agents.
+
+**New features:**
+- `--agent` flag: compact, lossless output (path printed once per file).
+- `--agent-aggressive` flag: compact + long-line trimming at 200 characters.
+- `--format <fmt>`: explicit format selection (`grep`, `compact`, `json`, `jsonl`).
+- `FGR_FORMAT` environment variable support (overridden by explicit flags).
+- Structured JSON and JSONL output formats with stable, documented schemas.
+- Output limits: `--max-results`, `--max-results-per-file`, `--max-files`, `--max-output-bytes`.
+- Context lines: `-C`/`--context N` wired up (N lines before and after each match).
+- `--agent-stats`: search latency, match count, output bytes, token estimates to stderr.
+- `fgr integrations` subcommand: prints integration guide for Claude Code, Codex, Aider.
+- `fgr bench --agent-metrics`: compares grep-format vs compact-format bytes and token estimates.
+- `integrations/` directory: setup guides for Claude Code, Codex, OpenCode, Aider, and MCP.
+- `scripts/bench-agent/run.sh`: reproducible benchmark script producing JSON + Markdown results.
+- `scripts/demo/demo.sh` + `demo.tape`: recordable demo for asciinema/VHS.
+- `Makefile`: `make demo`, `make bench-agent`, `make release`, `make test` targets.
+
+**Output format details:**
+- `--agent` / `--format compact`: path printed once per file, then `line: text` per match.
+  Relative paths from the search root. Lossless (all content preserved).
+- `--agent-aggressive`: compact + trim lines longer than 200 characters (appends `…`).
+  Trimming respects UTF-8 character boundaries.
+- `--format json`: single JSON object containing all results. Always valid, even for 0 matches.
+  Includes `truncated` metadata when output limits are applied.
+- `--format jsonl`: one JSON object per match (streaming-friendly).
+  JSON schema keys are stable across minor versions.
+
+**Output limit behavior:**
+- Limits are applied deterministically: matches sorted by path then line number, first N kept.
+- When output is truncated, compact/grep formats print a message to stderr.
+- JSON/JSONL include a `truncated` field with total vs. shown counts.
+- UTF-8 boundaries are never cut by `--max-output-bytes`.
+
+**Precedence (highest to lowest):**
+1. `--format <fmt>` (explicit, always wins)
+2. `--agent-aggressive`
+3. `--agent`
+4. `FGR_FORMAT` environment variable
+5. Default (grep format)
+
+### Bug fixes / robustness
+
+- Index `load()` now validates the version field; rejects incompatible indexes with a clear error.
+- Index `load()` validates `ngrams.lookup` size is a multiple of the entry size (corruption check).
+- Index `build()` writes to a temporary directory and renames atomically on completion.
+  An interrupted build no longer leaves a partially-written index.
+- Improved error messages throughout `persist.rs` with actionable hints.
+
+### Documentation
+
+- README rewritten to lead with agent-oriented positioning and use-case table.
+- "Why coding agents need a different grep" section explains the dual-cost problem.
+- Agent output comparison section with measured byte/token counts (not invented).
+- Trade-offs section documenting: index cost, disk usage, pattern fallbacks, `-i` bypass,
+  symlinks, binary files, large files, case sensitivity, and agent output limitations.
+- JSON schema documented with stable-key guarantee.
+- Output format precedence documented.
+
+### Compatibility
+
+- Default output format is unchanged (grep: `file:line:text`).
+- No breaking changes to existing flags or subcommands.
+- Binary format version remains 3; existing indexes are compatible.
+- `-c/--count` and `-l/--files-with-matches` reject incompatible formats (`json`, `jsonl`)
+  with a clear error and non-zero exit code.
+
+### Removed
+
+- Stale `[[example]]` entry in `Cargo.toml` pointing to `/tmp/re_test.rs`.
+
+---
+
+## [0.3.x] — previous releases
+
+See git log for earlier changes. CHANGELOG started at 0.4.0.
