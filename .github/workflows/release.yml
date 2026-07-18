@@ -149,7 +149,7 @@ jobs:
           echo "sha256=${archive}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -213,7 +213,7 @@ jobs:
           for f in *.deb; do sha256sum "$f" | awk '{print $1}' > "$f.sha256"; done
           ls -la
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.target }}
           path: dist/*
