@@ -2,6 +2,7 @@ pub mod casefold;
 pub mod config;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+pub mod filetype;
 pub mod index;
 #[cfg(target_os = "macos")]
 pub mod metal;

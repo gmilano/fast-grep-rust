@@ -7,9 +7,14 @@
 //! hand edits stick. Missing file or missing fields fall back to the defaults,
 //! and a malformed file degrades to defaults with a warning rather than failing.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+
+use crate::filetype::{self, ExtClass};
 
 /// File name (in the index root) holding the editable per-index config.
 pub const CONFIG_FILE: &str = "config.toml";
@@ -31,12 +36,28 @@ delta_docs_abs = 500     # compact once the live delta exceeds this many docs
 delta_docs_ratio = 0.05  # ...or once it exceeds this fraction of the baseline
 tombstone_ratio = 0.10   # ...or once tombstones exceed this fraction of it
 min_main_docs = 500      # never auto-compact a baseline smaller than this
+
+[index]
+# What gets indexed. Binary files are detected by extension AND a confirmed
+# magic signature, so a text file misnamed `.png` is still indexed.
+max_file_size_mb = 64            # skip files larger than this (0 = no limit)
+# Known text extensions (.rs, .log, .txt, .csv, ...) are always indexed even
+# past the cap. Add more extensions and/or relative-path globs that should also
+# bypass the cap and always be indexed:
+always_index_extensions = []     # e.g. [\"ndjson\", \"dump\"]
+always_index_paths = []          # e.g. [\"logs/**\", \"data/*.bin\"]
+# Binary extensions with no magic (bin/dat/o/obj/lzma/eot/pyc/pyo/tar) are
+# classified by content: a NUL or >this%% high bytes (in NUL-free, non-UTF-8
+# data) means binary; UTF-8 text (incl. CJK) is always kept. Tune 30-40.
+binary_high_byte_pct = 30
 ";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +131,193 @@ impl CompactionConfig {
             || (delta_docs as f64 / denom) >= self.delta_docs_ratio
             || (tombstones as f64 / denom) >= self.tombstone_ratio
     }
+}
+
+/// What gets indexed: the binary/size admission policy, editable per index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexConfig {
+    /// Files larger than this are skipped, unless their extension is known-text,
+    /// listed in `always_index_extensions`, or matched by `always_index_paths`.
+    /// `0` disables the cap.
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Extra extensions (no dot, any case) treated as always-text: indexed past
+    /// the size cap and exempt from the NUL heuristic.
+    #[serde(default)]
+    pub always_index_extensions: Vec<String>,
+    /// Relative-path globs (from the index root) that bypass the size cap.
+    #[serde(default)]
+    pub always_index_paths: Vec<String>,
+    /// For binary extensions with no magic signature (bin, dat, o, obj, lzma,
+    /// eot, pyc, pyo, tar): a NUL-free, non-UTF-8 sample is treated as binary
+    /// when more than this %% of its bytes are > 127. UTF-8 text (incl. CJK) is
+    /// always kept. Tune 30–40; higher indexes more of these as text.
+    #[serde(default = "default_binary_high_byte_pct")]
+    pub binary_high_byte_pct: u8,
+}
+
+fn default_max_file_size_mb() -> u64 {
+    64
+}
+fn default_binary_high_byte_pct() -> u8 {
+    filetype::DEFAULT_HIGH_BYTE_PCT
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size_mb: default_max_file_size_mb(),
+            always_index_extensions: Vec::new(),
+            always_index_paths: Vec::new(),
+            binary_high_byte_pct: default_binary_high_byte_pct(),
+        }
+    }
+}
+
+/// Outcome of the indexing admission decision for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Candidate {
+    /// Index this file (caller still reads it and runs the NUL backstop).
+    Admit,
+    /// A confirmed / marker-less binary — skip without reading the body.
+    SkipBinary,
+    /// Over the size cap and not exempt — skip.
+    SkipTooLarge,
+}
+
+/// Compiled admission policy shared by the index build, incremental update, and
+/// the stale check, so all three agree on the file set (a disagreement makes an
+/// index churn — a file one path includes and another drops is re-indexed then
+/// evicted on every update). Cheap to clone across rayon workers.
+#[derive(Debug, Clone)]
+pub struct Admission {
+    max_bytes: Option<u64>,
+    extra_text: HashSet<String>,
+    path_globs: Option<GlobSet>,
+    binary_high_byte_pct: u8,
+    root: PathBuf,
+}
+
+impl Admission {
+    /// Build from an `IndexConfig`, resolving path globs against `root`.
+    /// Invalid globs are warned about and skipped rather than failing the build.
+    pub fn from_config(cfg: &IndexConfig, root: &Path) -> Self {
+        let max_bytes = (cfg.max_file_size_mb > 0).then(|| cfg.max_file_size_mb * 1024 * 1024);
+        let extra_text = cfg
+            .always_index_extensions
+            .iter()
+            .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        let path_globs = if cfg.always_index_paths.is_empty() {
+            None
+        } else {
+            let mut b = GlobSetBuilder::new();
+            for pat in &cfg.always_index_paths {
+                match Glob::new(pat) {
+                    Ok(g) => {
+                        b.add(g);
+                    }
+                    Err(e) => {
+                        eprintln!("warning: ignoring invalid always_index_paths glob `{pat}`: {e}")
+                    }
+                }
+            }
+            b.build().ok()
+        };
+        Self {
+            max_bytes,
+            extra_text,
+            path_globs,
+            binary_high_byte_pct: cfg.binary_high_byte_pct,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// A file exempt from the size cap: known-text extension, a configured extra
+    /// text extension, or a configured relative-path glob.
+    fn size_exempt(&self, path: &Path, ext: &str) -> bool {
+        if filetype::is_known_text_ext_str(ext) || self.extra_text.contains(ext) {
+            return true;
+        }
+        match &self.path_globs {
+            Some(gs) => {
+                let rel = path.strip_prefix(&self.root).unwrap_or(path);
+                gs.is_match(rel)
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the NUL backstop should be skipped for this extension (it is
+    /// trusted text). Path-glob exemptions keep the NUL check.
+    pub fn is_text_ext(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some(e) => filetype::is_known_text_ext_str(e) || self.extra_text.contains(e),
+            None => false,
+        }
+    }
+}
+
+/// Decide whether to index `path` under `adm`. `size_hint` is the on-disk size
+/// when the caller already has it (e.g. the update walk, which stats for mtime
+/// anyway); pass `None` and this stats lazily — but only when a size cap is in
+/// effect and the file isn't cap-exempt, so the common case (text sources under
+/// a cap) does no stat at all. Reads a bounded header only for signature-binary
+/// extensions, returning `SkipBinary` without touching the body when confirmed.
+pub fn admit_file(
+    path: &Path,
+    size_hint: Option<u64>,
+    adm: &Admission,
+) -> std::io::Result<Candidate> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match filetype::classify_ext(&ext) {
+        ExtClass::NoMarker => {
+            // No magic to confirm; decide by content instead of skipping blind.
+            let block = read_header(path, filetype::CONTENT_PEEK)?;
+            if filetype::looks_binary_content(&block, adm.binary_high_byte_pct) {
+                return Ok(Candidate::SkipBinary);
+            }
+            // Looks like text → fall through to the size check and index it.
+        }
+        ExtClass::Signature => {
+            let header = read_header(path, filetype::HEADER_PEEK)?;
+            if filetype::header_confirms_binary(&ext, &header) {
+                return Ok(Candidate::SkipBinary);
+            }
+            // Magic absent → misnamed; fall through to the size check as text.
+        }
+        ExtClass::NotBinary => {}
+    }
+
+    if let Some(max) = adm.max_bytes {
+        if !adm.size_exempt(path, &ext) {
+            let size = match size_hint {
+                Some(s) => s,
+                None => std::fs::metadata(path)?.len(),
+            };
+            if size > max {
+                return Ok(Candidate::SkipTooLarge);
+            }
+        }
+    }
+    Ok(Candidate::Admit)
+}
+
+/// Read up to `n` bytes from the start of `path`.
+fn read_header(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(n);
+    f.take(n as u64).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// Load `<index_dir>/config.toml`, falling back to defaults when it is absent,
@@ -190,5 +398,136 @@ mod tests {
         assert_eq!(cfg.compaction.delta_docs_ratio, d.delta_docs_ratio);
         assert_eq!(cfg.compaction.tombstone_ratio, d.tombstone_ratio);
         assert_eq!(cfg.compaction.min_main_docs, d.min_main_docs);
+        // The new [index] section parses to its defaults too.
+        assert_eq!(cfg.index.max_file_size_mb, 64);
+        assert!(cfg.index.always_index_extensions.is_empty());
+    }
+
+    // --- file admission ---
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn admit_confirmed_binary_skips_regardless_of_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adm = Admission::from_config(&IndexConfig::default(), tmp.path());
+        let png = write(tmp.path(), "logo.png", b"\x89PNG\r\n\x1a\n\x00\x00");
+        // Confirmed binary short-circuits before the size check.
+        assert_eq!(
+            admit_file(&png, Some(0), &adm).unwrap(),
+            Candidate::SkipBinary
+        );
+        assert_eq!(
+            admit_file(&png, Some(500 * MB), &adm).unwrap(),
+            Candidate::SkipBinary
+        );
+    }
+
+    #[test]
+    fn admit_misnamed_text_with_binary_ext_is_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adm = Admission::from_config(&IndexConfig::default(), tmp.path());
+        // A text file called `.png` fails the magic check → not skipped.
+        let fake = write(tmp.path(), "notes.png", b"just some notes, not a png\n");
+        assert_eq!(admit_file(&fake, Some(10), &adm).unwrap(), Candidate::Admit);
+    }
+
+    #[test]
+    fn admit_no_marker_binary_decided_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adm = Admission::from_config(&IndexConfig::default(), tmp.path());
+
+        // A no-marker extension holding a NUL → binary.
+        let nul = write(tmp.path(), "a.o", b"\x7fELF\x00\x00\x00stuff");
+        assert_eq!(
+            admit_file(&nul, Some(10), &adm).unwrap(),
+            Candidate::SkipBinary
+        );
+
+        // A no-marker extension holding high-entropy, NUL-free, non-UTF-8 data
+        // → binary.
+        let hi: Vec<u8> = (0..4000u32)
+            .map(|i| if i % 2 == 0 { 0xC0 } else { 0xFF })
+            .collect();
+        let blob = write(tmp.path(), "b.dat", &hi);
+        assert_eq!(
+            admit_file(&blob, Some(10), &adm).unwrap(),
+            Candidate::SkipBinary
+        );
+
+        // A `.dat` that is actually plain ASCII text → now INDEXED (not naive).
+        let txt = write(tmp.path(), "c.dat", b"key=value\nname=example\nport=8080\n");
+        assert_eq!(admit_file(&txt, Some(10), &adm).unwrap(), Candidate::Admit);
+
+        // A `.dat` of valid CJK UTF-8 → text (protected despite high bytes).
+        let cjk = write(
+            tmp.path(),
+            "d.dat",
+            "設定ファイル：バイナリではない".as_bytes(),
+        );
+        assert_eq!(admit_file(&cjk, Some(10), &adm).unwrap(), Candidate::Admit);
+    }
+
+    #[test]
+    fn admit_size_cap_with_text_and_config_exemptions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = IndexConfig {
+            max_file_size_mb: 64,
+            always_index_extensions: vec!["dump".into()],
+            always_index_paths: vec!["big/**".into()],
+            ..Default::default()
+        };
+        let adm = Admission::from_config(&cfg, tmp.path());
+
+        // Oversized unknown extension → skipped (size is passed, not measured).
+        let big = write(tmp.path(), "huge.xyz", b"x");
+        assert_eq!(
+            admit_file(&big, Some(100 * MB), &adm).unwrap(),
+            Candidate::SkipTooLarge
+        );
+        // Oversized known-text extension → indexed.
+        let log = write(tmp.path(), "huge.log", b"x");
+        assert_eq!(
+            admit_file(&log, Some(100 * MB), &adm).unwrap(),
+            Candidate::Admit
+        );
+        // Oversized configured extension → indexed.
+        let dump = write(tmp.path(), "huge.dump", b"x");
+        assert_eq!(
+            admit_file(&dump, Some(100 * MB), &adm).unwrap(),
+            Candidate::Admit
+        );
+        // Oversized file under a configured path glob → indexed.
+        let pathed = write(tmp.path(), "big/huge.xyz", b"x");
+        assert_eq!(
+            admit_file(&pathed, Some(100 * MB), &adm).unwrap(),
+            Candidate::Admit
+        );
+        // Under the cap → admitted regardless.
+        assert_eq!(admit_file(&big, Some(10), &adm).unwrap(), Candidate::Admit);
+    }
+
+    #[test]
+    fn admit_zero_cap_disables_size_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = IndexConfig {
+            max_file_size_mb: 0,
+            ..Default::default()
+        };
+        let adm = Admission::from_config(&cfg, tmp.path());
+        let big = write(tmp.path(), "huge.xyz", b"x");
+        assert_eq!(
+            admit_file(&big, Some(500 * MB), &adm).unwrap(),
+            Candidate::Admit
+        );
     }
 }
