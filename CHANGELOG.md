@@ -2,6 +2,33 @@
 
 All notable changes to fast-grep are documented here.
 
+## [Unreleased]
+
+### Indexing — binary detection & size cap
+
+- **Binaries are skipped without being read.** Files were previously read in
+  full and only then rejected via a NUL-byte scan; a binary with no NUL in its
+  first bytes (a text-looking blob) could even be indexed as garbage. Detection
+  now happens by extension **plus** a confirmed magic signature — not naive: a
+  text file misnamed `logo.png` is still indexed, and a real PNG is skipped
+  after a short header read.
+- **Broadened format coverage.** The signature set extends the previous list
+  with ~40 common formats — modern media (heic/heif/avif/jxl/flv/…), ZIP-based
+  packages (apk/ipa/whl/vsix/epub/office `*x`/…), ML & data
+  (gguf/npy/tflite/parquet/hdf5/arrow/…), and native modules (pyd/ko/msi/deb/…).
+- **Content heuristic for marker-less binary extensions** (`bin`, `dat`, `o`,
+  `obj`, `lzma`, `eot`, `pyc`, `pyo`, `tar`): a NUL, or a high `>127`-byte ratio
+  in NUL-free non-UTF-8 data, means binary; valid UTF-8 (incl. CJK) is kept, so
+  a `.dat` that is really text now gets indexed.
+- **Size cap** (`max_file_size_mb`, default 64) skips oversized files, with
+  known-text extensions and configurable extension/path exemptions always
+  indexed past it.
+- **New `[index]` section** in `<index>/config.toml`: `max_file_size_mb`,
+  `always_index_extensions`, `always_index_paths`, `binary_high_byte_pct`.
+- Build reports binary / too-large skip counts; the same admission policy gates
+  build, incremental update, the stale check, and the no-index scan so they
+  agree on the file set.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights

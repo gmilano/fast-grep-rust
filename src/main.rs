@@ -3,6 +3,7 @@ mod cli;
 mod config;
 #[cfg(feature = "daemon")]
 mod daemon;
+mod filetype;
 mod index;
 #[cfg(target_os = "macos")]
 pub mod metal;

@@ -666,79 +666,39 @@ fn line_bounds(buf: &[u8], offset: usize) -> (usize, usize) {
     (line_start, line_end)
 }
 
-/// Check if buffer looks binary (null byte in first 512 bytes).
-#[inline]
-pub(crate) fn is_binary(buf: &[u8]) -> bool {
-    let check_len = buf.len().min(512);
-    memchr::memchr(0, &buf[..check_len]).is_some()
-}
+// File classification lives in `crate::filetype` (one source of truth shared
+// by the index build, incremental update, and the search paths). Re-exported
+// here so existing `crate::searcher::{is_binary, is_known_text_ext}` callers
+// keep compiling.
+pub(crate) use crate::filetype::{is_binary, is_known_text_ext};
 
-/// Known text extensions — skip binary check for these (major perf win)
-#[inline(always)]
-pub(crate) fn is_known_text_ext(path: &std::path::Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => matches!(
-            e,
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "rb"
-                | "java"
-                | "c"
-                | "h"
-                | "cpp"
-                | "cc"
-                | "hpp"
-                | "cs"
-                | "swift"
-                | "kt"
-                | "scala"
-                | "php"
-                | "html"
-                | "css"
-                | "scss"
-                | "less"
-                | "json"
-                | "toml"
-                | "yaml"
-                | "yml"
-                | "md"
-                | "txt"
-                | "sh"
-                | "bash"
-                | "zsh"
-                | "fish"
-                | "vim"
-                | "lua"
-                | "r"
-                | "sql"
-                | "xml"
-                | "svg"
-                | "tf"
-                | "hcl"
-                | "nix"
-                | "ex"
-                | "exs"
-                | "erl"
-                | "hrl"
-                | "ml"
-                | "mli"
-                | "hs"
-                | "clj"
-                | "cljs"
-                | "lisp"
-                | "el"
-                | "dart"
-                | "zig"
-                | "v"
-                | "proto"
-                | "graphql"
-                | "gql"
-        ),
-        None => false,
+/// Skip a candidate whose extension is a *confirmed* binary (magic matches) or a
+/// marker-less binary extension. Used by the no-index full-scan paths, where the
+/// file bytes are already mmapped so the header check is free. Returns true when
+/// the file should be skipped as binary purely from its extension + header,
+/// before the NUL heuristic.
+#[inline]
+pub(crate) fn skip_binary_by_ext(path: &std::path::Path, header: &[u8]) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let Some(ext) = ext.as_deref() else {
+        return false;
+    };
+    match crate::filetype::classify_ext(ext) {
+        crate::filetype::ExtClass::NoMarker => {
+            // No index config on the no-index scan → default threshold.
+            let n = header.len().min(crate::filetype::CONTENT_PEEK);
+            crate::filetype::looks_binary_content(
+                &header[..n],
+                crate::filetype::DEFAULT_HIGH_BYTE_PCT,
+            )
+        }
+        crate::filetype::ExtClass::Signature => {
+            crate::filetype::header_confirms_binary(ext, header)
+        }
+        crate::filetype::ExtClass::NotBinary => false,
     }
 }
 
@@ -1247,7 +1207,7 @@ pub fn search_full_scan(
                 &read_buf[..]
             };
 
-            if !is_known_text_ext(path) && is_binary(buf) {
+            if skip_binary_by_ext(path, buf) || (!is_known_text_ext(path) && is_binary(buf)) {
                 return ignore::WalkState::Continue;
             }
 
@@ -1361,7 +1321,7 @@ pub fn search_full_scan_count(
                 &read_buf[..]
             };
 
-            if !is_known_text_ext(path) && is_binary(buf) {
+            if skip_binary_by_ext(path, buf) || (!is_known_text_ext(path) && is_binary(buf)) {
                 return ignore::WalkState::Continue;
             }
 
@@ -1464,7 +1424,7 @@ pub fn search_full_scan_any(
                 &read_buf[..]
             };
 
-            if !is_known_text_ext(path) && is_binary(buf) {
+            if skip_binary_by_ext(path, buf) || (!is_known_text_ext(path) && is_binary(buf)) {
                 return ignore::WalkState::Continue;
             }
 

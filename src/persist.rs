@@ -1361,8 +1361,18 @@ pub fn build(
         eprintln!("Building index for {:?}...", root);
     }
 
-    let index =
-        SparseIndex::build_from_directory(root, no_ignore, type_filter, verbose, case_insensitive)?;
+    // Admission policy from the index's config (defaults on a first build,
+    // before `config.toml` is written below). The same policy gates the
+    // incremental update + stale walk, so all three agree on the file set.
+    let admission = crate::config::Admission::from_config(&crate::config::load(output).index, root);
+    let index = SparseIndex::build_from_directory(
+        root,
+        no_ignore,
+        type_filter,
+        verbose,
+        case_insensitive,
+        &admission,
+    )?;
 
     fs::create_dir_all(output).context("creating output directory")?;
 
@@ -1771,6 +1781,7 @@ fn index_dir_in_walk(index_path: &Path, walk_root: &Path) -> PathBuf {
 fn collect_tree_state(
     root: &Path,
     exclude_dir: &Path,
+    admission: &crate::config::Admission,
 ) -> (HashMap<String, u64>, HashMap<String, u64>) {
     use ignore::WalkState;
     let files: std::sync::Mutex<HashMap<String, u64>> = std::sync::Mutex::new(HashMap::new());
@@ -1798,10 +1809,19 @@ fn collect_tree_state(
                 }
             } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 if let Ok(m) = entry.metadata() {
-                    files
-                        .lock()
-                        .unwrap()
-                        .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                    // Apply the same admission policy as the build, so a binary
+                    // or over-cap file never enters the tracked set (otherwise
+                    // it would be classified "added" every update and churn).
+                    // Anything but Admit (SkipBinary / SkipTooLarge / IO error)
+                    // is simply left untracked.
+                    if let Ok(crate::config::Candidate::Admit) =
+                        crate::config::admit_file(path, Some(m.len()), admission)
+                    {
+                        files
+                            .lock()
+                            .unwrap()
+                            .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                    }
                 }
             }
             WalkState::Continue
@@ -1922,8 +1942,12 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
-    // 2. Walk root — get current file mtimes and directory mtimes (parallel)
-    let (current_files, new_dir_mtimes) = collect_tree_state(root, &index_in_walk);
+    // 2. Walk root — get current file mtimes and directory mtimes (parallel),
+    // applying the index's admission policy so binaries / over-cap files are
+    // never tracked (must match the build to avoid churn).
+    let admission =
+        crate::config::Admission::from_config(&crate::config::load(index_path).index, root);
+    let (current_files, new_dir_mtimes) = collect_tree_state(root, &index_in_walk, &admission);
 
     // 3. Classify: added, modified, deleted (vs last known state)
     let mut added_set: HashSet<String> = HashSet::new();
@@ -2241,7 +2265,9 @@ pub fn full_stale_check(index: &PersistentIndex, index_path: &Path) -> bool {
     // index-dir exclusion), so "stale" here agrees exactly with what an update
     // would classify as changed.
     let exclude = index_dir_in_walk(index_path, root);
-    let (files, dirs) = collect_tree_state(root, &exclude);
+    let admission =
+        crate::config::Admission::from_config(&crate::config::load(index_path).index, root);
+    let (files, dirs) = collect_tree_state(root, &exclude, &admission);
 
     for (path, mtime) in &dirs {
         match index.meta.dir_mtimes.get(path) {

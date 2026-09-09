@@ -200,6 +200,34 @@ in-flight searches (see [REBASELINE.md](REBASELINE.md) for the design).
   The auto-compaction cost is paid by the updater (or the daemon, off its event
   loop) — never by a search.
 
+### What gets indexed (binaries & large files)
+
+fast-grep indexes text files and skips binaries. Binaries are detected by
+extension **and** a confirmed magic signature, so detection is not naive: a
+text file misnamed `logo.png` is still indexed, while a real PNG is skipped
+without reading its body. A built-in denylist covers 100+ formats (images,
+audio/video, archives, executables, fonts, documents, databases, ML/data).
+Extensions with no reliable magic (`bin`, `dat`, `o`, `obj`, `lzma`, `eot`,
+`pyc`, `pyo`, `tar`) are decided by content: a NUL byte — or, in NUL-free
+non-UTF-8 data, a high ratio of `>127` bytes — means binary, while valid UTF-8
+(including CJK / accented text) is always kept.
+
+Files larger than a size cap (default **64 MiB**) are skipped, **unless** their
+extension is known-text (`.log`, `.csv`, `.txt`, source files, …) or you exempt
+them. All of this is tunable per index in `<index>/config.toml`:
+
+```toml
+[index]
+max_file_size_mb = 64            # skip files larger than this (0 = no limit)
+always_index_extensions = []     # extra text extensions, indexed past the cap
+always_index_paths = []          # relative-path globs, indexed past the cap
+binary_high_byte_pct = 30        # >127-byte %% for the no-magic content check
+```
+
+These settings apply to the index. A no-index `fgr` scan skips the same known
+binaries (for parity) but has no size cap — you can always grep a huge file
+directly.
+
 ### Daemon mode (auto-incremental updates)
 
 Run a background watcher that observes filesystem changes and applies

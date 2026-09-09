@@ -723,6 +723,74 @@ fn modified_file_yields_no_duplicate_matches() {
     assert_eq!(hits, deduped, "duplicate match lines for a modified file");
 }
 
+/// Index admission: confirmed binaries (by extension + magic) and over-cap
+/// files are skipped, while a misnamed-text file, known-text over the cap, and
+/// a config path-glob exemption are all indexed. Uses a tiny 1 MiB cap set via
+/// config.toml so the test doesn't have to write 64 MiB files.
+#[test]
+fn index_admission_skips_binaries_and_caps_size() {
+    let corpus = tempfile::tempdir().unwrap();
+    let c = corpus.path();
+    let big = |marker: &str| format!("{marker}\n{}", "abc ".repeat(300_000)); // ~1.2 MB
+
+    // Real PNG magic (no NUL in the first bytes) + searchable text after it.
+    fs::write(
+        c.join("logo.png"),
+        [b"\x89PNG\r\n\x1a\n".as_ref(), b"secretmarker here"].concat(),
+    )
+    .unwrap();
+    // Text file misnamed with a binary extension — magic absent → indexed.
+    fs::write(c.join("notes.png"), b"pngtextmarker lives here\n").unwrap();
+    // Marker-less binary extension with real binary content (NUL) → skipped.
+    fs::write(c.join("blob.bin"), b"\x00\x01binmarker\x00payload\x02").unwrap();
+    // Marker-less binary extension that is actually ASCII text → now indexed.
+    fs::write(c.join("config.dat"), b"datmarker key = value\n").unwrap();
+    // Over-cap known-text extension → indexed.
+    fs::write(c.join("huge.log"), big("logmarker")).unwrap();
+    // Over-cap unknown extension → skipped (too large).
+    fs::write(c.join("huge.xyz"), big("xyzmarker")).unwrap();
+    // Over-cap file under a configured path glob → indexed.
+    fs::create_dir_all(c.join("big")).unwrap();
+    fs::write(c.join("big/huge.xyz"), big("pathmarker")).unwrap();
+    // A normal small source file, as a control.
+    fs::write(c.join("main.rs"), b"fn controlmarker() {}\n").unwrap();
+
+    // Index dir outside the corpus, pre-seeded with a 1 MiB cap + path exemption.
+    let idxtmp = tempfile::tempdir().unwrap();
+    let idx_dir = idxtmp.path().join("idx");
+    fs::create_dir_all(&idx_dir).unwrap();
+    fs::write(
+        idx_dir.join("config.toml"),
+        "[index]\nmax_file_size_mb = 1\nalways_index_paths = [\"big/**\"]\n",
+    )
+    .unwrap();
+
+    build_index(c, &idx_dir, true, &[], false, false).unwrap();
+    let idx = load_index(&idx_dir).unwrap();
+
+    let present = |m: &str| !search(&idx, m).is_empty();
+    assert!(present("controlmarker"), "control .rs indexed");
+    assert!(
+        !present("secretmarker"),
+        "real PNG skipped by magic (not just NUL)"
+    );
+    assert!(
+        present("pngtextmarker"),
+        "misnamed-text .png indexed (not naive)"
+    );
+    assert!(!present("binmarker"), "binary .bin (NUL) skipped");
+    assert!(
+        present("datmarker"),
+        "text-content .dat indexed (content heuristic)"
+    );
+    assert!(present("logmarker"), "over-cap .log indexed (known text)");
+    assert!(!present("xyzmarker"), "over-cap unknown ext skipped");
+    assert!(
+        present("pathmarker"),
+        "over-cap path-glob exemption indexed"
+    );
+}
+
 /// `try_acquire_index_lock` is non-blocking: it returns None while the lock is
 /// held (letting the daemon skip an update round during a background
 /// compaction) and Some once it is released.

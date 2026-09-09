@@ -5,6 +5,7 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 
 use crate::casefold;
+use crate::config::{self, Admission, Candidate};
 use crate::postenc::PostingWriter;
 use crate::searcher::is_known_text_ext;
 
@@ -156,6 +157,7 @@ impl SparseIndex {
         type_filter: &[String],
         verbose: bool,
         case_insensitive: bool,
+        admission: &Admission,
     ) -> Result<Self> {
         // Phase 1: collect all file paths
         let walker = WalkBuilder::new(root)
@@ -178,22 +180,41 @@ impl SparseIndex {
             paths.push(path.to_path_buf());
         }
 
-        // Phase 2: index all files
+        // Phase 2: index all files. The admission policy (binary-extension +
+        // magic signature, and the size cap with text/config exemptions) skips
+        // known binaries WITHOUT reading their bodies; the NUL heuristic stays
+        // as the content backstop for everything that gets read. The same
+        // `config::admit_file` gates the incremental update + stale walk, so all
+        // three agree on the file set.
         let mut index = SparseIndex::with_case_insensitive(case_insensitive);
         let mut count = 0u32;
+        let (mut skipped_binary, mut skipped_large) = (0u32, 0u32);
         for path in &paths {
+            match config::admit_file(path, None, admission) {
+                Ok(Candidate::SkipBinary) => {
+                    skipped_binary += 1;
+                    continue;
+                }
+                Ok(Candidate::SkipTooLarge) => {
+                    skipped_large += 1;
+                    continue;
+                }
+                Ok(Candidate::Admit) => {}
+                Err(_) => continue,
+            }
             let content = match std::fs::read(path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // Match `search_full_scan`'s binary-detection rule so the
-            // indexed and direct-scan paths see the same set of files.
-            // Known text extensions (`.txt`, `.rs`, etc.) trust the
-            // extension and bypass the null-byte heuristic — fixtures
-            // can legitimately contain `\0` and we don't want to drop
-            // them from the index when the direct scan would still
-            // search them.
-            if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
+            // Content backstop: reject binaries that slipped past the extension
+            // check (unknown extension with NUL bytes). Known/configured text
+            // extensions are trusted and bypass it — fixtures can legitimately
+            // contain `\0` and the direct scan would still search them.
+            if !admission.is_text_ext(path)
+                && !is_known_text_ext(path)
+                && content.iter().take(512).any(|&b| b == 0)
+            {
+                skipped_binary += 1;
                 continue;
             }
 
@@ -206,9 +227,11 @@ impl SparseIndex {
 
         if verbose {
             eprintln!(
-                "  indexed {} files total, {} trigrams",
+                "  indexed {} files total, {} trigrams ({} binary, {} too-large skipped)",
                 count,
-                index.ngrams.len()
+                index.ngrams.len(),
+                skipped_binary,
+                skipped_large
             );
         }
 

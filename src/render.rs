@@ -802,7 +802,9 @@ pub(crate) fn render_file_into(
     if mmap.is_empty() {
         return 0;
     }
-    if !is_known_text_ext(path) && is_binary(mmap) {
+    if crate::searcher::skip_binary_by_ext(path, mmap)
+        || (!is_known_text_ext(path) && is_binary(mmap))
+    {
         return 0;
     }
 

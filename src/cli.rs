@@ -849,12 +849,17 @@ fn run_subcommand(
                         .should_compact(idx.main_num_docs, delta_docs, tombstones)
                 );
             } else {
+                let admission = crate::config::Admission::from_config(
+                    &crate::config::IndexConfig::default(),
+                    &index_path,
+                );
                 let idx = index::SparseIndex::build_from_directory(
                     &index_path,
                     no_ignore,
                     type_filter,
                     false,
                     false,
+                    &admission,
                 )?;
                 let stats = idx.stats();
                 println!("In-memory Index Stats:");
