@@ -50,6 +50,12 @@ always_index_paths = []          # e.g. [\"logs/**\", \"data/*.bin\"]
 # classified by content: a NUL or >this%% high bytes (in NUL-free, non-UTF-8
 # data) means binary; UTF-8 text (incl. CJK) is always kept. Tune 30-40.
 binary_high_byte_pct = 30
+# Bound the peak RAM of a full `fgr index` build. Postings are accumulated in a
+# buffer of about this many MiB, spilled to sorted temp segments when it fills,
+# then k-way merged into the final index — so peak memory stays flat instead of
+# growing with the repository. 0 disables spilling (fastest, but the whole index
+# is held in RAM). The final index is byte-identical either way.
+build_buffer_mb = 256
 ";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,6 +123,21 @@ impl Default for CompactionConfig {
     }
 }
 
+fn default_build_buffer_mb() -> usize {
+    256
+}
+
+impl IndexConfig {
+    /// Build buffer budget in bytes; `None` means unbounded (never spill).
+    pub fn build_budget_bytes(&self) -> Option<usize> {
+        if self.build_buffer_mb == 0 {
+            None
+        } else {
+            Some(self.build_buffer_mb * 1024 * 1024)
+        }
+    }
+}
+
 impl CompactionConfig {
     /// Whether divergence warrants an automatic rebaseline. `main_docs` is the
     /// baseline doc count (the denominator for the ratios), `delta_docs` the
@@ -154,6 +175,11 @@ pub struct IndexConfig {
     /// always kept. Tune 30–40; higher indexes more of these as text.
     #[serde(default = "default_binary_high_byte_pct")]
     pub binary_high_byte_pct: u8,
+    /// Peak build buffer in MiB before postings are spilled to a sorted temp
+    /// segment and later k-way merged. Keeps peak RAM flat regardless of corpus
+    /// size. `0` disables spilling (the whole index is assembled in RAM).
+    #[serde(default = "default_build_buffer_mb")]
+    pub build_buffer_mb: usize,
 }
 
 fn default_max_file_size_mb() -> u64 {
@@ -170,6 +196,7 @@ impl Default for IndexConfig {
             always_index_extensions: Vec::new(),
             always_index_paths: Vec::new(),
             binary_high_byte_pct: default_binary_high_byte_pct(),
+            build_buffer_mb: default_build_buffer_mb(),
         }
     }
 }
@@ -401,6 +428,10 @@ mod tests {
         // The new [index] section parses to its defaults too.
         assert_eq!(cfg.index.max_file_size_mb, 64);
         assert!(cfg.index.always_index_extensions.is_empty());
+        assert_eq!(
+            cfg.index.build_buffer_mb,
+            IndexConfig::default().build_buffer_mb
+        );
     }
 
     // --- file admission ---
@@ -529,5 +560,17 @@ mod tests {
             admit_file(&big, Some(500 * MB), &adm).unwrap(),
             Candidate::Admit
         );
+    }
+
+    #[test]
+    fn index_config_defaults_and_budget() {
+        let d = IndexConfig::default();
+        assert_eq!(d.build_buffer_mb, 256);
+        assert_eq!(d.build_budget_bytes(), Some(256 * 1024 * 1024));
+        let unbounded = IndexConfig {
+            build_buffer_mb: 0,
+            ..Default::default()
+        };
+        assert_eq!(unbounded.build_budget_bytes(), None);
     }
 }

@@ -16,11 +16,6 @@ pub struct IndexStats {
     pub avg_postings_len: f64,
 }
 
-/// A posting entry: (doc_id, line_no, byte_offset).
-/// - line_no: 1-based line number where this trigram appears
-/// - byte_offset: byte offset of the start of that line in the file
-pub type Posting = (u32, u32, u32);
-
 /// Accumulates one trigram's posting list already in the compact
 /// (delta-varint) wire format. Postings are encoded into `bytes` as they are
 /// added, so the build never materializes the decoded `Vec<Posting>` for the
@@ -34,6 +29,17 @@ pub struct TrigramBuilder {
     writer: PostingWriter,
     /// Number of postings encoded, for `stats()` / `avg_postings_len`.
     count: u32,
+}
+
+impl TrigramBuilder {
+    /// Append one posting (compact, delta-encoded on the spot). Callers must
+    /// push in ascending `(doc, line)` order. Used by the bounded delta build
+    /// to accumulate postings without materializing decoded `Vec<Posting>`.
+    #[inline]
+    pub fn push(&mut self, doc: u32, line: u32, off: u32) {
+        self.writer.push(&mut self.bytes, doc, line, off);
+        self.count += 1;
+    }
 }
 
 pub struct SparseIndex {
@@ -65,66 +71,14 @@ impl SparseIndex {
     pub fn add_document(&mut self, path: &Path, content: &[u8]) {
         let doc_id = self.doc_ids.len() as u32;
         self.doc_ids.push(path.to_path_buf());
-
-        if content.len() < 3 {
-            return;
-        }
-
-        // Index trigrams per line: one posting per (trigram, doc_id, line)
-        let mut line_no = 1u32;
-        let mut line_start = 0usize;
-        // Scratch buffer for the case-folded copy of each line, reused across
-        // lines so the CI pass doesn't allocate per line.
         let mut fold_buf = Vec::new();
-
-        loop {
-            let line_end = content[line_start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|p| line_start + p)
-                .unwrap_or(content.len());
-
-            let line = &content[line_start..line_end];
-
-            if line.len() >= 3 {
-                let byte_offset = line_start as u32;
-                for w in line.windows(3) {
-                    let tri = [w[0], w[1], w[2]];
-                    let b = self.ngrams.entry(tri).or_default();
-                    // Dedup: only one posting per (doc_id, line_no) per trigram.
-                    // The windows over a line hit the same (doc, line) on every
-                    // repeat of a trigram, so checking the writer's last pushed
-                    // posting is enough — and lets us encode on the spot.
-                    if b.writer.last_dl() != Some((doc_id, line_no)) {
-                        b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
-                        b.count += 1;
-                    }
-                }
-
-                // Case-insensitive map: same posting, but trigrams come from the
-                // case-folded line. `byte_offset` still points at the original
-                // line so verification reads un-folded text.
-                if let Some(ref mut ci) = self.ngrams_ci {
-                    casefold::fold_into(line, &mut fold_buf);
-                    if fold_buf.len() >= 3 {
-                        for w in fold_buf.windows(3) {
-                            let tri = [w[0], w[1], w[2]];
-                            let b = ci.entry(tri).or_default();
-                            if b.writer.last_dl() != Some((doc_id, line_no)) {
-                                b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
-                                b.count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if line_end >= content.len() {
-                break;
-            }
-            line_start = line_end + 1;
-            line_no += 1;
-        }
+        extract_document(
+            doc_id,
+            content,
+            &mut self.ngrams,
+            self.ngrams_ci.as_mut(),
+            &mut fold_buf,
+        );
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -237,6 +191,81 @@ impl SparseIndex {
 
         Ok(index)
     }
+}
+
+/// Extract per-line trigrams from one document into the case-sensitive map (and
+/// the case-folded companion when present), delta-encoding each posting on the
+/// spot. Shared by [`SparseIndex::add_document`] and the bounded (external-merge)
+/// build so both produce byte-identical posting lists. Returns the number of
+/// bytes appended to the posting blobs — the caller uses this to bound the build
+/// buffer. The dedup (one posting per `(doc,line)` per trigram) and the
+/// `byte_offset`-points-at-original-line rule match the original inline code.
+pub fn extract_document(
+    doc_id: u32,
+    content: &[u8],
+    ngrams: &mut HashMap<[u8; 3], TrigramBuilder>,
+    mut ngrams_ci: Option<&mut HashMap<[u8; 3], TrigramBuilder>>,
+    fold_buf: &mut Vec<u8>,
+) -> usize {
+    if content.len() < 3 {
+        return 0;
+    }
+
+    let mut added = 0usize;
+    let mut line_no = 1u32;
+    let mut line_start = 0usize;
+
+    loop {
+        let line_end = content[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| line_start + p)
+            .unwrap_or(content.len());
+
+        let line = &content[line_start..line_end];
+
+        if line.len() >= 3 {
+            let byte_offset = line_start as u32;
+            for w in line.windows(3) {
+                let tri = [w[0], w[1], w[2]];
+                let b = ngrams.entry(tri).or_default();
+                // Dedup: only one posting per (doc_id, line_no) per trigram.
+                if b.writer.last_dl() != Some((doc_id, line_no)) {
+                    let before = b.bytes.len();
+                    b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
+                    added += b.bytes.len() - before;
+                    b.count += 1;
+                }
+            }
+
+            // Case-insensitive map: same posting, but trigrams come from the
+            // case-folded line. `byte_offset` still points at the original line
+            // so verification reads un-folded text.
+            if let Some(ci) = ngrams_ci.as_deref_mut() {
+                casefold::fold_into(line, fold_buf);
+                if fold_buf.len() >= 3 {
+                    for w in fold_buf.windows(3) {
+                        let tri = [w[0], w[1], w[2]];
+                        let b = ci.entry(tri).or_default();
+                        if b.writer.last_dl() != Some((doc_id, line_no)) {
+                            let before = b.bytes.len();
+                            b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
+                            added += b.bytes.len() - before;
+                            b.count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if line_end >= content.len() {
+            break;
+        }
+        line_start = line_end + 1;
+        line_no += 1;
+    }
+
+    added
 }
 
 #[cfg(test)]

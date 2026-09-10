@@ -1,3 +1,4 @@
+pub mod buildsort;
 pub mod casefold;
 pub mod config;
 #[cfg(feature = "daemon")]
