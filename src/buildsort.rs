@@ -41,11 +41,11 @@ pub struct BuildOutput {
     pub has_ci: bool,
 }
 
-/// Trigram key for this on-disk format. (CRC32 today; injective on 3-byte
-/// inputs, so distinct trigrams never share a key.)
+/// Trigram key for this on-disk format: the packed u32 (see
+/// [`crate::trigram::trigram_key`]), injective by construction.
 #[inline]
 fn key_of(tri: &[u8; 3]) -> u32 {
-    crc32fast::hash(tri)
+    crate::trigram::trigram_key(tri)
 }
 
 /// Spill one trigram map to a sorted segment: `[key u32][len u32][blob]` per

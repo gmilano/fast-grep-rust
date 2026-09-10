@@ -17,10 +17,10 @@ use crate::index::TrigramBuilder;
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
-/// On-disk index format version. Bumped to 4 for the compact (delta-varint)
-/// posting format; the loader rejects older indices so they get rebuilt rather
-/// than decoded with the wrong reader.
-const INDEX_VERSION: u32 = 4;
+/// On-disk index format version. Bumped to 5 for the packed-u32 trigram key
+/// (was a CRC32 hash); the lookup key values change, so the loader rejects
+/// older indices and they get rebuilt rather than searched with the wrong key.
+const INDEX_VERSION: u32 = 5;
 
 // --- Slot layout (two-slot baseline swap) ---
 //
@@ -339,7 +339,9 @@ impl PersistentIndex {
         let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
+            // Mask the reserved low byte so a stored key that ever carries
+            // per-trigram flags still matches the query's trigram bits.
+            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE) & trigram::TRIGRAM_KEY_MASK;
             match h.cmp(&hash) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -382,7 +384,9 @@ impl PersistentIndex {
         if lookup.is_empty() {
             return None;
         }
-        let idx = lookup.binary_search_by_key(&hash, |e| e.hash).ok()?;
+        let idx = lookup
+            .binary_search_by_key(&hash, |e| e.hash & trigram::TRIGRAM_KEY_MASK)
+            .ok()?;
         let entry = &lookup[idx];
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
@@ -410,7 +414,9 @@ impl PersistentIndex {
         let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
+            // Mask the reserved low byte so a stored key that ever carries
+            // per-trigram flags still matches the query's trigram bits.
+            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE) & trigram::TRIGRAM_KEY_MASK;
             match h.cmp(&hash) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -620,7 +626,7 @@ impl PersistentIndex {
 
             let hashes: Vec<u32> = alt_trigrams
                 .iter()
-                .map(|tri| crc32fast::hash(tri))
+                .map(|tri| trigram::trigram_key(tri))
                 .collect();
 
             if has_bitmaps {
@@ -956,11 +962,11 @@ pub(crate) fn write_ngram_files(
 ) -> Result<u64> {
     // Emit trigrams in key order so the lookup can be binary-searched.
     let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = ngrams.iter().collect();
-    trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
+    trigram_list.sort_by_key(|(k, _)| trigram::trigram_key(*k));
 
     let mut w = NgramFileWriter::create(output, prefix)?;
     for (tri, builder) in &trigram_list {
-        w.emit(crc32fast::hash(*tri), &builder.bytes)?;
+        w.emit(trigram::trigram_key(*tri), &builder.bytes)?;
     }
     let (postings_len, _) = w.finish()?;
     Ok(postings_len)
@@ -1041,11 +1047,15 @@ fn write_compacted_store(
         let hmain = (i < main_count).then(|| lookup_entry_at(main_lookup, i));
         let hdelta = (j < delta_lookup.len()).then(|| &delta_lookup[j]);
         let (take_main, take_delta) = match (hmain, hdelta) {
-            (Some(m), Some(d)) => match m.0.cmp(&d.hash) {
-                std::cmp::Ordering::Less => (true, false),
-                std::cmp::Ordering::Greater => (false, true),
-                std::cmp::Ordering::Equal => (true, true),
-            },
+            // Compare on the trigram-identity bits only; the reserved low byte
+            // must not split one trigram's postings across two merged entries.
+            (Some(m), Some(d)) => {
+                match (m.0 & trigram::TRIGRAM_KEY_MASK).cmp(&(d.hash & trigram::TRIGRAM_KEY_MASK)) {
+                    std::cmp::Ordering::Less => (true, false),
+                    std::cmp::Ordering::Greater => (false, true),
+                    std::cmp::Ordering::Equal => (true, true),
+                }
+            }
             (Some(_), None) => (true, false),
             (None, Some(_)) => (false, true),
             (None, None) => unreachable!(),
@@ -1865,7 +1875,7 @@ fn index_delta_file(path_str: &str, ci_enabled: bool) -> Option<DeltaFileIndex> 
             for w in line.windows(3) {
                 let tri = [w[0], w[1], w[2]];
                 if seen_on_line.insert(tri) {
-                    let hash = crc32fast::hash(&tri);
+                    let hash = trigram::trigram_key(&tri);
                     dfi.ngrams
                         .entry(hash)
                         .or_default()
@@ -1881,7 +1891,7 @@ fn index_delta_file(path_str: &str, ci_enabled: bool) -> Option<DeltaFileIndex> 
                     for w in fold_buf.windows(3) {
                         let tri = [w[0], w[1], w[2]];
                         if seen_on_line_ci.insert(tri) {
-                            let hash = crc32fast::hash(&tri);
+                            let hash = trigram::trigram_key(&tri);
                             dfi.ngrams_ci
                                 .entry(hash)
                                 .or_default()

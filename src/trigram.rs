@@ -36,6 +36,37 @@ pub fn has_case_insensitive_flag(pattern: &str) -> bool {
     false
 }
 
+/// Mask selecting the trigram-identity bits of a [`trigram_key`]. The three
+/// trigram bytes occupy the top 24 bits; the low 8 bits are a **reserved
+/// field**, currently always 0. The reserved byte is a zero-cost extension
+/// point (per-trigram flags, a rarity bucket for the planner, …): it is already
+/// materialized in every 16-byte lookup entry. Two rules make it safe to fill
+/// later without an on-disk format change:
+///
+///  1. **Every key *comparison* masks with this constant.** The lookup table is
+///     sorted and binary-searched by key, but a query only knows the trigram
+///     bits — an exact match over the full `u32` would miss an entry whose
+///     reserved byte is non-zero. All four comparison sites (main lookup,
+///     bitmap lookup, delta lookup, and the compaction merge-join) already mask,
+///     so a build that starts writing the reserved byte stays readable by
+///     existing binaries (they mask it off and preserve it through compaction).
+///  2. **The sort needs no mask** — the identity bits are the most significant,
+///     so full-key order is trigram order regardless of the reserved byte.
+pub const TRIGRAM_KEY_MASK: u32 = 0xFFFF_FF00;
+
+/// Pack a trigram into its `u32` index key: the three bytes in the top 24 bits,
+/// low 8 bits reserved (see [`TRIGRAM_KEY_MASK`]). A trigram is exactly 24 bits,
+/// so this is a perfect bijection — two distinct trigrams can never share a key
+/// (no hashing, no collisions, injective by construction). Used as the on-disk
+/// lookup key for postings and bitmaps, and to key query trigrams at search
+/// time. Replaced the former CRC32 hash, which was also collision-free on
+/// 3-byte inputs but computed a hash the key never needed and scattered keys
+/// across the full 32-bit range.
+#[inline]
+pub fn trigram_key(tri: &[u8; 3]) -> u32 {
+    ((tri[0] as u32) << 24) | ((tri[1] as u32) << 16) | ((tri[2] as u32) << 8)
+}
+
 /// Decompose a regex pattern into literal trigrams that must appear in any match.
 /// Returns a Vec of Vec<[u8;3]> where the outer vec is OR alternatives,
 /// and each inner vec is AND-required trigrams for that alternative.
@@ -291,6 +322,38 @@ fn is_meta(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    // --- trigram_key ---
+
+    #[test]
+    fn trigram_key_packs_into_top_24_bits() {
+        assert_eq!(trigram_key(&[0x41, 0x42, 0x43]), 0x4142_4300);
+        assert_eq!(trigram_key(&[0x00, 0x00, 0x00]), 0);
+        assert_eq!(trigram_key(&[0xFF, 0xFF, 0xFF]), 0xFFFF_FF00);
+        // the low 8 bits (reserved field) are always 0
+        for t in [[0x00, 0x00, 0x00], [0x41, 0x42, 0x43], [0xFF, 0xFF, 0xFF]] {
+            assert_eq!(trigram_key(&t) & !TRIGRAM_KEY_MASK, 0);
+        }
+    }
+
+    #[test]
+    fn trigram_key_is_injective() {
+        // Exhaustive over a dense byte sample: distinct trigrams -> distinct keys.
+        let bytes: [u8; 8] = [0x00, 0x01, 0x7F, 0x80, 0xC3, 0xA9, 0xFE, 0xFF];
+        let mut seen = HashSet::new();
+        for &a in &bytes {
+            for &b in &bytes {
+                for &c in &bytes {
+                    assert!(
+                        seen.insert(trigram_key(&[a, b, c])),
+                        "collision at {a:#x} {b:#x} {c:#x}"
+                    );
+                }
+            }
+        }
+        assert_eq!(seen.len(), bytes.len().pow(3));
+    }
 
     // --- decompose_pattern tests (ported from decomposeRegex in trigram.test.ts) ---
 
