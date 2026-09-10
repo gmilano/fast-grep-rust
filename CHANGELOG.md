@@ -96,6 +96,22 @@ All notable changes to fast-grep are documented here.
   that hides every match still exits `0` (something matched). Errors moved from
   `1` to `2` so that `1` unambiguously means "no match", as in grep/ripgrep.
 
+### Indexing — trigram key
+
+- **Packed-u32 trigram key.** The per-trigram index key is now the three trigram
+  bytes packed directly into a `u32` (top 24 bits) instead of a CRC32 hash. A
+  trigram is exactly 24 bits, so the packing is a perfect bijection — injective
+  by construction, with no hash to compute — and drops the `crc32fast`
+  dependency. (Both keys were in fact collision-free on 3-byte inputs, so search
+  results are unchanged; this is a simplification, not a correctness fix.)
+- **Reserved key byte.** The key's low 8 bits are a reserved, zero-cost
+  extension field (currently always 0) for future per-trigram metadata. All key
+  comparisons mask it off, so it can be populated later without an on-disk
+  format change.
+- **Index format version 4 → 5.** The on-disk lookup key values change, so an
+  older index is rejected with a clear "rebuild with `fgr index`" message rather
+  than searched with the wrong key. Rebuild any existing index.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights
