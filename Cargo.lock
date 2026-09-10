@@ -384,6 +384,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "ctrlc",
+ "getrandom",
  "globset",
  "ignore",
  "libc",
