@@ -38,4 +38,4 @@ Remove fast-grep from the tool definition and restore `grep -rn` or `rg`.
 ## Limits
 
 - Index must be rebuilt after large file changes: `fgr update --index .fgr`
-- The index does not support case-insensitive search (`-i` always full-scans)
+- Case-insensitive search (`-i`) is only indexed when the index was built with `fgr index -i`; otherwise it scans every indexed file

@@ -103,8 +103,9 @@ in large, stable repositories. For a first-time search or a small repo, ripgrep 
 | Full build | ~60s (one-time) |
 | Incremental update | <1s for 10–100 changed files |
 | Index load (mmap) | 17ms |
-| Index size (postings) | 775 MB |
-| Index size (bitmaps) | 161 MB |
+| Indexed documents | 79,406 (after `.gitignore` and binary skips) |
+| Index size (postings) | ~2.9 GB (line-level postings, ~2.9 bytes each) |
+| Index size (bitmaps) | ~170 MB |
 | RAM at query time | ~22 MB (rest is mmap'd) |
 
 ---
@@ -124,12 +125,15 @@ Binary: `./target/release/fgr`. SIMD (AVX2/NEON) is auto-enabled via `.cargo/con
 ## Usage
 
 Searching is the default — pass PATTERN and PATH as positional args. Other
-operations (`index`, `update`, `compact`, `bench`, `stats`, `daemon`) are
-subcommands.
+operations (`index`, `update`, `compact`, `bench`, `stats`, `daemon`,
+`integrations`) are subcommands.
 
 ```bash
 # Index a codebase (one-time, ~60s for the Linux kernel)
 fgr index /path/to/codebase --output .fgr
+
+# Same, plus a case-folded companion so `-i` searches are indexed too
+fgr index -i /path/to/codebase --output .fgr
 
 # Agent-optimised search (compact output, relative paths)
 fgr --agent "process_request" /path/to/codebase --index .fgr
@@ -227,6 +231,7 @@ binary_high_byte_pct = 30        # >127-byte %% for the no-magic content check
 These settings apply to the index. A no-index `fgr` scan skips the same known
 binaries (for parity) but has no size cap — you can always grep a huge file
 directly.
+
 The same `[index]` section also bounds the peak memory of a full build:
 
 ```toml
@@ -280,14 +285,25 @@ ACLs (best effort) — keep your index directory in a location only you can read
 | `--max-results-per-file <N>` | Cap matches per file. |
 | `--max-files <N>` | Cap number of files in output. |
 | `--max-output-bytes <N>` | Cap output size in bytes. |
-| `--context <N>` / `-C <N>` | Print N lines of context around each match. |
+| `--context <N>` / `-C <N>` | Print N lines of context around each match (`-A`/`-B` for after/before only). |
 | `--agent-stats` | Print latency and token estimates to stderr. |
-| `--index <path>` | Use persistent index for fast repeated searches. |
-| `--type <ext>` | Filter by file extension (`rs`, `ts`, `py`, …). |
+| `--index <path>` | Use persistent index for fast repeated searches (auto-built if missing). |
+| `--type <ext>` | Filter by file extension (`rs`, `ts`, `py`, …); repeatable. |
+| `--include <glob>` / `--exclude <glob>` | Keep / drop files matching a glob; repeatable. |
 | `--no-ignore` | Don't respect `.gitignore`. |
+| `--hidden` / `-.` | Include hidden files and directories. |
 | `--count` / `-c` | Count matching lines per file. |
 | `--files-with-matches` / `-l` | Print file paths only. |
-| `--ignore-case` / `-i` | Case-insensitive search (disables index). |
+| `--quiet` / `-q` | No output; exit status only. |
+| `--ignore-case` / `-i` | Case-insensitive search. Indexed when the index was built with `fgr index -i`; otherwise scans every indexed file. |
+| `--fixed-strings` / `-F` | Treat PATTERN as a literal, not a regex. |
+| `--invert-match` / `-v` | Lines that do NOT match (always a direct scan, never the index). |
+| `--only-matching` / `-o` | Print only the matched part of each line. |
+| `--trim` | Strip leading indentation from output lines (lossy, fewer tokens). |
+| `--heading` / `--no-heading` | Force grouped / flat text output (default: grouped on a TTY, flat when piped). |
+| `--no-unicode` / `-U` | ASCII-only `\b`, `\w`, `\s`, … |
+
+Exit status is grep-compatible: `0` matched, `1` no match, `2` error.
 
 ### Output format precedence
 
@@ -345,15 +361,17 @@ File counts are always exact.
 
 Five techniques combine to eliminate >99% of I/O before the regex engine runs:
 
-1. **Sparse n-grams with adaptive frequency table** — Variable-length substrings weighted by corpus-specific bigram rarity. Produces fewer, more selective posting lists than fixed trigrams.
+1. **Trigram index with line-level postings** — Every 3-byte window of every line is indexed as `(document, line, byte offset)`. A query is decomposed into the trigrams any match must contain (per alternation branch), and their posting lists are intersected on `(document, line)` — so the index answers "which lines", not just "which files".
 
-2. **Position masks (Blackbird algorithm)** — Two 8-bit bloom filters per (n-gram, document) encode position and successor character. Drops the false positive rate to 0.42%.
+2. **Two-tier lookup with Roaring bitmaps** — Each trigram also has a bitmap of the documents containing it. Bitmaps are ANDed first (cheap, early exit); line postings are then decoded only for surviving documents, and skipped entirely when the bitmap is already tiny.
 
-3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
+3. **Compact posting encoding** — Postings are delta-encoded with a flagged varint (~2.9 bytes each instead of 16), encoded on the fly during the build so the decoded index never sits in RAM.
 
-4. **Line-level index with byte offsets** — Index stores line positions, not just file IDs. Verification jumps directly to candidate lines instead of scanning entire files.
+4. **Persistent index with mmap** — Lookup tables live in RAM; postings and bitmaps are memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
 
-5. **SIMD verification** — The `regex` crate uses Teddy SIMD when `target-cpu=native` is set; `memchr` uses AVX2/NEON for literal pre-filters.
+5. **Line-level SIMD verification** — Candidate lines are verified in parallel (Rayon), seeking straight to each line's byte offset (or reading the file once when it is dense with candidates). Pure literals use `memchr` (AVX2/NEON), literal alternations use Aho-Corasick, and the `regex` crate uses Teddy SIMD with `target-cpu=native`.
+
+The build runs in **bounded memory** (postings are spilled to sorted segments and k-way merged, so peak RAM does not grow with the repository). Edits are absorbed by a **delta overlay** (`fgr update` / the daemon) and folded back into the primary by **compaction**; a **case-folded companion** index (`fgr index -i`) makes `-i` searches indexed as well.
 
 ---
 
@@ -362,16 +380,17 @@ Five techniques combine to eliminate >99% of I/O before the regex engine runs:
 fast-grep is not always faster or better.
 
 - **The first index build has a cost** (~60s for the Linux kernel). Amortised over repeated searches, this pays off quickly.
-- **The index consumes disk space** (~936 MB for 81k files). A smaller repo produces a proportionally smaller index.
+- **The index consumes disk space** (~3 GB for the Linux kernel: 79k indexed files, ~1 billion line-level postings). A smaller repo produces a proportionally smaller index; `fgr index -i` roughly doubles it.
 - **Small repositories and one-off searches** are typically faster with ripgrep (no build cost).
-- **Some regex patterns cannot be filtered by the index** — patterns with no extractable n-grams (e.g. `.*`, `\d+`) fall back to a full scan. Use `fgr stats` to check.
-- **Case-insensitive search (`-i`) bypasses the index** — the index is case-sensitive; `-i` always falls back to a full scan.
+- **Some regex patterns cannot be filtered by the index** — a pattern (or one branch of an alternation) with no literal run of at least 3 bytes (e.g. `.*`, `\d+`, `ab`) scans every indexed file. `fgr bench` shows the candidate count.
+- **Case-insensitive search (`-i`) is only indexed with a companion index** — the primary index is case-sensitive. Build with `fgr index -i` to get a case-folded companion (more disk); without it, `-i` scans every indexed file.
+- **`-v` / `--invert-match` never uses the index** — the index locates matches, not their absence; it always runs as a direct scan.
 - **Agent compact output reduces token overhead but does not replace semantic retrieval or ranking.** It is a formatting optimisation, not an AI feature.
-- **Incremental updates detect changed files but require a full scan of those files.** Partial index merging is on the roadmap.
-- **Symlinks**: followed during indexing; `is_stale()` does not detect symlink retargets.
-- **Binary files**: skipped based on null-byte detection in the first 512 bytes.
-- **Large files**: indexed and searched via mmap; no hard size limit, but very large files increase index size.
-- **Socket security**: there is no TCP daemon in 0.4.0; searches are in-process.
+- **Incremental updates re-index only the changed files** into a delta overlay; the primary is not rewritten until compaction. Change detection is mtime-based (`fgr stats` reports `Stale`).
+- **Symlinks** are not followed (`ignore` crate default), neither at index time nor in a scan.
+- **Binary files** are skipped by extension **plus** a confirmed magic signature (a text file misnamed `.png` is still indexed), by a content heuristic for marker-less extensions, and by a NUL-byte backstop; see "What gets indexed" above.
+- **Large files**: files over `max_file_size_mb` (default 64 MiB) are not indexed unless their extension is known-text or exempted in `config.toml`; the no-index scan has no cap. Indexed files are searched via mmap.
+- **Daemon socket**: the daemon listens on a random localhost TCP port (`<index>/daemon.port`); the command set is closed (`status`/`flush`/`stop`) and every command is authenticated with the per-daemon token in `<index>/daemon.token`. Searches themselves are always in-process.
 
 ---
 
