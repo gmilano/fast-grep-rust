@@ -58,9 +58,9 @@ processes beyond what the OS already enforces.
 - The CLI does not follow symlinks by default (`ignore::WalkBuilder`'s
   default).
 - `cargo-audit` runs on every push and PR (`.github/workflows/ci.yml`)
-  and fails the build on any vulnerability advisory. Two transitive
-  unmaintained-only warnings (`instant`, `paste`) are tracked and
-  suppressed in `.cargo/audit.toml`; they are not vulnerabilities.
+  and fails the build on any vulnerability advisory. One transitive
+  unmaintained-only warning (`paste`) is tracked and suppressed in
+  `.cargo/audit.toml`; it is not a vulnerability.
 - The interactive site loads Mermaid from jsDelivr pinned to an exact
   version with an SRI integrity hash, so a registry compromise cannot
   inject arbitrary JS into visitors' browsers.
@@ -75,5 +75,4 @@ processes beyond what the OS already enforces.
 |------|------------------|
 | `unsafe { Mmap::map(&file) }` | Required by `memmap2`. We document the contract: do not rebuild the index in-place while a search is running. |
 | No CRC validation at index load | Index is a local cache. A user able to overwrite it can already do worse to their own filesystem. |
-| `instant` (transitive, unmaintained) | Pulled in by `notify` 7.x for the daemon FS watcher. Re-evaluate when `notify` removes the dependency. |
 | `paste` (transitive, unmaintained) | Pulled in by `metal` 0.29 for the macOS GPU verify scaffold. Re-evaluate when `metal-rs` removes it. |

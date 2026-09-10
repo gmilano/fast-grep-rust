@@ -7,11 +7,6 @@
 
 [advisories]
 ignore = [
-    # `instant` is unmaintained. Pulled in transitively via:
-    #   notify (FS watcher used by the `daemon` feature) -> notify-types -> instant
-    # Re-evaluate when `notify` drops the dependency or moves to `web-time`.
-    "RUSTSEC-2024-0384",
-
     # `paste` is unmaintained. Pulled in transitively via:
     #   metal (macOS Metal GPU verify, optional) -> paste
     # Re-evaluate when `metal-rs` removes the dependency.
