@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::casefold;
-use crate::index::{Posting, TrigramBuilder};
+use crate::index::TrigramBuilder;
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
@@ -1539,49 +1539,6 @@ fn read_delta(lookup_path: &Path, postings_path: &Path) -> Result<(Vec<LookupEnt
     Ok((dlookup, dpostings))
 }
 
-/// Write a delta store's `{postings, lookup}` files (compact-encoded), or
-/// remove them when the trigram map is empty. Doc-ids are shared between the CS
-/// and CI deltas, so this writes only the postings + lookup pair.
-fn write_delta_store(
-    postings_path: &Path,
-    lookup_path: &Path,
-    ngrams: HashMap<u32, Vec<Posting>>,
-) -> Result<()> {
-    let mut sorted: Vec<(u32, Vec<Posting>)> = ngrams.into_iter().collect();
-    sorted.sort_by_key(|(hash, _)| *hash);
-
-    if sorted.is_empty() {
-        let _ = fs::remove_file(postings_path);
-        let _ = fs::remove_file(lookup_path);
-        return Ok(());
-    }
-
-    let mut postings_file = BufWriter::new(File::create(postings_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut offset: u64 = 0;
-    for (hash, postings) in &sorted {
-        let mut buf = Vec::with_capacity(postings.len() * 3);
-        let mut w = PostingWriter::new();
-        for &(doc_id, line_no, byte_offset) in postings {
-            w.push(&mut buf, doc_id, line_no, byte_offset);
-        }
-        let len = buf.len() as u32;
-        postings_file.write_all(&buf)?;
-        lookup_entries.push((*hash, offset, len));
-        offset += len as u64;
-    }
-    postings_file.flush()?;
-
-    let mut lookup_file = BufWriter::new(File::create(lookup_path)?);
-    for (hash, off, len) in &lookup_entries {
-        lookup_file.write_u32::<LittleEndian>(*hash)?;
-        lookup_file.write_u64::<LittleEndian>(*off)?;
-        lookup_file.write_u32::<LittleEndian>(*len)?;
-    }
-    lookup_file.flush()?;
-    Ok(())
-}
-
 /// Open the four mmaps of a trigram store given its file prefix, returning
 /// `None` for the whole set when the postings file is absent.
 type StoreMmaps = (Mmap, usize, Mmap, Option<Mmap>, Option<Mmap>, usize);
@@ -2064,41 +2021,81 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     // unreadable or binary get no id), and postings within a hash stay sorted
     // by (doc_id, line).
     let ci_enabled = meta.case_insensitive;
-    let per_file: Vec<Option<DeltaFileIndex>> = delta_files_to_index
-        .par_iter()
-        .map(|path_str| index_delta_file(path_str, ci_enabled))
-        .collect();
 
-    let mut delta_ngrams: HashMap<u32, Vec<Posting>> = HashMap::new();
-    let mut delta_ngrams_ci: HashMap<u32, Vec<Posting>> = HashMap::new();
+    // 8b. Accumulate the delta with bounded memory: read + trigram files in
+    // parallel chunks, merge each chunk into a compact accumulator (postings
+    // encoded on the spot), and spill a sorted segment whenever the buffer
+    // exceeds the build budget. A huge one-shot update (e.g. a branch switch
+    // before the first update) therefore keeps flat memory like the full build.
+    // Doc ids are assigned serially in `delta_files_to_index` order (unreadable/
+    // binary files get none), so the delta stays byte-identical to the old
+    // single-pass merge.
+    let budget = crate::config::load(index_path).index.build_budget_bytes();
+    let deltatmp = slot_dir.join(".deltatmp");
+    if budget.is_some() {
+        fs::create_dir_all(&deltatmp)?;
+    }
+
+    let mut cs_map: HashMap<u32, TrigramBuilder> = HashMap::new();
+    let mut ci_map: HashMap<u32, TrigramBuilder> = HashMap::new();
+    let mut cs_segs: Vec<PathBuf> = Vec::new();
+    let mut ci_segs: Vec<PathBuf> = Vec::new();
     let mut delta_doc_ids: Vec<PathBuf> = Vec::new();
     let mut actual_added = 0usize;
     let mut actual_modified = 0usize;
+    let mut buffered = 0usize;
 
-    for (path_str, dfi) in delta_files_to_index.iter().zip(per_file) {
-        let Some(dfi) = dfi else { continue };
+    const DELTA_CHUNK: usize = 2048;
+    for chunk in delta_files_to_index.chunks(DELTA_CHUNK) {
+        let per_file: Vec<Option<DeltaFileIndex>> = chunk
+            .par_iter()
+            .map(|path_str| index_delta_file(path_str, ci_enabled))
+            .collect();
 
-        // Doc_id in combined space: main_num_docs + delta_doc_ids.len()
-        let doc_id = (main_num_docs + delta_doc_ids.len()) as u32;
-        delta_doc_ids.push(PathBuf::from(path_str));
+        for (path_str, dfi) in chunk.iter().zip(per_file) {
+            let Some(dfi) = dfi else { continue };
 
-        if added_set.contains(path_str) {
-            actual_added += 1;
-        } else if modified_set.contains(path_str) {
-            actual_modified += 1;
+            // Doc_id in combined space: main_num_docs + delta_doc_ids.len()
+            let doc_id = (main_num_docs + delta_doc_ids.len()) as u32;
+            delta_doc_ids.push(PathBuf::from(path_str));
+
+            if added_set.contains(path_str) {
+                actual_added += 1;
+            } else if modified_set.contains(path_str) {
+                actual_modified += 1;
+            }
+
+            for (hash, lines) in dfi.ngrams {
+                let b = cs_map.entry(hash).or_default();
+                for (l, o) in lines {
+                    let before = b.bytes.len();
+                    b.push(doc_id, l, o);
+                    buffered += b.bytes.len() - before;
+                }
+            }
+            for (hash, lines) in dfi.ngrams_ci {
+                let b = ci_map.entry(hash).or_default();
+                for (l, o) in lines {
+                    let before = b.bytes.len();
+                    b.push(doc_id, l, o);
+                    buffered += b.bytes.len() - before;
+                }
+            }
         }
 
-        for (hash, lines) in dfi.ngrams {
-            delta_ngrams
-                .entry(hash)
-                .or_default()
-                .extend(lines.iter().map(|&(l, o)| (doc_id, l, o)));
-        }
-        for (hash, lines) in dfi.ngrams_ci {
-            delta_ngrams_ci
-                .entry(hash)
-                .or_default()
-                .extend(lines.iter().map(|&(l, o)| (doc_id, l, o)));
+        if let Some(budget) = budget {
+            if buffered >= budget {
+                let n = cs_segs.len();
+                let cp = deltatmp.join(format!("cs-{n:05}.seg"));
+                crate::buildsort::spill_u32(&mut cs_map, &cp)?;
+                cs_segs.push(cp);
+                if ci_enabled {
+                    let ip = deltatmp.join(format!("ci-{n:05}.seg"));
+                    crate::buildsort::spill_u32(&mut ci_map, &ip)?;
+                    ci_segs.push(ip);
+                }
+                buffered = 0;
+            }
         }
     }
 
@@ -2121,45 +2118,31 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         f.flush()?;
     }
 
-    // Write delta postings + lookup (12 bytes per entry)
-    let mut sorted_ngrams: Vec<(u32, Vec<Posting>)> = delta_ngrams.into_iter().collect();
-    sorted_ngrams.sort_by_key(|(hash, _)| *hash);
-
+    // Write the case-sensitive delta postings + lookup + docids.
     let delta_postings_path = slot_dir.join("delta.postings");
     let delta_lookup_path = slot_dir.join("delta.lookup");
     let delta_docids_path = slot_dir.join("delta.docids");
 
-    if sorted_ngrams.is_empty() && delta_doc_ids.is_empty() {
+    if delta_doc_ids.is_empty() {
         let _ = fs::remove_file(&delta_postings_path);
         let _ = fs::remove_file(&delta_lookup_path);
         let _ = fs::remove_file(&delta_docids_path);
     } else {
-        let mut postings_file = BufWriter::new(File::create(&delta_postings_path)?);
-        let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-        let mut offset: u64 = 0;
-
-        for (hash, postings) in &sorted_ngrams {
-            let mut buf = Vec::with_capacity(postings.len() * 3);
-            let mut w = PostingWriter::new();
-            for &(doc_id, line_no, byte_offset) in postings {
-                w.push(&mut buf, doc_id, line_no, byte_offset);
+        if cs_segs.is_empty() {
+            crate::buildsort::write_delta_map(&cs_map, &delta_postings_path, &delta_lookup_path)?;
+        } else {
+            if !cs_map.is_empty() {
+                let cp = deltatmp.join(format!("cs-{:05}.seg", cs_segs.len()));
+                crate::buildsort::spill_u32(&mut cs_map, &cp)?;
+                cs_segs.push(cp);
             }
-            let len = buf.len() as u32;
-            postings_file.write_all(&buf)?;
-            lookup_entries.push((*hash, offset, len));
-            offset += len as u64;
+            crate::buildsort::merge_delta_segments(
+                &cs_segs,
+                &delta_postings_path,
+                &delta_lookup_path,
+            )?;
         }
-        postings_file.flush()?;
 
-        let mut lookup_file = BufWriter::new(File::create(&delta_lookup_path)?);
-        for (hash, off, len) in &lookup_entries {
-            lookup_file.write_u32::<LittleEndian>(*hash)?;
-            lookup_file.write_u64::<LittleEndian>(*off)?;
-            lookup_file.write_u32::<LittleEndian>(*len)?;
-        }
-        lookup_file.flush()?;
-
-        // Write delta docids
         let mut docids_file = BufWriter::new(File::create(&delta_docids_path)?);
         for path in &delta_doc_ids {
             let path_bytes = path.to_string_lossy();
@@ -2171,18 +2154,27 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     }
 
     // 9b. Write the lockstep CI delta (postings + lookup only — docids are
-    // shared with the CS delta written above). When the index has no CI
-    // companion, make sure no stale CI delta lingers.
-    if ci_enabled {
-        write_delta_store(
-            &slot_dir.join("delta.ci.postings"),
-            &slot_dir.join("delta.ci.lookup"),
-            delta_ngrams_ci,
-        )?;
+    // shared with the CS delta written above). Absent/empty when there is no CI
+    // companion or the delta produced no case-folded postings.
+    let ci_postings_path = slot_dir.join("delta.ci.postings");
+    let ci_lookup_path = slot_dir.join("delta.ci.lookup");
+    if ci_enabled && !(ci_map.is_empty() && ci_segs.is_empty()) {
+        if ci_segs.is_empty() {
+            crate::buildsort::write_delta_map(&ci_map, &ci_postings_path, &ci_lookup_path)?;
+        } else {
+            if !ci_map.is_empty() {
+                let ip = deltatmp.join(format!("ci-{:05}.seg", ci_segs.len()));
+                crate::buildsort::spill_u32(&mut ci_map, &ip)?;
+                ci_segs.push(ip);
+            }
+            crate::buildsort::merge_delta_segments(&ci_segs, &ci_postings_path, &ci_lookup_path)?;
+        }
     } else {
-        let _ = fs::remove_file(slot_dir.join("delta.ci.postings"));
-        let _ = fs::remove_file(slot_dir.join("delta.ci.lookup"));
+        let _ = fs::remove_file(&ci_postings_path);
+        let _ = fs::remove_file(&ci_lookup_path);
     }
+
+    let _ = fs::remove_dir_all(&deltatmp);
 
     // 10. Update meta.json with current file_mtimes
     let mut new_mtimes: HashMap<String, u64> = HashMap::with_capacity(saved_mtimes.len());

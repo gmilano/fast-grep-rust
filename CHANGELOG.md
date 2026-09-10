@@ -28,7 +28,8 @@ All notable changes to fast-grep are documented here.
 - Build reports binary / too-large skip counts; the same admission policy gates
   build, incremental update, the stale check, and the no-index scan so they
   agree on the file set.
-### Indexing — bounded (external-merge) build
+
+### Indexing — bounded (external-merge) build & update
 
 - **Flat build memory.** `fgr index` no longer assembles the whole inverted
   index in RAM before writing it (peak memory used to grow with the repository
@@ -36,11 +37,17 @@ All notable changes to fast-grep are documented here.
   when it fills they are spilled to a sorted temp segment; after the walk the
   segments are k-way merged straight into the final index. Peak build RAM is
   bounded and independent of corpus size.
+- **Flat update memory.** A single large `fgr update` (e.g. the first update
+  after a branch switch that changes tens of thousands of files) used to read
+  and hold every changed file's postings in RAM at once. The delta build now
+  uses the same bounded buffer + spill + k-way merge, so update peak memory is
+  bounded too.
 - **New `[index] build_buffer_mb`** in `<index>/config.toml` (default 256): the
-  build buffer size before a spill. `0` disables spilling (assemble in RAM —
-  fastest, if you have the memory).
-- The produced index is **byte-identical** to the previous single-pass build —
-  no on-disk format change, existing indexes keep working.
+  buffer size before a spill, shared by build and update. `0` disables spilling
+  (assemble in RAM — fastest, if you have the memory).
+- The produced index/delta is **byte-identical** to the previous single-pass
+  build for a given input order — no on-disk format change, existing indexes
+  keep working.
 
 ## [0.4.0] — 2026-07-18
 

@@ -107,11 +107,15 @@ impl SegmentCursor {
     }
 }
 
-/// K-way merge the segments by trigram key and stream the four `{prefix}.*`
-/// files. For a key present in several segments, its blobs are concatenated in
-/// segment order (= doc order) and re-encoded into one continuous chain.
-/// Returns the postings byte length and the number of trigrams written.
-fn merge_segments(segs: &[PathBuf], out_dir: &Path, prefix: &str) -> Result<(u64, usize)> {
+/// K-way merge the segments by key, calling `emit(key, blob)` once per distinct
+/// key with its postings re-encoded into one continuous chain. For a key present
+/// in several segments, the blobs are concatenated in segment order (= doc
+/// order). Key-agnostic: used by both the full-index build (trigram keys) and
+/// the delta build (posting-hash keys).
+fn kway_merge<F>(segs: &[PathBuf], mut emit: F) -> Result<()>
+where
+    F: FnMut(u32, &[u8]) -> Result<()>,
+{
     let mut cursors: Vec<SegmentCursor> = segs
         .iter()
         .map(|p| SegmentCursor::open(p))
@@ -126,9 +130,7 @@ fn merge_segments(segs: &[PathBuf], out_dir: &Path, prefix: &str) -> Result<(u64
         }
     }
 
-    let mut w = NgramFileWriter::create(out_dir, prefix)?;
     let mut blob = Vec::new();
-
     while let Some(&Reverse((min_key, _))) = heap.peek() {
         // Collect every segment currently at this key (ascending index).
         let mut group: Vec<usize> = Vec::new();
@@ -147,7 +149,7 @@ fn merge_segments(segs: &[PathBuf], out_dir: &Path, prefix: &str) -> Result<(u64
                 pw.push(&mut blob, doc, line, off);
             }
         }
-        w.emit(min_key, &blob)?;
+        emit(min_key, &blob)?;
 
         for idx in group {
             cursors[idx].advance()?;
@@ -156,7 +158,106 @@ fn merge_segments(segs: &[PathBuf], out_dir: &Path, prefix: &str) -> Result<(u64
             }
         }
     }
+    Ok(())
+}
 
+/// K-way merge segments into the four `{prefix}.*` full-index files.
+/// Returns the postings byte length and the number of trigrams written.
+fn merge_segments(segs: &[PathBuf], out_dir: &Path, prefix: &str) -> Result<(u64, usize)> {
+    let mut w = NgramFileWriter::create(out_dir, prefix)?;
+    kway_merge(segs, |k, b| w.emit(k, b))?;
+    w.finish()
+}
+
+// --- Delta build (bounded), used by persist::update_incremental ---
+//
+// The delta store is keyed directly by the u32 posting hash (not a trigram) and
+// has no bitmaps — just `{name}.postings` + `{name}.lookup`. The accumulator map
+// therefore uses the u32 hash as the key; everything else (segment format,
+// spill, k-way merge) is shared with the full build.
+
+/// Spill a u32-keyed trigram map to a sorted segment and clear it.
+pub(crate) fn spill_u32(map: &mut HashMap<u32, TrigramBuilder>, path: &Path) -> Result<()> {
+    let mut entries: Vec<(u32, &[u8])> =
+        map.iter().map(|(k, b)| (*k, b.bytes.as_slice())).collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let mut w = BufWriter::new(File::create(path)?);
+    for (k, blob) in &entries {
+        w.write_u32::<LittleEndian>(*k)?;
+        w.write_u32::<LittleEndian>(blob.len() as u32)?;
+        w.write_all(blob)?;
+    }
+    w.flush()?;
+    drop(entries);
+    map.clear();
+    Ok(())
+}
+
+/// Streams a delta store's two files, emitting `(key, blob)` in ascending-key
+/// order. `{name}.postings` = compact blobs concatenated; `{name}.lookup` =
+/// `[key u32][off u64][len u32]` per key (key-sorted, binary-searched).
+struct DeltaWriter {
+    postings: BufWriter<File>,
+    lookup: Vec<(u32, u64, u32)>,
+    lookup_path: PathBuf,
+    offset: u64,
+}
+
+impl DeltaWriter {
+    fn create(postings_path: &Path, lookup_path: &Path) -> Result<Self> {
+        Ok(Self {
+            postings: BufWriter::new(File::create(postings_path)?),
+            lookup: Vec::new(),
+            lookup_path: lookup_path.to_path_buf(),
+            offset: 0,
+        })
+    }
+
+    fn emit(&mut self, key: u32, blob: &[u8]) -> Result<()> {
+        self.postings.write_all(blob)?;
+        self.lookup.push((key, self.offset, blob.len() as u32));
+        self.offset += blob.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.postings.flush()?;
+        let mut lf = BufWriter::new(File::create(&self.lookup_path)?);
+        for (key, off, len) in &self.lookup {
+            lf.write_u32::<LittleEndian>(*key)?;
+            lf.write_u64::<LittleEndian>(*off)?;
+            lf.write_u32::<LittleEndian>(*len)?;
+        }
+        lf.flush()?;
+        Ok(())
+    }
+}
+
+/// Write a delta store directly from an in-memory u32-keyed map (non-spilling
+/// path). Byte-identical to the merged output.
+pub(crate) fn write_delta_map(
+    map: &HashMap<u32, TrigramBuilder>,
+    postings_path: &Path,
+    lookup_path: &Path,
+) -> Result<()> {
+    let mut entries: Vec<(u32, &[u8])> =
+        map.iter().map(|(k, b)| (*k, b.bytes.as_slice())).collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let mut w = DeltaWriter::create(postings_path, lookup_path)?;
+    for (k, blob) in &entries {
+        w.emit(*k, blob)?;
+    }
+    w.finish()
+}
+
+/// K-way merge spilled delta segments into `{name}.postings` + `{name}.lookup`.
+pub(crate) fn merge_delta_segments(
+    segs: &[PathBuf],
+    postings_path: &Path,
+    lookup_path: &Path,
+) -> Result<()> {
+    let mut w = DeltaWriter::create(postings_path, lookup_path)?;
+    kway_merge(segs, |k, b| w.emit(k, b))?;
     w.finish()
 }
 
@@ -391,6 +492,51 @@ mod tests {
         assert_eq!(ob.doc_paths.len(), ou.doc_paths.len());
         assert_eq!(ob.postings_len, ou.postings_len);
         assert_ngram_files_eq(bounded.path(), unbounded.path(), "ngrams");
+    }
+
+    /// The delta merge (spill segments → k-way merge) must produce the same
+    /// `delta.postings`/`delta.lookup` bytes as writing the accumulator directly.
+    #[test]
+    fn delta_merge_is_byte_identical_to_direct() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Direct: one accumulator holding all docs' postings, pushed in doc order.
+        let mut full: HashMap<u32, TrigramBuilder> = HashMap::new();
+        // Segmented: three per-batch accumulators (doc ranges 0..10, 10..20, 20..30).
+        let mut batches: Vec<HashMap<u32, TrigramBuilder>> =
+            vec![HashMap::new(), HashMap::new(), HashMap::new()];
+
+        for doc in 0u32..30 {
+            // A handful of overlapping hash keys per doc, several lines each.
+            for k in 0u32..40 {
+                let hash = k.wrapping_mul(2_654_435_761) & 0x0000_FFFF; // spread, with collisions across docs
+                for line in 1u32..=3 {
+                    let off = line * 7;
+                    full.entry(hash).or_default().push(doc, line, off);
+                    batches[(doc / 10) as usize]
+                        .entry(hash)
+                        .or_default()
+                        .push(doc, line, off);
+                }
+            }
+        }
+
+        let direct_p = dir.path().join("d.postings");
+        let direct_l = dir.path().join("d.lookup");
+        write_delta_map(&full, &direct_p, &direct_l).unwrap();
+
+        let mut segs = Vec::new();
+        for (i, mut b) in batches.into_iter().enumerate() {
+            let p = dir.path().join(format!("seg-{i}.seg"));
+            spill_u32(&mut b, &p).unwrap();
+            segs.push(p);
+        }
+        let merged_p = dir.path().join("m.postings");
+        let merged_l = dir.path().join("m.lookup");
+        merge_delta_segments(&segs, &merged_p, &merged_l).unwrap();
+
+        assert_eq!(fs::read(&direct_p).unwrap(), fs::read(&merged_p).unwrap());
+        assert_eq!(fs::read(&direct_l).unwrap(), fs::read(&merged_l).unwrap());
     }
 
     #[test]

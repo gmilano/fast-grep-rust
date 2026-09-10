@@ -238,8 +238,10 @@ build_buffer_mb = 256    # spill postings past this buffer, then k-way merge (0 
 sorted segment is spilled to disk, and the segments are k-way merged into the
 final index at the end. Peak build RAM stays flat regardless of repository size
 (on the 79K-file Linux kernel, ~3.5 GB → ~0.4 GB) with no measurable change in
-build time. `0` assembles the whole index in RAM (fastest, if it fits). The
-produced index is byte-identical either way.
+build time. `fgr update` uses the same buffer, so a single large update (say the
+first one after a branch switch) is bounded the same way. `0` assembles the
+whole index in RAM (fastest, if it fits). The produced index is byte-identical
+either way.
 
 ### Daemon mode (auto-incremental updates)
 

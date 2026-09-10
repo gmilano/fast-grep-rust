@@ -16,11 +16,6 @@ pub struct IndexStats {
     pub avg_postings_len: f64,
 }
 
-/// A posting entry: (doc_id, line_no, byte_offset).
-/// - line_no: 1-based line number where this trigram appears
-/// - byte_offset: byte offset of the start of that line in the file
-pub type Posting = (u32, u32, u32);
-
 /// Accumulates one trigram's posting list already in the compact
 /// (delta-varint) wire format. Postings are encoded into `bytes` as they are
 /// added, so the build never materializes the decoded `Vec<Posting>` for the
@@ -34,6 +29,17 @@ pub struct TrigramBuilder {
     writer: PostingWriter,
     /// Number of postings encoded, for `stats()` / `avg_postings_len`.
     count: u32,
+}
+
+impl TrigramBuilder {
+    /// Append one posting (compact, delta-encoded on the spot). Callers must
+    /// push in ascending `(doc, line)` order. Used by the bounded delta build
+    /// to accumulate postings without materializing decoded `Vec<Posting>`.
+    #[inline]
+    pub fn push(&mut self, doc: u32, line: u32, off: u32) {
+        self.writer.push(&mut self.bytes, doc, line, off);
+        self.count += 1;
+    }
 }
 
 pub struct SparseIndex {
