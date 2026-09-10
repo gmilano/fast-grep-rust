@@ -87,6 +87,15 @@ All notable changes to fast-grep are documented here.
 - `fgr bench --agent-metrics`, listed under 0.4.0, was never implemented and is
   not part of this change.
 
+### Exit codes — grep-compatible
+
+- A search now exits `0` when something matched, `1` when nothing matched, and
+  `2` on an error. Previously it exited `0` regardless (only `-q` honoured the
+  no-match case), so `if fgr "X" .; then …` never worked. Applies to plain
+  searches, `-q`, `-c`, `-l` and `-v`, with and without `--index`; an output cap
+  that hides every match still exits `0` (something matched). Errors moved from
+  `1` to `2` so that `1` unambiguously means "no match", as in grep/ripgrep.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights

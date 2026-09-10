@@ -369,7 +369,10 @@ fn enable_ansi_on_windows() {
 #[cfg(not(windows))]
 fn enable_ansi_on_windows() {}
 
-pub fn run() -> Result<()> {
+/// Entry point. Returns whether the search matched anything (`true` for
+/// subcommands, which have no notion of a match); `main` maps that to the
+/// grep-compatible exit status (0 matched / 1 no match / 2 error).
+pub fn run() -> Result<bool> {
     enable_ansi_on_windows();
 
     let cli = Cli::parse();
@@ -405,14 +408,15 @@ pub fn run() -> Result<()> {
     };
 
     if let Some(cmd) = cli.command {
-        return run_subcommand(
+        run_subcommand(
             cmd,
             cli.index_path.clone(),
             opts.no_ignore,
             opts.hidden,
             &opts.file_type,
             opts.ignore_case,
-        );
+        )?;
+        return Ok(true);
     }
 
     let pattern = match cli.pattern.as_ref() {
@@ -469,17 +473,17 @@ pub fn run() -> Result<()> {
     // against the folded store, and transparently falls back to scanning all
     // live docs when no CI index exists. Routing it through the indexed path
     // also lets a first `-i` search auto-build the CI index.
-    if let Some(ref idx_path) = cli.index_path {
+    let found = if let Some(ref idx_path) = cli.index_path {
         if cli.invert_match {
-            run_direct_search(&effective, &dir, &opts)?;
+            run_direct_search(&effective, &dir, &opts)?
         } else {
-            run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
+            run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?
         }
     } else {
-        run_direct_search(&effective, &dir, &opts)?;
-    }
+        run_direct_search(&effective, &dir, &opts)?
+    };
 
-    Ok(())
+    Ok(found)
 }
 
 /// Resolve the output format: explicit `--format` wins, then
@@ -595,7 +599,8 @@ fn print_render_summary(
     }
 }
 
-fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+/// Returns whether anything matched (for the exit status).
+fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<bool> {
     // count/files-only/quiet bypass the render pipeline entirely — they
     // produce per-file aggregates (counts, file lists) or no output at
     // all, so context flags don't apply and the simpler Vec<Match> API
@@ -613,10 +618,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
             &opts.exclude,
             opts.invert,
         )?;
-        if !found {
-            std::process::exit(1);
-        }
-        return Ok(());
+        return Ok(found);
     }
 
     // count / files-only produce per-file aggregates; they bypass the render
@@ -640,7 +642,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
             elapsed.as_secs_f64() * 1000.0,
             matches.len()
         );
-        return Ok(());
+        return Ok(!matches.is_empty());
     }
 
     let render_opts = render_opts_for(opts, dir);
@@ -672,7 +674,13 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     };
     let elapsed = start.elapsed();
     print_render_summary(opts, &stats, output_bytes, None, elapsed);
-    Ok(())
+    Ok(matched(&stats))
+}
+
+/// A render found something if it emitted a match — or if a cap hid the ones
+/// it found (`truncated` is only ever set when at least one match existed).
+fn matched(stats: &RenderStats) -> bool {
+    stats.matches > 0 || stats.truncated.is_some()
 }
 
 fn run_indexed_search(
@@ -680,7 +688,7 @@ fn run_indexed_search(
     idx_path: &std::path::Path,
     search_path: &std::path::Path,
     opts: &SearchOpts,
-) -> Result<()> {
+) -> Result<bool> {
     // Auto-build the index on first use. We detect "no index" by the absence of
     // meta.json (the same probe persist::load uses internally). The build root
     // is the search PATH the user passed — this matches the natural intent
@@ -752,7 +760,7 @@ fn run_indexed_search(
                 search_time.as_secs_f64() * 1000.0
             );
         }
-        return Ok(());
+        return Ok(n > 0);
     }
 
     if opts.files_only || opts.quiet {
@@ -776,10 +784,7 @@ fn run_indexed_search(
                 matches.len()
             );
         }
-        if opts.quiet && matches.is_empty() {
-            std::process::exit(1);
-        }
-        return Ok(());
+        return Ok(!matches.is_empty());
     }
 
     let render_opts = render_opts_for(opts, search_path);
@@ -810,7 +815,7 @@ fn run_indexed_search(
     };
     let search_time = start.elapsed();
     print_render_summary(opts, &stats, output_bytes, Some(load_time), search_time);
-    Ok(())
+    Ok(matched(&stats))
 }
 
 /// Build a `RenderOpts` from the resolved output format and the search root.
