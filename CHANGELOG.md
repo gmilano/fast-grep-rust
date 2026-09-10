@@ -153,6 +153,10 @@ All notable changes to fast-grep are documented here.
 - GitHub Actions moved to the Node 24 line: `actions/checkout` v7,
   `actions/upload-artifact` v7, `actions/download-artifact` v8,
   `softprops/action-gh-release` v3. Supersedes the open dependabot PRs.
+- `toml` 0.8 -> 1.1, `criterion` 0.5 -> 0.8 (benches only) and `metal` 0.29 -> 0.33
+  (macOS GPU scaffold). The only source change is in `tests/regex_correctness.rs`:
+  toml 1.x parses a document via `toml::Table`, not `toml::Value`, `FromStr`.
+  `metal` 0.33 still pulls the unmaintained `paste`, so that audit ignore stays.
 
 ## [0.4.0] — 2026-07-18
 

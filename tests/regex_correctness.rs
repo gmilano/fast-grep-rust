@@ -109,7 +109,7 @@ fn unescape_haystack(s: &str) -> String {
 
 fn parse_toml_tests(path: &std::path::Path) -> Vec<RegexTest> {
     let content = fs::read_to_string(path).unwrap();
-    let table: toml::Value = content.parse().unwrap();
+    let table: toml::Table = content.parse().unwrap();
 
     let mut tests = Vec::new();
     if let Some(arr) = table.get("test").and_then(|v| v.as_array()) {
