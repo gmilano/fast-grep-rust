@@ -71,21 +71,13 @@ so `fgr ... | wc -l` and other pipes work the same as with `grep`.
 These are real behavioural quirks an agent must work around. Tracked in
 upstream issue [#6](https://github.com/gmilano/fast-grep-rust/issues/6).
 
-### 1. Exit code does not reflect match status
+### 1. Exit codes are grep-compatible
 
-`fgr` exits `0` whether or not anything matched. `-q` (quiet) also exits `0`.
-**Do not** write `if fgr "X" .; then ...` to detect matches.
-
-Instead, parse the output:
-
-```bash
-# match-count check
-n=$(fgr -c "PATTERN" . | awk -F: '{s+=$NF} END{print s+0}')
-[ "$n" -gt 0 ] && echo "found"
-
-# or just check if any line was produced
-fgr "PATTERN" . | grep -q . && echo "found"
-```
+`fgr` exits `0` when something matched, `1` when nothing matched, and `2` on
+an error (bad pattern, unreadable index, invalid flag combination). This holds
+for `-q`, `-c`, `-l` and `-v` too, so `if fgr -q "X" .; then …` works as
+with `grep`/`rg`. (Earlier releases always exited `0` — if you targeted one,
+drop any output-parsing workaround.)
 
 ### 2. `--include` / `--exclude` glob filters are no-ops
 

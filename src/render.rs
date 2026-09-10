@@ -161,6 +161,10 @@ struct WorkerBufs {
     /// `mem::take`'d into the dispatch sink (or written and cleared) at
     /// the end of each file.
     out: Vec<u8>,
+    /// Byte offset in `out` where each match's block starts (see
+    /// `render_file_into`); lets the sorted drain truncate a file to its
+    /// first `k` matches cleanly.
+    cuts: Vec<usize>,
     /// Read fallback for files small enough that mmap overhead dominates;
     /// reused across files to avoid per-file allocation.
     read_buf: Vec<u8>,
@@ -170,6 +174,7 @@ impl WorkerBufs {
     fn new() -> Self {
         Self {
             out: Vec::with_capacity(64 * 1024),
+            cuts: Vec::new(),
             read_buf: Vec::with_capacity(64 * 1024),
         }
     }
@@ -203,29 +208,255 @@ fn read_or_mmap<'a>(
     }
 }
 
+/// One rendered file awaiting the sorted drain: path, formatted bytes, the
+/// number of matches *emitted* into those bytes, the number of matches the
+/// file really has (for truncation totals), and the per-match cut points.
+type Collected = (PathBuf, Vec<u8>, usize, bool, Vec<usize>);
+
 /// Hand off a per-file output buffer to the shared writer (or the
-/// collector for sorted dispatch). Empty buffers are skipped so files
-/// without matches generate no output.
+/// collector for sorted dispatch). Streaming skips empty buffers so files
+/// without matches generate no output; the sorted collector keeps every
+/// file with matches (even one the per-file cap emptied) so the drain can
+/// report true totals.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_file<W: Write>(
     path: &Path,
     out_buf: &mut Vec<u8>,
+    emitted: usize,
+    capped: bool,
+    cuts: &mut Vec<usize>,
     dispatch: Dispatch,
     streaming_sink: &Mutex<W>,
-    collector: &Mutex<Vec<(PathBuf, Vec<u8>)>>,
+    collector: &Mutex<Vec<Collected>>,
 ) {
-    if out_buf.is_empty() {
-        return;
-    }
     match dispatch {
         Dispatch::Streaming => {
-            let mut sink = streaming_sink.lock().unwrap();
-            let _ = sink.write_all(out_buf);
+            if !out_buf.is_empty() {
+                let mut sink = streaming_sink.lock().unwrap();
+                let _ = sink.write_all(out_buf);
+            }
             out_buf.clear();
+            cuts.clear();
         }
         Dispatch::Sorted => {
             let bytes = std::mem::take(out_buf);
-            collector.lock().unwrap().push((path.to_path_buf(), bytes));
+            let cuts = std::mem::take(cuts);
+            collector
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), bytes, emitted, capped, cuts));
         }
+    }
+}
+
+/// Length of the buffer prefix that holds the first `k` of `m` matches.
+fn prefix_len(bytes: &[u8], cuts: &[usize], m: usize, k: usize) -> usize {
+    if k >= m {
+        bytes.len()
+    } else {
+        cuts[k]
+    }
+}
+
+/// Exact bytes emitted for one file with its first `keep` matches, in the
+/// output's wire shape: a plain prefix for text/JSONL, or a wrapped
+/// `{"path":…,"matches":[…]}` object for JSON (`first` controls the leading
+/// comma between file objects).
+fn file_chunk(
+    render: &RenderOpts,
+    path: &Path,
+    bytes: &[u8],
+    cuts: &[usize],
+    m: usize,
+    keep: usize,
+    first: bool,
+) -> Vec<u8> {
+    let n = prefix_len(bytes, cuts, m, keep);
+    match render.kind {
+        RenderKind::Text | RenderKind::Jsonl => bytes[..n].to_vec(),
+        RenderKind::Json => {
+            let mut v = Vec::with_capacity(n + 64);
+            if !first {
+                v.push(b',');
+            }
+            v.extend_from_slice(b"{\"path\":");
+            write_json_str(
+                &mut v,
+                display_path(path, render.rel_base.as_deref()).as_bytes(),
+            );
+            v.extend_from_slice(b",\"matches\":[");
+            // Per-line fragments each end with ',' — drop the last one.
+            let frag = &bytes[..n];
+            v.extend_from_slice(frag.strip_suffix(b",").unwrap_or(frag));
+            v.extend_from_slice(b"]}");
+            v
+        }
+    }
+}
+
+fn write_truncation(v: &mut Vec<u8>, t: Option<Truncation>) {
+    match t {
+        None => v.extend_from_slice(b"null"),
+        Some(t) => {
+            let _ = write!(
+                v,
+                "{{\"total_matches\":{},\"shown_matches\":{},\"total_files\":{},\"shown_files\":{},\"exact\":{}}}",
+                t.total_matches, t.shown_matches, t.total_files, t.shown_files, t.exact
+            );
+        }
+    }
+}
+
+/// `--format json` document head, up to and including `"files":[`.
+fn json_head(render: &RenderOpts, total_matches: usize) -> Vec<u8> {
+    let (query, root, indexed, elapsed_ms) = match &render.envelope {
+        Some(e) => (
+            e.query.as_str(),
+            e.root.as_str(),
+            e.indexed,
+            e.started.elapsed().as_millis(),
+        ),
+        None => ("", "", false, 0),
+    };
+    let mut v = Vec::new();
+    v.extend_from_slice(b"{\"query\":");
+    write_json_str(&mut v, query.as_bytes());
+    v.extend_from_slice(b",\"root\":");
+    write_json_str(&mut v, root.as_bytes());
+    let _ = write!(
+        v,
+        ",\"indexed\":{},\"elapsed_ms\":{},\"total_matches\":{},\"files\":[",
+        indexed, elapsed_ms, total_matches
+    );
+    v
+}
+
+/// `--format json` document tail: closes `files` and writes `truncated`.
+fn json_tail(t: Option<Truncation>) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"],\"truncated\":");
+    write_truncation(&mut v, t);
+    v.extend_from_slice(b"}\n");
+    v
+}
+
+/// Sorted drain: write the collected files in path order, applying the
+/// output caps deterministically ("first N by path then line"), and for JSON
+/// wrap the whole document. A file that only partially fits is truncated at a
+/// match boundary via its cut points, so a byte cap never splits a line or a
+/// UTF-8 sequence, and never strands a `--` separator or before-context.
+fn drain_sorted<W: Write>(
+    mut entries: Vec<Collected>,
+    render: &RenderOpts,
+    output: &Mutex<W>,
+) -> RenderStats {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_files = entries.len();
+    // Files that stopped early at their cap make `total_matches` a lower bound.
+    let total_matches: usize = entries.iter().map(|e| e.2).sum();
+    let any_capped = entries.iter().any(|e| e.3);
+    let lim = render.limits;
+    let json = render.kind == RenderKind::Json;
+
+    let mut sink = output.lock().unwrap();
+
+    // Byte budget for the file chunks: the cap minus the JSON head and a
+    // worst-case tail (the totals have the most digits), so the finished
+    // document never exceeds `--max-output-bytes`.
+    let head = json.then(|| json_head(render, total_matches));
+    let tail_reserve = if json {
+        json_tail(Some(Truncation {
+            total_matches,
+            shown_matches: total_matches,
+            total_files,
+            shown_files: total_files,
+            exact: false,
+        }))
+        .len()
+    } else {
+        0
+    };
+    let budget = lim
+        .max_output_bytes
+        .map(|max| max.saturating_sub(head.as_ref().map_or(0, |h| h.len()) + tail_reserve));
+    if let Some(h) = &head {
+        let _ = sink.write_all(h);
+    }
+
+    let mut used = 0usize;
+    let mut shown_files = 0usize;
+    let mut shown_matches = 0usize;
+    for (path, bytes, m, _capped, cuts) in &entries {
+        if lim.max_files.is_some_and(|mf| shown_files >= mf) {
+            break;
+        }
+        let mut keep = *m;
+        if let Some(mr) = lim.max_results {
+            keep = keep.min(mr.saturating_sub(shown_matches));
+        }
+        if keep == 0 {
+            break;
+        }
+        let first = shown_files == 0;
+        if let Some(b) = budget {
+            let remaining = b.saturating_sub(used);
+            // Chunk length is monotonic in `keep`: binary-search the largest
+            // prefix that still fits.
+            let fits =
+                |k: usize| file_chunk(render, path, bytes, cuts, *m, k, first).len() <= remaining;
+            if !fits(keep) {
+                let (mut lo, mut hi) = (0usize, keep);
+                while hi - lo > 1 {
+                    let mid = (lo + hi) / 2;
+                    if fits(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                keep = lo;
+            }
+            if keep == 0 {
+                break;
+            }
+        }
+        let chunk = file_chunk(render, path, bytes, cuts, *m, keep, first);
+        let _ = sink.write_all(&chunk);
+        used += chunk.len();
+        shown_matches += keep;
+        shown_files += 1;
+        if keep < *m {
+            break; // a partially shown file ends the output
+        }
+    }
+
+    let truncated = (shown_matches < total_matches || shown_files < total_files || any_capped)
+        .then_some(Truncation {
+            total_matches,
+            shown_matches,
+            total_files,
+            shown_files,
+            exact: !any_capped,
+        });
+    match render.kind {
+        RenderKind::Json => {
+            let _ = sink.write_all(&json_tail(truncated));
+        }
+        RenderKind::Jsonl => {
+            if let Some(t) = truncated {
+                let mut v = Vec::new();
+                v.extend_from_slice(b"{\"truncated\":");
+                write_truncation(&mut v, Some(t));
+                v.extend_from_slice(b"}\n");
+                let _ = sink.write_all(&v);
+            }
+        }
+        RenderKind::Text => {}
+    }
+    RenderStats {
+        matches: shown_matches,
+        files: shown_files,
+        truncated,
     }
 }
 
@@ -244,10 +475,11 @@ pub fn search_full_scan_render<W: Write + Send>(
     render: &RenderOpts,
     dispatch: Dispatch,
     output: &Mutex<W>,
-) -> Result<usize> {
+) -> Result<RenderStats> {
     let matcher = Matcher::new(pattern)?;
     let total_count = std::sync::atomic::AtomicUsize::new(0);
-    let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
+    let files_emitted = std::sync::atomic::AtomicUsize::new(0);
+    let collector: Mutex<Vec<Collected>> = Mutex::new(Vec::new());
 
     let mut wb = ignore::WalkBuilder::new(root);
     wb.git_ignore(!no_ignore)
@@ -263,6 +495,7 @@ pub fn search_full_scan_render<W: Write + Send>(
     walker.run(|| {
         let matcher = &matcher;
         let total_count = &total_count;
+        let files_emitted = &files_emitted;
         let collector = &collector;
         let type_filter = type_filter_owned.as_slice();
         let mut bufs = WorkerBufs::new();
@@ -289,11 +522,31 @@ pub fn search_full_scan_render<W: Write + Send>(
             };
 
             bufs.out.clear();
-            let count = render_file_into(path, buf, matcher, pattern, ctx, render, &mut bufs.out);
+            bufs.cuts.clear();
+            let (emitted, capped) = render_file_into(
+                path,
+                buf,
+                matcher,
+                pattern,
+                ctx,
+                render,
+                &mut bufs.out,
+                &mut bufs.cuts,
+            );
 
-            if count > 0 {
-                total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                dispatch_file(path, &mut bufs.out, dispatch, output, collector);
+            if emitted > 0 || capped {
+                total_count.fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+                files_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dispatch_file(
+                    path,
+                    &mut bufs.out,
+                    emitted,
+                    capped,
+                    &mut bufs.cuts,
+                    dispatch,
+                    output,
+                    collector,
+                );
             }
 
             ignore::WalkState::Continue
@@ -301,15 +554,15 @@ pub fn search_full_scan_render<W: Write + Send>(
     });
 
     if dispatch == Dispatch::Sorted {
-        let mut entries = collector.into_inner().unwrap();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut sink = output.lock().unwrap();
-        for (_, bytes) in &entries {
-            let _ = sink.write_all(bytes);
-        }
+        let entries = collector.into_inner().unwrap();
+        return Ok(drain_sorted(entries, render, output));
     }
 
-    Ok(total_count.load(std::sync::atomic::Ordering::Relaxed))
+    Ok(RenderStats {
+        matches: total_count.load(std::sync::atomic::Ordering::Relaxed),
+        files: files_emitted.load(std::sync::atomic::Ordering::Relaxed),
+        truncated: None,
+    })
 }
 
 /// Render path for the persistent-index search. Resolves candidate files
@@ -338,7 +591,7 @@ pub fn search_persistent_render<W: Write + Send>(
     render: &RenderOpts,
     dispatch: Dispatch,
     output: &Mutex<W>,
-) -> Result<(usize, crate::persist::SearchTiming)> {
+) -> Result<(RenderStats, crate::persist::SearchTiming)> {
     use crate::persist::SearchResult;
 
     let matcher = Matcher::new(pattern)?;
@@ -373,7 +626,8 @@ pub fn search_persistent_render<W: Write + Send>(
         .collect();
 
     let total_count = std::sync::atomic::AtomicUsize::new(0);
-    let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
+    let files_emitted = std::sync::atomic::AtomicUsize::new(0);
+    let collector: Mutex<Vec<Collected>> = Mutex::new(Vec::new());
 
     use rayon::prelude::*;
     candidate_paths
@@ -390,30 +644,50 @@ pub fn search_persistent_render<W: Write + Send>(
             };
 
             bufs.out.clear();
-            let count = render_file_into(path, buf, &matcher, pattern, ctx, render, &mut bufs.out);
+            bufs.cuts.clear();
+            let (emitted, capped) = render_file_into(
+                path,
+                buf,
+                &matcher,
+                pattern,
+                ctx,
+                render,
+                &mut bufs.out,
+                &mut bufs.cuts,
+            );
 
-            if count > 0 {
-                total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                dispatch_file(path, &mut bufs.out, dispatch, output, &collector);
+            if emitted > 0 || capped {
+                total_count.fetch_add(emitted, std::sync::atomic::Ordering::Relaxed);
+                files_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dispatch_file(
+                    path,
+                    &mut bufs.out,
+                    emitted,
+                    capped,
+                    &mut bufs.cuts,
+                    dispatch,
+                    output,
+                    &collector,
+                );
             }
         });
 
-    if dispatch == Dispatch::Sorted {
-        let mut entries = collector.into_inner().unwrap();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut sink = output.lock().unwrap();
-        for (_, bytes) in &entries {
-            let _ = sink.write_all(bytes);
+    let stats = if dispatch == Dispatch::Sorted {
+        let entries = collector.into_inner().unwrap();
+        drain_sorted(entries, render, output)
+    } else {
+        RenderStats {
+            matches: total_count.load(std::sync::atomic::Ordering::Relaxed),
+            files: files_emitted.load(std::sync::atomic::Ordering::Relaxed),
+            truncated: None,
         }
-    }
-
-    let count = total_count.load(std::sync::atomic::Ordering::Relaxed);
+    };
     timing.verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
-    timing.matches = count;
+    timing.matches = stats.matches;
     // strategy: kept simple here; the pre-render code reported "line-level"
     // / "file-level" / "bitmap-only" — we can resurrect that if the bench
     // line in cli.rs misses it.
-    Ok((count, timing))
+    Ok((stats, timing))
 }
 
 #[cfg(test)]
@@ -423,6 +697,10 @@ mod render_tests {
 
     fn opts(heading: bool) -> RenderOpts {
         RenderOpts {
+            kind: RenderKind::Text,
+            max_line_chars: None,
+            limits: Limits::default(),
+            envelope: None,
             heading,
             color: false,
             invert: false,
@@ -438,7 +716,8 @@ mod render_tests {
         let path = PathBuf::from("test.txt");
         let matcher = Matcher::new(pattern).unwrap();
         let mut out = Vec::new();
-        let n = render_file_into(
+        let mut cuts = Vec::new();
+        let (n, _) = render_file_into(
             &path,
             buf,
             &matcher,
@@ -446,6 +725,7 @@ mod render_tests {
             &ctx,
             &opts(heading),
             &mut out,
+            &mut cuts,
         );
         (n, String::from_utf8_lossy(&out).into_owned())
     }
@@ -739,10 +1019,92 @@ mod scan_tests {
     }
 }
 
+/// Wire shape of the output: plain text (grep / heading / compact), a single
+/// JSON document, or one JSON object per match (JSONL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderKind {
+    Text,
+    Json,
+    Jsonl,
+}
+
+/// Output caps (`--max-results`, `--max-results-per-file`, `--max-files`,
+/// `--max-output-bytes`). Applied deterministically at the sorted drain:
+/// matches ordered by path then line, first N kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub max_results: Option<usize>,
+    pub max_results_per_file: Option<usize>,
+    pub max_files: Option<usize>,
+    pub max_output_bytes: Option<usize>,
+}
+
+impl Limits {
+    pub fn any(&self) -> bool {
+        self.max_results.is_some()
+            || self.max_results_per_file.is_some()
+            || self.max_files.is_some()
+            || self.max_output_bytes.is_some()
+    }
+
+    /// Cap on matches rendered for a single file: no file needs more than
+    /// the per-file cap, nor more than the global budget.
+    fn per_file_cap(&self) -> Option<usize> {
+        match (self.max_results_per_file, self.max_results) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// Envelope fields for `--format json`, supplied by the CLI so the renderer
+/// can write the document in one place (elapsed is measured at drain time).
+#[derive(Debug, Clone)]
+pub struct JsonEnvelope {
+    pub query: String,
+    pub root: String,
+    pub indexed: bool,
+    pub started: std::time::Instant,
+}
+
+/// What a cap cut. Total vs shown counts — surfaced on stderr for text
+/// formats and as the `truncated` field for JSON/JSONL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Truncation {
+    pub total_matches: usize,
+    pub shown_matches: usize,
+    pub total_files: usize,
+    pub shown_files: usize,
+    /// `false` when a per-file cap stopped a file early: `total_matches` is
+    /// then a lower bound ("at least N"), never a wrong exact number. File
+    /// counts stay exact — every file is visited, each stops at its cap.
+    pub exact: bool,
+}
+
+/// Outcome of a render: how many matches/files were found, and what (if
+/// anything) the output caps left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderStats {
+    pub matches: usize,
+    pub files: usize,
+    pub truncated: Option<Truncation>,
+}
+
 /// Knobs the renderer needs to format output. Ownership lives at the CLI
 /// layer; the per-file pipeline reads it by reference.
 #[derive(Debug, Clone)]
 pub struct RenderOpts {
+    /// Text vs JSON vs JSONL. JSON/JSONL ignore `heading`/`color` and emit
+    /// match lines only (context lines are not matches).
+    pub kind: RenderKind,
+    /// `--agent-aggressive`: cut content longer than this many *characters*
+    /// and append `…` (UTF-8 boundary safe). Applied after `--trim`, before
+    /// highlighting. `None` = no cut.
+    pub max_line_chars: Option<usize>,
+    /// Output caps; see [`Limits`].
+    pub limits: Limits,
+    /// Envelope for `--format json`; `None` for every other kind.
+    pub envelope: Option<JsonEnvelope>,
     /// Group matches under a file-name heading (path on its own line,
     /// lines indented). When false, emit `path:line:content` per match.
     pub heading: bool,
@@ -790,6 +1152,12 @@ pub struct RenderOpts {
 ///
 /// Returns 0 (and writes nothing) if the file is empty or detected as
 /// binary, matching the historical full-scan behaviour.
+///
+/// `cuts` receives one entry per counted match: the `out_buf` offset at which
+/// that match's block starts (before its `--` separator and before-context),
+/// so truncating the buffer to `cuts[k]` keeps exactly the first `k` matches
+/// with all of their context. Invariant on return: `cuts.len() == count`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_file_into(
     path: &Path,
     mmap: &[u8],
@@ -798,17 +1166,25 @@ pub(crate) fn render_file_into(
     ctx: &ContextOpts,
     render: &RenderOpts,
     out_buf: &mut Vec<u8>,
-) -> usize {
+    cuts: &mut Vec<usize>,
+) -> (usize, bool) {
     if mmap.is_empty() {
-        return 0;
+        return (0, false);
     }
     if crate::searcher::skip_binary_by_ext(path, mmap)
         || (!is_known_text_ext(path) && is_binary(mmap))
     {
-        return 0;
+        return (0, false);
     }
 
     let lbl = needs_line_by_line(pattern);
+    // `--max-results-per-file` (and never more than the global budget). Once
+    // reached we stop scanning the file — after flushing any after-context
+    // still owed to the last shown match — and report `capped = true`, which
+    // makes the totals a lower bound ("at least N") instead of costing a full
+    // pass just to count. An existence-style `--max-results 1` therefore stops
+    // at the first hit of each file.
+    let cap = render.limits.per_file_cap();
 
     // We need a compiled regex on this file for two distinct reasons:
     //   1. colour highlighting wraps each match position in ANSI codes
@@ -833,21 +1209,11 @@ pub(crate) fn render_file_into(
         None
     };
 
-    // `compact` format relativises paths against the search root and normalises
+    // `compact`/JSON relativise paths against the search root and normalise
     // the OS separator to `/` (portable for cross-platform agent consumers).
     // Every other format prints the path exactly as walked, preserving drop-in
     // grep behaviour (and native separators) for scripts.
-    let path_str: std::borrow::Cow<str> = match render.rel_base.as_deref() {
-        Some(base) => {
-            let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy();
-            if std::path::MAIN_SEPARATOR == '/' {
-                rel
-            } else {
-                std::borrow::Cow::Owned(rel.replace(std::path::MAIN_SEPARATOR, "/"))
-            }
-        }
-        None => path.to_string_lossy(),
-    };
+    let path_str = display_path(path, render.rel_base.as_deref());
 
     // --- --invert-match ---
     //
@@ -861,7 +1227,8 @@ pub(crate) fn render_file_into(
     // non-matching line.
     if render.invert {
         let mut header_emitted = false;
-        let mut match_count: usize = 0;
+        let mut match_count: usize = 0; // emitted
+        let mut capped = false;
         let mut line_no: u32 = 0;
         let mut pos: usize = 0;
         while pos < mmap.len() {
@@ -871,6 +1238,11 @@ pub(crate) fn render_file_into(
             line_no += 1;
             let line_bytes = &mmap[pos..end];
             if !matcher.has_match(line_bytes, lbl) {
+                if cap == Some(0) {
+                    capped = true;
+                    break;
+                }
+                cuts.push(out_buf.len());
                 if !header_emitted && render.heading {
                     emit_heading(out_buf, &path_str, render);
                     header_emitted = true;
@@ -885,10 +1257,15 @@ pub(crate) fn render_file_into(
                     None,
                 );
                 match_count += 1;
+                if cap.is_some_and(|c| match_count >= c) {
+                    capped = true;
+                    break;
+                }
             }
             pos = end + 1;
         }
-        return match_count;
+        debug_assert_eq!(cuts.len(), match_count);
+        return (match_count, capped);
     }
 
     // State machine for chunk merging:
@@ -911,7 +1288,8 @@ pub(crate) fn render_file_into(
     // chunk without a `--` separator. `None` until the first emission.
     let mut last_emitted_line: Option<u32> = None;
     let mut header_emitted = false;
-    let mut match_count: usize = 0;
+    let mut match_count: usize = 0; // emitted
+    let mut capped = false;
 
     let mut line_no: u32 = 1;
     let mut pos: usize = 0;
@@ -927,7 +1305,15 @@ pub(crate) fn render_file_into(
         // the CR stripped.
         let is_match = matcher.has_match(line_bytes, lbl);
 
-        if is_match {
+        if is_match && (capped || cap == Some(0)) {
+            // Past the per-file cap (or a zero cap): stop scanning. The file
+            // reports "at least N"; a hidden match never leaks as context.
+            capped = true;
+            break;
+        } else if is_match {
+            // Where this match's block begins — before the heading (first
+            // match), separator, and before-context — for the cut points.
+            let block_start = out_buf.len();
             if !header_emitted && render.heading {
                 emit_heading(out_buf, &path_str, render);
                 header_emitted = true;
@@ -950,7 +1336,7 @@ pub(crate) fn render_file_into(
                 // matching ripgrep) and treat the ring buffer as fresh
                 // before-context.
                 if last_emitted_line.is_some() && !ctx.is_zero() {
-                    write_separator(out_buf);
+                    write_separator(out_buf, render);
                 }
             }
             // In both merge and no-merge cases we drain the ring buffer:
@@ -980,7 +1366,20 @@ pub(crate) fn render_file_into(
             // expect None here in practice).
             if render.only_matching {
                 if let Some(ref re) = bytes_re {
+                    let mut first_sub = true;
                     for m in re.find_iter(display_bytes) {
+                        // `-o` reports per substring, not per matching line:
+                        // `Searched in Xms, N matches` should equal what the
+                        // user sees on stdout. (`--count` counts lines and
+                        // takes a different path entirely, so it's unaffected.)
+                        // The first substring owns the block (separator +
+                        // before-context); later ones cut right before them.
+                        cuts.push(if first_sub {
+                            block_start
+                        } else {
+                            out_buf.len()
+                        });
+                        first_sub = false;
                         emit_line(
                             out_buf,
                             &path_str,
@@ -990,13 +1389,14 @@ pub(crate) fn render_file_into(
                             render,
                             hl_re,
                         );
-                        // `-o` reports per substring, not per matching line:
-                        // `Searched in Xms, N matches` should equal what the
-                        // user sees on stdout. (`--count` counts lines and
-                        // takes a different path entirely, so it's unaffected.)
                         match_count += 1;
+                        if cap.is_some_and(|c| match_count >= c) {
+                            capped = true;
+                            break;
+                        }
                     }
                 } else {
+                    cuts.push(block_start);
                     emit_line(
                         out_buf,
                         &path_str,
@@ -1007,8 +1407,12 @@ pub(crate) fn render_file_into(
                         hl_re,
                     );
                     match_count += 1;
+                    if cap.is_some_and(|c| match_count >= c) {
+                        capped = true;
+                    }
                 }
             } else {
+                cuts.push(block_start);
                 emit_line(
                     out_buf,
                     &path_str,
@@ -1019,6 +1423,9 @@ pub(crate) fn render_file_into(
                     hl_re,
                 );
                 match_count += 1;
+                if cap.is_some_and(|c| match_count >= c) {
+                    capped = true;
+                }
             }
             last_emitted_line = Some(line_no);
             after_remaining = ctx.after;
@@ -1034,8 +1441,9 @@ pub(crate) fn render_file_into(
             );
             last_emitted_line = Some(line_no);
             after_remaining -= 1;
-        } else if ctx.before > 0 {
-            // Feed the before-context ring buffer.
+        } else if ctx.before > 0 && !capped {
+            // Feed the before-context ring buffer (pointless once capped:
+            // nothing will drain it).
             if prev_lines.len() == ctx.before {
                 prev_lines.pop_front();
             }
@@ -1044,14 +1452,95 @@ pub(crate) fn render_file_into(
 
         line_no += 1;
         pos = end + 1;
+        // Cap reached and the last shown match's after-context is flushed:
+        // stop here rather than scan the rest just to count it.
+        if capped && after_remaining == 0 {
+            break;
+        }
     }
 
-    match_count
+    debug_assert_eq!(cuts.len(), match_count);
+    (match_count, capped)
+}
+
+/// Path as displayed: relative to `rel_base` (the search root) with the OS
+/// separator normalised to `/` when relativised — the `compact`/JSON form —
+/// or exactly as walked otherwise (drop-in grep behaviour).
+pub(crate) fn display_path<'a>(
+    path: &'a Path,
+    rel_base: Option<&Path>,
+) -> std::borrow::Cow<'a, str> {
+    match rel_base {
+        Some(base) => {
+            let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy();
+            if std::path::MAIN_SEPARATOR == '/' {
+                rel
+            } else {
+                std::borrow::Cow::Owned(rel.replace(std::path::MAIN_SEPARATOR, "/"))
+            }
+        }
+        None => path.to_string_lossy(),
+    }
+}
+
+/// Cut `content` to at most `max_chars` characters (UTF-8 boundary safe) and
+/// append `…`. Returns `None` when no cut is needed. Invalid UTF-8 is walked
+/// byte-wise so a cut never lands inside a multi-byte sequence.
+pub(crate) fn cut_chars(content: &[u8], max_chars: usize) -> Option<Vec<u8>> {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < content.len() {
+        if count == max_chars {
+            let mut v = Vec::with_capacity(i + 3);
+            v.extend_from_slice(&content[..i]);
+            v.extend_from_slice("…".as_bytes());
+            return Some(v);
+        }
+        let b = content[i];
+        // Advance by one UTF-8 scalar (1–4 bytes); a stray byte counts as one.
+        let w = match b {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        i = (i + w).min(content.len());
+        count += 1;
+    }
+    None
+}
+
+/// Write `bytes` as a JSON string literal (with quotes), escaping `"`, `\`,
+/// control characters, and passing invalid UTF-8 through lossily.
+pub(crate) fn write_json_str(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'"');
+    let s = String::from_utf8_lossy(bytes);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
 }
 
 /// File-name header for heading mode. Emitted lazily on the first match in
-/// a file (so files with no matches stay invisible).
+/// a file (so files with no matches stay invisible). No-op for JSON kinds.
 fn emit_heading(out: &mut Vec<u8>, path_str: &str, render: &RenderOpts) {
+    if render.kind != RenderKind::Text {
+        return;
+    }
     if render.color {
         let _ = write!(out, "{}{}{}{}\n", C_BOLD, C_PATH, path_str, C_RESET);
     } else {
@@ -1063,7 +1552,10 @@ fn emit_heading(out: &mut Vec<u8>, path_str: &str, render: &RenderOpts) {
 /// non-zero-context mode; zero-context never produces separators (a single
 /// continuous block of `path:line:content` matches the historical
 /// behaviour and ripgrep's).
-fn write_separator(out: &mut Vec<u8>) {
+fn write_separator(out: &mut Vec<u8>, render: &RenderOpts) {
+    if render.kind != RenderKind::Text {
+        return;
+    }
     out.extend_from_slice(b"--\n");
 }
 
@@ -1099,6 +1591,42 @@ fn emit_line(
     } else {
         content
     };
+
+    // `--agent-aggressive`: cap the line at N characters with a `…`.
+    let cut;
+    let content: &[u8] = match render.max_line_chars.and_then(|n| cut_chars(content, n)) {
+        Some(v) => {
+            cut = v;
+            &cut
+        }
+        None => content,
+    };
+
+    // JSON kinds: matches only, one object (or object fragment) per match.
+    // Context lines are not matches and are omitted.
+    match render.kind {
+        RenderKind::Jsonl => {
+            if matches!(kind, LineKind::Match) {
+                out.extend_from_slice(b"{\"path\":");
+                write_json_str(out, path_str.as_bytes());
+                let _ = write!(out, ",\"line\":{},\"text\":", line_no);
+                write_json_str(out, content);
+                out.extend_from_slice(b"}\n");
+            }
+            return;
+        }
+        RenderKind::Json => {
+            // Fragment with a trailing comma; the drain wraps the file object
+            // and strips the last comma. Keeps per-line emission stateless.
+            if matches!(kind, LineKind::Match) {
+                let _ = write!(out, "{{\"line\":{},\"text\":", line_no);
+                write_json_str(out, content);
+                out.extend_from_slice(b"},");
+            }
+            return;
+        }
+        RenderKind::Text => {}
+    }
 
     if !render.heading {
         if render.color {
@@ -1147,5 +1675,146 @@ fn highlight_bytes_into(line: &[u8], re: &regex::bytes::Regex, out: &mut Vec<u8>
     }
     if last_end < line.len() {
         out.extend_from_slice(&line[last_end..]);
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn text_opts(limits: Limits) -> RenderOpts {
+        RenderOpts {
+            kind: RenderKind::Text,
+            max_line_chars: None,
+            limits,
+            envelope: None,
+            heading: false,
+            color: false,
+            invert: false,
+            only_matching: false,
+            pattern: None,
+            rel_base: None,
+            trim: false,
+        }
+    }
+
+    fn render_with(
+        buf: &[u8],
+        pattern: &str,
+        ctx: ContextOpts,
+        opts: &RenderOpts,
+    ) -> (usize, Vec<u8>, Vec<usize>, bool) {
+        let matcher = Matcher::new(pattern).unwrap();
+        let mut out = Vec::new();
+        let mut cuts = Vec::new();
+        let (n, capped) = render_file_into(
+            &PathBuf::from("t.txt"),
+            buf,
+            &matcher,
+            pattern,
+            &ctx,
+            opts,
+            &mut out,
+            &mut cuts,
+        );
+        (n, out, cuts, capped)
+    }
+
+    #[test]
+    fn cut_chars_counts_characters_and_keeps_utf8_intact() {
+        let ascii = "x".repeat(250);
+        let cut = cut_chars(ascii.as_bytes(), 200).unwrap();
+        let s = String::from_utf8(cut).unwrap();
+        assert_eq!(s.chars().count(), 201);
+        assert!(s.ends_with('…'));
+        assert!(
+            cut_chars("x".repeat(200).as_bytes(), 200).is_none(),
+            "exactly 200: no cut"
+        );
+        assert!(cut_chars(b"short", 200).is_none());
+
+        // 2-byte chars: 200 chars = 400 bytes, then `…`.
+        let e = "é".repeat(250);
+        let cut = String::from_utf8(cut_chars(e.as_bytes(), 200).unwrap()).unwrap();
+        assert_eq!(cut.chars().count(), 201);
+        assert_eq!(cut.len(), 400 + "…".len());
+
+        // A 3-byte char exactly at the boundary is kept whole, never split.
+        let mixed = format!("{}€{}", "a".repeat(199), "b".repeat(50));
+        let cut = String::from_utf8(cut_chars(mixed.as_bytes(), 200).unwrap()).unwrap();
+        let kept: String = cut.chars().take(200).collect();
+        assert!(kept.ends_with('€'));
+    }
+
+    #[test]
+    fn json_string_escaping() {
+        let mut out = Vec::new();
+        write_json_str(&mut out, b"he said \"hi\"\n\t\\ \x01");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\"he said \\\"hi\\\"\\n\\t\\\\ \\u0001\""
+        );
+        let mut out = Vec::new();
+        write_json_str(&mut out, &[0x68, 0xff, 0x69]); // h <invalid> i
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with('"') && s.ends_with('"'));
+        assert!(
+            s.contains('\u{FFFD}'),
+            "invalid UTF-8 is replaced, not dropped"
+        );
+    }
+
+    #[test]
+    fn cut_points_truncate_to_whole_match_blocks_with_context() {
+        let ctx = ContextOpts::resolve(Some(1), None, None);
+        let (n, out, cuts, _capped) = render_with(
+            b"a\nhit\nb\nc\nd\nhit\ne\n",
+            "hit",
+            ctx,
+            &text_opts(Limits::default()),
+        );
+        assert_eq!(n, 2);
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(cuts[0], 0, "first block starts at the top of the buffer");
+        let first = String::from_utf8_lossy(&out[..cuts[1]]).into_owned();
+        assert_eq!(
+            first, "t.txt-1-a\nt.txt:2:hit\nt.txt-3-b\n",
+            "block = before-ctx + match + after-ctx, no separator"
+        );
+        assert!(
+            String::from_utf8_lossy(&out[cuts[1]..]).starts_with("--\n"),
+            "the separator belongs to the next block"
+        );
+    }
+
+    #[test]
+    fn per_file_cap_stops_scanning() {
+        let lim = Limits {
+            max_results_per_file: Some(1),
+            ..Limits::default()
+        };
+        let (n, out, cuts, _capped) = render_with(
+            b"hit\nhit\nhit\n",
+            "hit",
+            ContextOpts::default(),
+            &text_opts(lim),
+        );
+        assert_eq!(n, 1);
+        assert_eq!(cuts.len(), 1);
+        assert!(_capped, "the file stopped early at its cap");
+        assert_eq!(String::from_utf8_lossy(&out), "t.txt:1:hit\n");
+        // The global budget also bounds a single file.
+        let lim = Limits {
+            max_results: Some(2),
+            ..Limits::default()
+        };
+        let (n, _, _, _) = render_with(
+            b"hit\nhit\nhit\n",
+            "hit",
+            ContextOpts::default(),
+            &text_opts(lim),
+        );
+        assert_eq!(n, 2);
     }
 }

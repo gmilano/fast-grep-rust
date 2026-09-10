@@ -60,6 +60,42 @@ All notable changes to fast-grep are documented here.
   `error: unauthorized` and the daemon keeps running. Token comparison is
   constant-time.
 
+### Agent surface — the documented flags now exist
+
+- Implemented the agent-oriented CLI surface that the 0.4.0 notes, the README
+  and the `integrations/` guides describe but the binary never shipped:
+  `--agent` (same as `--format compact`), `--agent-aggressive` (compact plus
+  lines cut at 200 characters with `…`, UTF-8 boundary safe), `--agent-stats`
+  (latency, match/file counts, output bytes and a ~4 bytes/token estimate on
+  stderr), the output caps `--max-results`, `--max-results-per-file`,
+  `--max-files` and `--max-output-bytes` (applied deterministically — the
+  first N matches by path then line — with a truncation notice on stderr for
+  text formats and a `truncated` field for JSON/JSONL; a byte cap never splits
+  a line or a UTF-8 sequence), `--format json` / `--format jsonl` (the
+  documented schema; `json` is always a valid document, even with 0 matches),
+  and the `fgr integrations` subcommand. `-c`/`-l` reject the JSON formats with
+  a clear error and exit code 2. The shipped `scripts/demo` and
+  `scripts/bench-agent` invocations now run.
+- JSONL carries match lines only (`-A`/`-B`/`-C` context lines are not
+  matches) and, only when a cap truncated the output, ends with one
+  `{"truncated":{…}}` line.
+- A per-file cap (`--max-results-per-file`, or `--max-results` acting per file)
+  stops scanning that file once reached — an existence-style `--max-results 1`
+  stops at the first hit of each file — so when a file was cut short the
+  reported total is a lower bound: `N+` on stderr and `"exact": false` in the
+  `truncated` object. File counts are always exact.
+- `fgr bench --agent-metrics`, listed under 0.4.0, was never implemented and is
+  not part of this change.
+
+### Exit codes — grep-compatible
+
+- A search now exits `0` when something matched, `1` when nothing matched, and
+  `2` on an error. Previously it exited `0` regardless (only `-q` honoured the
+  no-match case), so `if fgr "X" .; then …` never worked. Applies to plain
+  searches, `-q`, `-c`, `-l` and `-v`, with and without `--index`; an output cap
+  that hides every match still exits `0` (something matched). Errors moved from
+  `1` to `2` so that `1` unambiguously means "no match", as in grep/ripgrep.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights

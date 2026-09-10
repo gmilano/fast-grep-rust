@@ -15,8 +15,15 @@ mod searcher;
 mod trigram;
 
 fn main() {
-    if let Err(e) = cli::run() {
-        eprintln!("Error: {:#}", e);
-        std::process::exit(1);
+    // grep/ripgrep-compatible exit status: 0 = something matched (or a
+    // subcommand succeeded), 1 = nothing matched, 2 = error (bad pattern,
+    // unreadable index, invalid flag combination, …).
+    match cli::run() {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("Error: {:#}", e);
+            std::process::exit(2);
+        }
     }
 }
