@@ -1,17 +1,21 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::render::{self, ContextOpts, Dispatch, RenderOpts, C_BOLD, C_LINENO, C_PATH, C_RESET};
+use crate::render::{
+    self, ContextOpts, Dispatch, JsonEnvelope, Limits, RenderKind, RenderOpts, RenderStats, C_BOLD,
+    C_LINENO, C_PATH, C_RESET,
+};
 use crate::{index, persist, searcher};
 
-/// Output layout. Resolved from `--format`, then `--heading`/`--no-heading`,
-/// then the `FGR_FORMAT` env var, then a TTY default (heading in a terminal,
-/// grep when piped — preserving drop-in grep behaviour for scripts).
+/// Output layout. Resolved from `--format`, then `--agent-aggressive` /
+/// `--agent`, then `--heading`/`--no-heading`, then the `FGR_FORMAT` env var,
+/// then a TTY default (heading in a terminal, grep when piped — preserving
+/// drop-in grep behaviour for scripts).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     /// `path:line:content` per match — flat, grep-compatible (piped default).
@@ -21,6 +25,11 @@ pub enum OutputFormat {
     /// Heading + paths relative to the search root: fewest tokens for LLM/agent
     /// consumers, without losing the path, line number, or content.
     Compact,
+    /// One JSON document: `{query, root, indexed, elapsed_ms, total_matches,
+    /// files:[{path, matches:[{line, text}]}], truncated}`. Always valid.
+    Json,
+    /// One JSON object per match: `{"path","line","text"}` — streaming-friendly.
+    Jsonl,
 }
 
 impl OutputFormat {
@@ -30,8 +39,14 @@ impl OutputFormat {
             "grep" => Some(Self::Grep),
             "heading" => Some(Self::Heading),
             "compact" => Some(Self::Compact),
+            "json" => Some(Self::Json),
+            "jsonl" => Some(Self::Jsonl),
             _ => None,
         }
+    }
+
+    fn is_json(self) -> bool {
+        matches!(self, Self::Json | Self::Jsonl)
     }
 }
 
@@ -63,8 +78,21 @@ struct SearchOpts {
     /// Glob patterns; a file is excluded if it matches any exclude glob.
     /// Empty list = no negative filter.
     exclude: Vec<String>,
-    /// Resolved output layout (grep / heading / compact).
+    /// Resolved output layout (grep / heading / compact / json / jsonl).
     format: OutputFormat,
+    /// `--agent-aggressive` took effect (no explicit `--format` overrode it):
+    /// cut content longer than 200 characters with a `…`.
+    aggressive: bool,
+    /// `--agent-stats`: print latency, counts, output bytes and a token
+    /// estimate to stderr instead of the plain timing line.
+    agent_stats: bool,
+    /// Output caps (`--max-results` etc.), applied deterministically.
+    limits: Limits,
+    /// Whether the search resolves through the persistent index (for the
+    /// JSON envelope's `indexed` field).
+    indexed: bool,
+    /// The pattern exactly as the user typed it (JSON envelope `query`).
+    query: String,
     /// `--trim`: strip leading indentation from emitted content (lossy).
     trim: bool,
     /// Resolved before/after context window for `-A` / `-B` / `-C`.
@@ -188,11 +216,45 @@ pub struct Cli {
     pub no_heading: bool,
 
     /// Output format: `grep` (flat `path:line:content`, piped default), `heading`
-    /// (grouped under a file heading, TTY default), or `compact` (grouped +
-    /// relative paths — fewest tokens for LLM/agent consumers). Overrides
+    /// (grouped under a file heading, TTY default), `compact` (grouped +
+    /// relative paths — fewest tokens for LLM/agent consumers), `json` (one
+    /// document) or `jsonl` (one object per match). Overrides --agent and
     /// --heading/--no-heading. Env: FGR_FORMAT.
     #[arg(long = "format", value_name = "FORMAT", value_enum, global = true)]
     pub format: Option<OutputFormat>,
+
+    /// Agent mode: compact output — path once per file, then `line: text`,
+    /// paths relative to the search root. Lossless. Same as `--format compact`.
+    #[arg(long = "agent", global = true)]
+    pub agent: bool,
+
+    /// Agent mode plus long-line trimming: content longer than 200 characters
+    /// is cut and suffixed with `…` (UTF-8 boundary safe). Lossy.
+    #[arg(long = "agent-aggressive", global = true)]
+    pub agent_aggressive: bool,
+
+    /// Print search latency, match/file counts, output bytes and a token
+    /// estimate (~4 bytes/token) to stderr.
+    #[arg(long = "agent-stats", global = true)]
+    pub agent_stats: bool,
+
+    /// Cap the total number of matches emitted (the first N by path, then
+    /// line). A truncation notice goes to stderr (or the `truncated` field
+    /// for JSON/JSONL).
+    #[arg(long = "max-results", value_name = "N", global = true)]
+    pub max_results: Option<usize>,
+
+    /// Cap the number of matches emitted per file.
+    #[arg(long = "max-results-per-file", value_name = "N", global = true)]
+    pub max_results_per_file: Option<usize>,
+
+    /// Cap the number of files in the output.
+    #[arg(long = "max-files", value_name = "N", global = true)]
+    pub max_files: Option<usize>,
+
+    /// Cap the output size in bytes. Never splits a line or a UTF-8 sequence.
+    #[arg(long = "max-output-bytes", value_name = "N", global = true)]
+    pub max_output_bytes: Option<usize>,
 
     /// Strip leading indentation from each match's content. Lossy (discards
     /// indentation structure) but trims a few % more tokens — pairs with
@@ -253,6 +315,9 @@ pub enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Print the integration guides (Claude Code, Codex, OpenCode, Aider, MCP)
+    #[command(name = "integrations")]
+    Integrations,
 }
 
 #[cfg(feature = "daemon")]
@@ -324,6 +389,16 @@ pub fn run() -> Result<()> {
         include: cli.include.clone(),
         exclude: cli.exclude.clone(),
         format: resolve_format(&cli),
+        aggressive: cli.agent_aggressive && cli.format.is_none(),
+        agent_stats: cli.agent_stats,
+        limits: Limits {
+            max_results: cli.max_results,
+            max_results_per_file: cli.max_results_per_file,
+            max_files: cli.max_files,
+            max_output_bytes: cli.max_output_bytes,
+        },
+        indexed: cli.index_path.is_some() && !cli.invert_match,
+        query: String::new(), // populated below from the raw pattern
         trim: cli.trim,
         context,
         pattern: None, // populated below once the effective pattern is built
@@ -349,12 +424,22 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // Aggregate modes produce per-file counts / file lists, not match records,
+    // so a structured format has nothing to carry: refuse rather than emit
+    // something that only looks like JSON.
+    if (cli.count || cli.files_only) && opts.format.is_json() {
+        eprintln!(
+            "fgr: --count / --files-with-matches cannot be combined with --format json or jsonl"
+        );
+        std::process::exit(2);
+    }
+
     let dir = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
     let mut effective = if cli.fixed_strings {
         regex::escape(&pattern)
     } else {
-        pattern
+        pattern.clone()
     };
     if cli.ignore_case {
         effective = format!("(?i){}", effective);
@@ -373,6 +458,7 @@ pub fn run() -> Result<()> {
 
     let mut opts = opts;
     opts.pattern = Some(effective.clone());
+    opts.query = pattern;
 
     // Invert-match can't use the index — the trigram index locates *matches*,
     // so a "lines that don't match" query can't be answered from it; it always
@@ -396,13 +482,17 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Resolve the output format: explicit `--format` wins, then the legacy
+/// Resolve the output format: explicit `--format` wins, then
+/// `--agent-aggressive` / `--agent` (both compact), then the legacy
 /// `--heading`/`--no-heading` booleans, then the `FGR_FORMAT` env var, then a
 /// TTY default (heading in a terminal, grep when piped — so `fgr | script`
 /// stays drop-in grep-compatible).
 fn resolve_format(cli: &Cli) -> OutputFormat {
     if let Some(f) = cli.format {
         return f;
+    }
+    if cli.agent_aggressive || cli.agent {
+        return OutputFormat::Compact;
     }
     if cli.no_heading {
         return OutputFormat::Grep;
@@ -428,6 +518,81 @@ fn resolve_format(cli: &Cli) -> OutputFormat {
 /// are independent: you can group without colour and colour without group.
 fn use_color() -> bool {
     std::io::stdout().is_terminal()
+}
+
+/// Counts the bytes written through it, so `--agent-stats` can report output
+/// size while the renderer stays generic over its writer.
+struct CountingWriter<W: Write> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The search root as an absolute path for the JSON envelope. Windows'
+/// canonical form carries a `\\?\` prefix that is noise for consumers.
+fn absolute_display(root: &std::path::Path) -> String {
+    let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let s = abs.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
+/// Post-render stderr line(s): the plain timing summary — or, with
+/// `--agent-stats`, a stats line in its place — plus, for text formats, the
+/// truncation notice when an output cap cut something.
+fn print_render_summary(
+    opts: &SearchOpts,
+    stats: &RenderStats,
+    output_bytes: u64,
+    load: Option<Duration>,
+    search: Duration,
+) {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    if opts.agent_stats {
+        // ~4 bytes/token heuristic (not any particular model's tokenizer).
+        let est_tokens = output_bytes.div_ceil(4);
+        match load {
+            Some(l) => eprintln!(
+                "fgr-stats: load_ms={:.1} search_ms={:.1} matches={} files={} output_bytes={} est_tokens={}",
+                ms(l), ms(search), stats.matches, stats.files, output_bytes, est_tokens
+            ),
+            None => eprintln!(
+                "fgr-stats: search_ms={:.1} matches={} files={} output_bytes={} est_tokens={}",
+                ms(search), stats.matches, stats.files, output_bytes, est_tokens
+            ),
+        }
+    } else if !opts.quiet {
+        match load {
+            Some(l) => eprintln!(
+                "Load: {:.1}ms, Search: {:.1}ms, {} matches",
+                ms(l),
+                ms(search),
+                stats.matches
+            ),
+            None => eprintln!("Searched in {:.2}ms, {} matches", ms(search), stats.matches),
+        }
+    }
+    if !opts.format.is_json() {
+        if let Some(t) = stats.truncated {
+            // `N+`: a per-file cap stopped a file early, so the total is a
+            // lower bound (we stopped looking rather than scan just to count).
+            let plus = if t.exact { "" } else { "+" };
+            eprintln!(
+                "fgr: output truncated — {} of {}{} matches ({} of {} files) shown; raise --max-results / --max-files / --max-output-bytes to see more",
+                t.shown_matches, t.total_matches, plus, t.shown_files, t.total_files
+            );
+        }
+    }
 }
 
 fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
@@ -483,8 +648,11 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
 
     let start = Instant::now();
     let stdout = std::io::stdout();
-    let output = Mutex::new(std::io::BufWriter::new(stdout));
-    let count = render::search_full_scan_render(
+    let output = Mutex::new(CountingWriter {
+        inner: std::io::BufWriter::new(stdout),
+        bytes: 0,
+    });
+    let stats = render::search_full_scan_render(
         dir,
         pattern,
         opts.no_ignore,
@@ -497,16 +665,13 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         dispatch,
         &output,
     )?;
-    {
+    let output_bytes = {
         let mut out = output.lock().unwrap();
         let _ = out.flush();
-    }
+        out.bytes
+    };
     let elapsed = start.elapsed();
-    eprintln!(
-        "Searched in {:.2}ms, {} matches",
-        elapsed.as_secs_f64() * 1000.0,
-        count
-    );
+    print_render_summary(opts, &stats, output_bytes, None, elapsed);
     Ok(())
 }
 
@@ -621,8 +786,11 @@ fn run_indexed_search(
     let dispatch = dispatch_for(&render_opts);
 
     let stdout = std::io::stdout();
-    let output = Mutex::new(std::io::BufWriter::new(stdout));
-    let (count, _) = render::search_persistent_render(
+    let output = Mutex::new(CountingWriter {
+        inner: std::io::BufWriter::new(stdout),
+        bytes: 0,
+    });
+    let (stats, _) = render::search_persistent_render(
         &idx,
         pattern,
         path_filter.as_deref(),
@@ -635,19 +803,13 @@ fn run_indexed_search(
         dispatch,
         &output,
     )?;
-    {
+    let output_bytes = {
         let mut out = output.lock().unwrap();
         let _ = out.flush();
-    }
+        out.bytes
+    };
     let search_time = start.elapsed();
-    if !opts.quiet {
-        eprintln!(
-            "Load: {:.1}ms, Search: {:.1}ms, {} matches",
-            load_time.as_secs_f64() * 1000.0,
-            search_time.as_secs_f64() * 1000.0,
-            count
-        );
-    }
+    print_render_summary(opts, &stats, output_bytes, Some(load_time), search_time);
     Ok(())
 }
 
@@ -655,14 +817,28 @@ fn run_indexed_search(
 /// `grep` → flat; `heading` → grouped; `compact` → grouped + paths relative to
 /// `root`. Colour stays strictly TTY-driven so a piped format never leaks escapes.
 fn render_opts_for(opts: &SearchOpts, root: &std::path::Path) -> RenderOpts {
-    let (heading, relative) = match opts.format {
-        OutputFormat::Grep => (false, false),
-        OutputFormat::Heading => (true, false),
-        OutputFormat::Compact => (true, true),
+    // JSON kinds use root-relative paths (like compact) and never headings.
+    let (heading, relative, kind) = match opts.format {
+        OutputFormat::Grep => (false, false, RenderKind::Text),
+        OutputFormat::Heading => (true, false, RenderKind::Text),
+        OutputFormat::Compact => (true, true, RenderKind::Text),
+        OutputFormat::Json => (false, true, RenderKind::Json),
+        OutputFormat::Jsonl => (false, true, RenderKind::Jsonl),
     };
+    let envelope = (kind == RenderKind::Json).then(|| JsonEnvelope {
+        query: opts.query.clone(),
+        root: absolute_display(root),
+        indexed: opts.indexed,
+        started: Instant::now(),
+    });
     RenderOpts {
+        kind,
+        max_line_chars: opts.aggressive.then_some(200),
+        limits: opts.limits,
+        envelope,
         heading,
-        color: use_color(),
+        // Never leak ANSI escapes into a JSON document.
+        color: use_color() && kind == RenderKind::Text,
         invert: opts.invert,
         only_matching: opts.only_matching,
         pattern: opts.pattern.clone(),
@@ -671,11 +847,16 @@ fn render_opts_for(opts: &SearchOpts, root: &std::path::Path) -> RenderOpts {
     }
 }
 
-/// Streaming dispatch is only safe when neither heading nor colour are on:
-/// both require buffered, sorted output (heading wants stable file order,
-/// colour can't be applied per-byte during a streaming write).
+/// Streaming dispatch is only safe when the output needs neither a stable
+/// file order nor buffering: heading and colour want sorted output, the
+/// output caps are defined as "first N by path", and JSON/JSONL are written
+/// as one deterministic document / sequence.
 fn dispatch_for(render_opts: &RenderOpts) -> Dispatch {
-    if render_opts.heading || render_opts.color {
+    if render_opts.heading
+        || render_opts.color
+        || render_opts.limits.any()
+        || render_opts.kind != RenderKind::Text
+    {
         Dispatch::Sorted
     } else {
         Dispatch::Streaming
@@ -915,6 +1096,30 @@ fn run_subcommand(
         #[cfg(not(feature = "daemon"))]
         Commands::Daemon { .. } => {
             eprintln!("Daemon feature not enabled. Rebuild with --features daemon");
+        }
+        Commands::Integrations => {
+            // The guides ship inside the binary so `fgr integrations` works
+            // wherever `fgr` is installed, without the source tree.
+            let guides: [(&str, &str); 5] = [
+                (
+                    "Claude Code",
+                    include_str!("../integrations/claude-code/README.md"),
+                ),
+                ("Codex", include_str!("../integrations/codex/README.md")),
+                (
+                    "OpenCode",
+                    include_str!("../integrations/opencode/README.md"),
+                ),
+                ("Aider", include_str!("../integrations/aider/README.md")),
+                ("MCP", include_str!("../integrations/mcp/README.md")),
+            ];
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            for (name, body) in guides {
+                let _ = writeln!(out, "==== {} ====\n", name);
+                let _ = out.write_all(body.as_bytes());
+                let _ = writeln!(out);
+            }
         }
     }
     Ok(())

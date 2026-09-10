@@ -13,7 +13,8 @@ use std::sync::Mutex;
 
 use fast_grep::persist::{build as build_index, load as load_index};
 use fast_grep::render::{
-    search_full_scan_render, search_persistent_render, ContextOpts, Dispatch, RenderOpts,
+    search_full_scan_render, search_persistent_render, ContextOpts, Dispatch, Limits, RenderKind,
+    RenderOpts,
 };
 
 fn sink() -> Mutex<Vec<u8>> {
@@ -22,6 +23,10 @@ fn sink() -> Mutex<Vec<u8>> {
 
 fn render_opts(heading: bool, color: bool, pattern: &str) -> RenderOpts {
     RenderOpts {
+        kind: RenderKind::Text,
+        max_line_chars: None,
+        limits: Limits::default(),
+        envelope: None,
         heading,
         color,
         invert: false,
@@ -70,7 +75,8 @@ fn full_scan_zero_context_one_file() {
         Dispatch::Streaming,
         &out,
     )
-    .unwrap();
+    .unwrap()
+    .matches;
 
     assert_eq!(n, 1);
     let s = String::from_utf8(out.into_inner().unwrap()).unwrap();

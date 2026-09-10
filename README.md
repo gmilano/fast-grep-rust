@@ -330,6 +330,15 @@ JSONL emits one object per match for streaming:
 
 Keys are stable across versions. New optional keys may be added in minor releases.
 
+JSONL carries match lines only (`-A`/`-B`/`-C` context lines are not matches).
+When an output cap truncates the result, the last JSONL line is
+`{"truncated":{"total_matches":…,"shown_matches":…,"total_files":…,"shown_files":…,"exact":…}}`;
+`--format json` puts the same object in its `truncated` field (`null` when
+nothing was cut). A per-file cap stops scanning a file at its Nth match rather
+than reading the rest just to count, so when one did, `exact` is `false` and
+`total_matches` is a lower bound ("at least"); text formats print it as `N+`.
+File counts are always exact.
+
 ---
 
 ## How it works
