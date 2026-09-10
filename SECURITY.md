@@ -46,9 +46,15 @@ processes beyond what the OS already enforces.
 
 ## Hardening notes
 
-- The daemon's TCP listener binds to `127.0.0.1` only. The command set is
-  closed: `status`, `flush`, `stop`. There is no path or pattern argument
-  passed over the socket — anything else returns `error: unknown command`.
+- The daemon's TCP listener binds to `127.0.0.1` only, on a random port
+  recorded in `<index>/daemon.port`. The command set is closed: `status`,
+  `flush`, `stop`. There is no path or pattern argument passed over the
+  socket — anything else returns `error: unknown command`.
+- Every command must carry the per-daemon secret token written to
+  `<index>/daemon.token` (owner-only `0600` on Unix; on Windows it inherits
+  the index directory's ACLs). A wrong or missing token returns
+  `error: unauthorized` and the daemon keeps running; the comparison is
+  constant-time. Keep the index directory somewhere only you can read.
 - The CLI does not follow symlinks by default (`ignore::WalkBuilder`'s
   default).
 - `cargo-audit` runs on every push and PR (`.github/workflows/ci.yml`)

@@ -57,24 +57,24 @@
     <p class="lede">Five techniques combine to eliminate &gt;99% of file I/O before the regex engine runs.</p>
     <div class="steps">
       <div class="card">
-        <h4>1. Sparse n-grams</h4>
-        <p>Variable-length substrings whose boundaries fall on rare bigram pairs (computed from the corpus itself). Fewer, longer, more selective posting lists than fixed trigrams.</p>
+        <h4>1. Trigrams, line-level postings</h4>
+        <p>Every 3-byte window of every line is indexed as (document, line, byte offset). A query's required trigrams are intersected on (document, line) — the index answers "which lines", not just "which files".</p>
       </div>
       <div class="card">
-        <h4>2. Position masks</h4>
-        <p>Two 8-bit Bloom filters per (n-gram, document) pair encode position-mod-8 and successor character. Drops the false-positive rate to 0.42% before any I/O.</p>
+        <h4>2. Roaring bitmaps first</h4>
+        <p>Each trigram also has a bitmap of the documents containing it. Bitmaps are ANDed first (cheap, early exit); line postings are decoded only for the surviving documents.</p>
       </div>
       <div class="card">
         <h4>3. mmap'd posting lists</h4>
         <p>Binary index files memory-mapped at query time. 17ms cold load regardless of corpus size — the OS pages in only the lists you touch.</p>
       </div>
       <div class="card">
-        <h4>4. Line-level offsets</h4>
-        <p>Index stores byte offsets of candidate lines, not just file IDs. Verification jumps directly to the suspicious line instead of scanning the whole file.</p>
+        <h4>4. Compact encoding</h4>
+        <p>Postings are delta-encoded with a flagged varint — ~2.9 bytes each instead of 16 — and encoded on the fly during the build, so the decoded index never sits in RAM.</p>
       </div>
       <div class="card">
-        <h4>5. 4-byte prefix filter</h4>
-        <p>Before invoking the regex engine, fast-grep checks a 4-byte content prefix per candidate line. Eliminates &gt;95% of remaining I/O.</p>
+        <h4>5. Line-level SIMD verify</h4>
+        <p>Candidate lines are verified in parallel, seeking straight to each line's byte offset. Literals use memchr, alternations Aho-Corasick, regexes the Teddy SIMD engine.</p>
       </div>
     </div>
     <p class="note" style="margin-top: 24px;">Deep dive: <a href="techniques.md">Techniques</a> · <a href="vs-ripgrep.md">vs ripgrep</a> · <a href="https://github.com/gmilano/fast-grep-rust/blob/master/src/searcher.rs">source code</a></p>
@@ -98,7 +98,7 @@
       </div>
       <div class="output" id="pat-output"></div>
     </div>
-    <p class="note">This demo uses fixed 3-grams for clarity. The real engine uses corpus-adaptive sparse n-grams (variable length, bigram-rarity weighted) which produce fewer, more selective lookups — but the decomposition pattern matching shown here (literal vs alternation vs regex) is exactly what <code>src/searcher.rs</code> implements.</p>
+    <p class="note">The trigram decomposition shown here (literal vs alternation vs regex) mirrors what <code>src/trigram.rs</code> does; the real engine additionally intersects the resulting posting lists at line granularity.</p>
   </div>
 </section>
 
@@ -116,11 +116,11 @@
         <div class="value"></div>
       </div>
       <div class="pipeline-step" data-step="2">
-        <h5>3. Posting lists</h5>
+        <h5>3. Bitmaps</h5>
         <div class="value"></div>
       </div>
       <div class="pipeline-step" data-step="3">
-        <h5>4. Position masks</h5>
+        <h5>4. Line postings</h5>
         <div class="value"></div>
       </div>
       <div class="pipeline-step" data-step="4">
@@ -133,7 +133,7 @@
       <button class="btn ghost reset">↻ Reset</button>
       <span class="step-label">Press play to start</span>
     </div>
-    <p class="note">Steps 1–4 take ≈10 ms. Step 5 (the only stage that touches actual file bytes) is where the 4-byte prefix filter eliminates &gt;95% of the I/O. End-to-end this query returns 197 matches in 197 ms — vs 1 553 ms for ripgrep.</p>
+    <p class="note">Steps 1–4 take ≈10 ms. Step 5 is the only stage that touches actual file bytes, and it reads candidate lines rather than whole files. End-to-end this query returns 197 matches in 197 ms — vs 1 553 ms for ripgrep.</p>
   </div>
 </section>
 
@@ -167,7 +167,7 @@ graph LR
   fs[(File system)]
 
   cli -- "build / load" --> index
-  cli -- "TCP localhost<br/>(flush before search)" --> daemon
+  cli -- "TCP localhost, token-authenticated<br/>(flush before search)" --> daemon
   daemon -- "incremental<br/>updates" --> index
   daemon -- "notify::Watcher<br/>(debounced 3s)" --> fs
   cli -- "verify reads" --> fs
@@ -179,20 +179,19 @@ graph LR
 graph TB
   cli["CLI / argument parser"]
   pat["Pattern decomposer<br/>(extract literal runs &amp;<br/>alternation branches)"]
-  load["Index loader<br/>(mmap meta.json + postings)"]
-  ngram["Sparse n-gram extractor"]
-  posting["Posting list intersection"]
-  bloom["Position-mask Bloom filter<br/>(Blackbird locMask + nextMask)"]
-  prefix["4-byte content prefix filter"]
-  verify["Line-level regex verify"]
-  out["Output renderer<br/>(grouped/colored or piped)"]
+  load["Index loader<br/>(lookup tables in RAM, postings + bitmaps mmap'd)"]
+  ngram["Trigram extractor"]
+  bloom["Roaring bitmap AND<br/>(document tier)"]
+  posting["Line posting intersection<br/>(main + delta, tombstones filtered)"]
+  verify["Line-level verify<br/>(memchr / Aho-Corasick / regex)"]
+  out["Output renderer<br/>(grep / heading / compact / json)"]
 
-  cli --> pat --> ngram --> posting --> bloom --> prefix --> verify --> out
-  load -.-> posting
+  cli --> pat --> ngram --> bloom --> posting --> verify --> out
   load -.-> bloom
+  load -.-> posting
     </pre>
 
-    <p class="note">The optional Metal GPU pre-filter (macOS, opt-in via <code>FGR_METAL=1</code>) lives between "prefix" and "verify" and runs literal scans on candidate lines as a Metal compute kernel.</p>
+    <p class="note">The optional Metal GPU pre-filter (macOS, opt-in via <code>FGR_METAL=1</code>) sits in front of "verify" and runs literal scans on candidate lines as a Metal compute kernel.</p>
   </div>
 </section>
 
@@ -228,7 +227,7 @@ graph TB
         <tr><td>Full build</td><td><strong>~60 s</strong> (one-time)</td></tr>
         <tr><td>Incremental update</td><td>&lt;1 s for 10–100 files (75× faster than rebuild)</td></tr>
         <tr><td>Index load (mmap)</td><td>17 ms</td></tr>
-        <tr><td>Index size</td><td>775 MB postings + 161 MB bitmaps</td></tr>
+        <tr><td>Index size</td><td>~2.9 GB postings + ~170 MB bitmaps (79 406 indexed files, line-level postings)</td></tr>
       </tbody>
     </table>
   </div>
@@ -251,7 +250,7 @@ graph TB
       </div>
       <div class="pyramid-tier t-unit">
         <div class="count">33</div>
-        <div class="label">Unit: index, sparse, trigram</div>
+        <div class="label">Unit: index, trigram, postenc, render</div>
       </div>
     </div>
 

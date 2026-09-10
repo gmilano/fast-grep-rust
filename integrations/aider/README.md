@@ -38,6 +38,6 @@ Remove the `grep:` line from `.aider.conf.yml` to restore aider's default.
 
 ## Limits
 
-- Case-insensitive patterns (`-i`) bypass the index
+- Case-insensitive patterns (`-i`) are only indexed when the index was built with `fgr index -i`; otherwise they scan every indexed file
 - The index reflects files at build time; stale results possible before `update`
 - Token estimates from `--agent-stats` use ~4 bytes/token, not aider's tokenizer

@@ -6,7 +6,7 @@ A detailed comparison of the two tools: when each one wins and why.
 
 | Dimension | ripgrep | fast-grep |
 |-----------|---------|-----------|
-| **Architecture** | No index, SIMD brute-force scan | Sparse n-gram inverted index |
+| **Architecture** | No index, SIMD brute-force scan | Trigram inverted index with line-level postings + Roaring bitmaps |
 | **First search** | Instant (no build step) | Requires index build (~60s for Linux kernel) |
 | **Repeated searches** | Same speed every time | 4–9x faster with index |
 | **Regex support** | Full PCRE2 / Rust regex | Full Rust regex (same engine for verification) |
@@ -22,15 +22,15 @@ ripgrep must open and scan every file in the tree. For the Linux kernel (81,690 
 fast-grep's index reduces candidates to a tiny fraction:
 - `EXPORT_SYMBOL` → ~0.5% of files are candidates
 - `TODO` → ~3% of files
-- Even `printk` (appears in ~40k files) benefits from position mask filtering
+- Even `printk` (appears in ~40k files) benefits: the postings are per *line*, so verification reads the candidate lines rather than the whole file
 
 Reading 500 files instead of 81,690 is the primary source of speedup.
 
 ### 2. Lookup is nearly free
 
-The index lookup phase (hash n-grams → binary search lookup table → load posting lists) takes **0.38ms**. Bitmap intersection takes **3.6ms**. Together, the filtering phase is <4ms — negligible compared to the ~220ms verification phase.
+The index lookup phase (trigram keys → binary search lookup table → load Roaring bitmaps) takes **0.38ms**. Bitmap intersection takes **3.6ms**. Together, the filtering phase is <4ms — negligible compared to the ~220ms verification phase.
 
-The postings file is mmap'd, so only the pages containing the accessed posting lists are read from disk. For a typical query touching 3-5 n-grams, this is a few KB of I/O.
+The postings and bitmap files are mmap'd, so only the pages containing the accessed lists are read from disk. For a typical query touching 3-5 trigrams, this is a few KB of I/O.
 
 ### 3. Verification uses the same engine
 
@@ -77,7 +77,7 @@ ripgrep compiles the regex once and reuses it across all files. For a single-pat
 - **Large codebases** (>50k files) — the larger the codebase, the more the index helps
 - **CI/CD pipelines** — build the index once per commit, run multiple pattern checks quickly
 - **Code review tools** — where the index can be pre-built and shared across queries
-- **Complex regex patterns** — patterns with `.*` wildcards that defeat ripgrep's literal optimizations still benefit from sparse n-gram filtering
+- **Complex regex patterns** — patterns with `.*` wildcards that defeat ripgrep's literal optimizations still benefit from trigram filtering, as long as each alternation branch keeps a literal run of ≥3 bytes
 
 ### The crossover point
 
@@ -93,7 +93,7 @@ After ~32 searches, the cumulative time saved exceeds the index build cost. With
 
 | Tool | Advantage over fast-grep | Disadvantage |
 |------|-------------------------|--------------|
-| **zoekt** (Sourcegraph) | Battle-tested at scale, trigram index is simpler | Go, higher false positive rate from fixed trigrams, no position masks |
+| **zoekt** (Sourcegraph) | Battle-tested at scale, server-side, multi-repo | Go; file-level postings, so verification scans whole candidate files; index tied to git |
 | **livegrep** | Suffix array enables arbitrary substring search without n-gram decomposition | C++, higher memory usage, slower index build |
 
-fast-grep occupies a middle ground: better filtering than zoekt's trigrams (via sparse n-grams + position masks), lower memory than livegrep's suffix arrays, and Rust's safety/performance guarantees.
+fast-grep occupies a middle ground: the same trigram decomposition as zoekt but with line-level postings (verification jumps to candidate lines), a delta overlay + FS daemon that keeps any directory fresh without git, lower memory than livegrep's suffix arrays, and Rust's safety/performance guarantees.

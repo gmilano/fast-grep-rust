@@ -6,11 +6,11 @@
 //   2. Animated pipeline showing the 5-stage indexed search path.
 //
 // The decomposition is a *faithful simplification* of the real Rust algorithm
-// in src/searcher.rs (extract_longest_literal, try_literal_alternation) and
-// src/sparse.rs (sliding-window n-gram extraction). It correctly identifies
-// regex metachars and alternations, but uses fixed-size 3-grams instead of
-// the corpus-adaptive sparse n-grams the real engine uses — that variant
-// needs a precomputed bigram frequency table that's too large to ship in JS.
+// in src/trigram.rs (decompose_pattern: top-level alternation split, literal
+// runs, sliding-window trigrams) and src/searcher.rs (extract_longest_literal,
+// try_literal_alternation). It identifies regex metachars and alternations the
+// same way; the real engine additionally intersects the posting lists at line
+// granularity and consults Roaring bitmaps first.
 
 (() => {
   const REGEX_META = new Set([
@@ -97,7 +97,7 @@
     cls.parts.forEach(p => trigramsOf(p).forEach(t => allTrigrams.add(t)));
 
     const verdict = cls.type === 'literal'
-      ? `Literal pattern. The index reads ${allTrigrams.size} posting list${allTrigrams.size === 1 ? '' : 's'} and intersects them; only files that contain ALL of these trigrams (in the right adjacency, per position masks) survive to the verify stage.`
+      ? `Literal pattern. The index reads ${allTrigrams.size} posting list${allTrigrams.size === 1 ? '' : 's'} and intersects them; only lines that contain ALL of these trigrams survive to the verify stage.`
       : cls.type === 'alternation'
       ? `Pure literal alternation (${cls.parts.length} branches). The index reads each branch's trigrams and unions the results — a file matches if it contains ALL trigrams of AT LEAST ONE branch.`
       : `Regex with metacharacters. We extract literal runs of ≥3 chars (${cls.parts.length} found) and use their trigrams as a pre-filter. Final regex matching happens at verify time on the candidate files.`;
@@ -144,9 +144,9 @@
   const stagePayloads = [
     { idx: 0, name: 'Pattern',       value: '"EXPORT_SYMBOL"' },
     { idx: 1, name: 'Trigrams',      value: 'EXP, XPO, POR, ORT, RT_, T_S, _SY, SYM, YMB, MBO, BOL' },
-    { idx: 2, name: 'Posting lists', value: '11 lookups → ~340 candidate (file, line) pairs' },
-    { idx: 3, name: 'Intersection',  value: '~340 → ~210 after position-mask Bloom filter' },
-    { idx: 4, name: 'Verify',        value: '4-byte prefix + regex → 197 matches in 0.3 ms' },
+    { idx: 2, name: 'Bitmaps',       value: '11 Roaring bitmaps ANDed, smallest first → candidate files' },
+    { idx: 3, name: 'Line postings', value: 'postings decoded for surviving files, intersected on (file, line)' },
+    { idx: 4, name: 'Verify',        value: 'regex on candidate lines only → 197 matches' },
   ];
 
   let cur = -1;

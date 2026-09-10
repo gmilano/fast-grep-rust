@@ -71,6 +71,6 @@ To disable fast-grep and return to the default, remove the `"grep"` entry from
 
 ## Limits
 
-- Case-insensitive search (`-i`) bypasses the index and runs a full scan.
+- Case-insensitive search (`-i`) is only indexed when the index was built with `fgr index -i`; otherwise it scans every indexed file.
 - The index must be rebuilt (or updated with `fgr update`) when files change significantly.
 - Token estimates from `--agent-stats` use a 4-bytes/token heuristic, not Claude's tokenizer.

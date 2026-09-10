@@ -12,7 +12,8 @@ description: |
 
 # fast-grep (`fgr`) — agent usage guide
 
-`fgr` is a drop-in `grep` replacement with an optional sparse n-gram index.
+`fgr` is a drop-in `grep` replacement with an optional trigram index
+(line-level postings, so verification reads only candidate lines).
 The CLI flags are intentionally close to `grep`/`rg`, so most habits transfer.
 This skill captures the non-obvious behaviour so an agent can use `fgr`
 without surprises.
@@ -46,27 +47,44 @@ surprising. Confirm with the user first.
 
 | Want | Flag |
 |---|---|
-| Case-insensitive | `-i` |
+| Case-insensitive | `-i` (indexed only if the index was built with `fgr index -i`; otherwise scans every indexed file) |
 | File names only | `-l` |
 | Match counts | `-c` |
 | Line numbers | `-n` (default on) |
 | Context lines | `-A N` / `-B N` / `-C N` |
 | Literal (not regex) | `-F` |
-| Invert match | `-v` |
+| Invert match | `-v` (always a direct scan, never the index) |
 | Only matching part | `-o` |
-| Filter by extension | `--type rs` (see pitfalls) |
+| Filter by extension | `--type rs` (repeatable) |
+| Glob filters | `--include '*.rs'` / `--exclude 'vendor/*'` (repeatable) |
 | Include `.gitignore`d files | `--no-ignore` |
+| Hidden files / dirs | `--hidden` |
 | Use persistent index | `--index .fgr` |
 
-Subcommands: `index`, `update`, `stats`, `daemon`, `bench`.
+Subcommands: `index`, `update`, `compact`, `stats`, `daemon`, `bench`,
+`integrations`.
 
 ## Output format
 
-Matches go to **stdout** as `path:line:content` (grep-compatible).
-A trailing summary like `Searched in 5ms, 2 matches` is written to **stderr**,
-so `fgr ... | wc -l` and other pipes work the same as with `grep`.
+Matches go to **stdout** as `path:line:content` (grep-compatible) when piped;
+on a TTY they are grouped under a file heading. A trailing summary like
+`Searched in 5ms, 2 matches` is written to **stderr**, so `fgr ... | wc -l`
+and other pipes work the same as with `grep`.
 
-## Known pitfalls (verified on v0.3.1)
+For agent tool calls prefer the compact formats — same content, fewer tokens:
+
+```bash
+fgr --agent "PATTERN" . --index .fgr                 # path once, then `line: text`
+fgr --format jsonl "PATTERN" . --index .fgr          # one {"path","line","text"} per match
+fgr --agent "PATTERN" . --max-results 50 --max-files 10   # cap the output (stderr notice; JSON gets `truncated`)
+fgr --agent-stats --agent "PATTERN" .                 # latency / bytes / token estimate on stderr
+```
+
+Caps are deterministic (first N matches by path, then line). A per-file cap
+stops reading a file at its Nth match, so a truncated total may be a lower
+bound (`N+` on stderr, `"exact": false` in JSON).
+
+## Known pitfalls (verified on v0.4.0)
 
 These are real behavioural quirks an agent must work around. Tracked in
 upstream issue [#6](https://github.com/gmilano/fast-grep-rust/issues/6).
@@ -79,23 +97,17 @@ for `-q`, `-c`, `-l` and `-v` too, so `if fgr -q "X" .; then …` works as
 with `grep`/`rg`. (Earlier releases always exited `0` — if you targeted one,
 drop any output-parsing workaround.)
 
-### 2. `--include` / `--exclude` glob filters are no-ops
+### 2. Short or literal-less patterns scan everything
 
-The flags are accepted but currently do not filter results. **Don't trust them.**
-Workarounds:
+The index needs a literal run of at least 3 bytes in every alternation branch.
+`ab`, `\d+`, `.*foo|x` and similar fall back to scanning every indexed file —
+correct, just not fast. Prefer a longer literal when you have one.
 
-- For extension filtering without an index: use `--type <ext>` (works correctly).
-- For extension filtering with an index, or arbitrary globs: pipe through `awk`/`grep`:
-  ```bash
-  fgr "PATTERN" . --index .fgr | awk -F: '$1 ~ /\.rs$/'
-  ```
-- Or shell out to `find` first and feed paths to `fgr` one at a time when precision matters.
+### 3. `-i` is only fast with a companion index
 
-### 3. `--type <ext>` is ignored when `--index` is used
-
-`--type rs` works on the no-index path but is silently dropped on the indexed
-path. Workaround: post-filter with `awk` as above, or run without `--index`
-when extension precision is required and the repo is small.
+The index is case-sensitive. `-i` uses the case-folded companion if the index
+was built with `fgr index -i`; otherwise it scans every indexed file. If an
+agent session will do many `-i` searches on a large repo, build with `-i`.
 
 ### 4. No lookaround, no backreferences
 
@@ -105,7 +117,8 @@ parse error. Fall back to `rg -P` or `grep -P` for those patterns.
 
 ### 5. `.gitignore` is respected by default
 
-Like `ripgrep`, not like `grep`. Pass `--no-ignore` to search ignored files.
+Like `ripgrep`, not like `grep`. Pass `--no-ignore` to search ignored files
+and `--hidden` to include dotfiles/dot-directories.
 
 ### 6. Index path is relative to the indexed root
 
@@ -123,7 +136,8 @@ running `fgr index`.
 |---|---|---|
 | One-time build | `fgr index . [--output .fgr]` | ~60s for 80k files |
 | Incremental update after edits | `fgr update . --index .fgr` | <1s for 10–100 files |
-| Inspect | `fgr stats --index .fgr` | instant |
+| Fold accumulated updates back into the baseline | `fgr compact --index .fgr` | seconds; also runs automatically past a threshold |
+| Inspect (docs, delta, tombstones, stale?) | `fgr stats --index .fgr` | instant |
 | Auto-update on FS changes | `fgr daemon start . --output .fgr` | background process |
 
 If a search returns no results but the user expects matches in recently-edited

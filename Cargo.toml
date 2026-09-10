@@ -6,7 +6,7 @@ authors = [
     "Gaston Milano <gmilano@genexus.com>",
     "Gustavo Brown Rodriguez <gustavo.brown@globant.com>",
 ]
-description = "Indexed regex search. 6-25x faster than ripgrep on large codebases via sparse n-gram index, position masks, and mmap'd posting lists."
+description = "Indexed regex search for coding agents. 6-25x faster than ripgrep on large codebases via a trigram index with line-level postings, Roaring bitmaps, and mmap'd posting lists; compact, capped output for LLM tool calls."
 license = "MIT"
 repository = "https://github.com/gmilano/fast-grep-rust"
 homepage = "https://github.com/gmilano/fast-grep-rust"
@@ -20,10 +20,7 @@ exclude = [
     "docs/**",
     ".fgr/**",
     ".claude/**",
-    "TASK.md",
     "AGENTS.md",
-    "ADAPTIVE_FREQ.md",
-    "SIMD_LITERAL.md",
 ]
 
 [[bin]]
@@ -80,10 +77,11 @@ maintainer = "Gaston Milano <gmilano@genexus.com>"
 copyright = "2026, Gaston Milano <gmilano@genexus.com>"
 license-file = ["LICENSE", "0"]
 extended-description = """\
-fast-grep (fgr) is an indexed regex search tool. It builds a persistent
-sparse n-gram index over a codebase so that subsequent searches become
-sub-200ms lookups instead of multi-second full scans. Without an index it
-falls back to a ripgrep-equivalent parallel scan."""
+fast-grep (fgr) is an indexed regex search tool for coding agents. It builds
+a persistent trigram index with line-level postings over a codebase so that
+subsequent searches become sub-200ms lookups instead of multi-second full
+scans, and offers compact, capped output formats for LLM tool calls. Without
+an index it falls back to a ripgrep-equivalent parallel scan."""
 # Hardcoded so cross-arch .deb builds don't depend on dpkg-shlibdeps
 # resolving foreign-arch shared libs on the build host.
 depends = "libc6"

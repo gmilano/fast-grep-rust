@@ -112,6 +112,35 @@ All notable changes to fast-grep are documented here.
   older index is rejected with a clear "rebuild with `fgr index`" message rather
   than searched with the wrong key. Rebuild any existing index.
 
+### Documentation — brought in line with the shipped engine
+
+- README "How it works", `docs/techniques.md`, `docs/vs-ripgrep.md`, the
+  interactive site (`docs/index.html`, `docs/app.js`), `AGENTS.md`, the
+  Cargo description and the agent skill described the original design (sparse
+  n-grams with a corpus-adaptive bigram table, Blackbird position masks, a
+  4-byte prefix filter). They now describe what the binary does: a fixed
+  trigram index with line-level postings, a two-tier Roaring-bitmap → postings
+  lookup, compact delta-varint encoding, delta overlay + compaction, and the
+  case-folded companion index, the bounded (external-merge) build, the
+  binary/size admission policy and the packed trigram key.
+- Fixed claims that were wrong for the current binary: `-i` "always bypasses
+  the index" (it is indexed with `fgr index -i`), symlinks "followed during
+  indexing" (they are not), "no TCP daemon" (there is one, on localhost, with
+  token authentication), and "binary format version remains 3" (it is 5 since the packed
+  trigram key; older indexes are rebuilt automatically on the next `--index`
+  search).
+- README flags table now lists every search flag (`-A`/`-B`, `--include`/
+  `--exclude`, `--hidden`, `-q`, `-F`, `-v`, `-o`, `--trim`, `--heading`,
+  `-U`) and the exit-status contract; index-size figures refreshed for the
+  compact posting format (timing figures unchanged).
+- Agent skill: dropped the `--include`/`--exclude` and `--type`-with-index
+  pitfalls (both work now), added `compact`/`integrations` and the agent output
+  flags.
+- Removed the orphan `src/freq_real.rs` (never compiled in) and two stale task
+  notes: `ADAPTIVE_FREQ.md` (the abandoned adaptive bigram table) and
+  `SIMD_LITERAL.md` (the literal pre-filter, long since implemented and
+  described in `docs/techniques.md`).
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights
@@ -129,7 +158,9 @@ repository-search latency and the number of tokens returned to coding agents.
 - Context lines: `-C`/`--context N` wired up (N lines before and after each match).
 - `--agent-stats`: search latency, match count, output bytes, token estimates to stderr.
 - `fgr integrations` subcommand: prints integration guide for Claude Code, Codex, Aider.
-- `fgr bench --agent-metrics`: compares grep-format vs compact-format bytes and token estimates.
+- ~~`fgr bench --agent-metrics`~~ — listed here by mistake; it was never implemented.
+  `fgr bench` compares indexed vs no-index `fgr` against grep/ag/rg/ugrep timings.
+  Use `--agent-stats` for byte/token estimates of a query.
 - `integrations/` directory: setup guides for Claude Code, Codex, OpenCode, Aider, and MCP.
 - `scripts/bench-agent/run.sh`: reproducible benchmark script producing JSON + Markdown results.
 - `scripts/demo/demo.sh` + `demo.tape`: recordable demo for asciinema/VHS.
@@ -180,7 +211,8 @@ repository-search latency and the number of tokens returned to coding agents.
 
 - Default output format is unchanged (grep: `file:line:text`).
 - No breaking changes to existing flags or subcommands.
-- Binary format version remains 3; existing indexes are compatible.
+- Binary format version is 4 (line-level compact postings). An index with an
+  older version is detected on the next `--index` search and rebuilt automatically.
 - `-c/--count` and `-l/--files-with-matches` reject incompatible formats (`json`, `jsonl`)
   with a clear error and non-zero exit code.
 
