@@ -263,7 +263,12 @@ fgr daemon stop   /path/to/codebase --output .fgr
 
 The daemon debounces FS events by 3 seconds, so a burst of writes triggers a
 single update. State is exchanged over a localhost TCP socket recorded in
-`<index>/daemon.port`.
+`<index>/daemon.port`. Every control command (`status`/`flush`/`stop`) is
+authenticated with a per-daemon secret token written to `<index>/daemon.token`,
+so another local process cannot stop or drive the daemon. On Unix the token file
+is created owner-only (`0600`); on Windows it inherits the index directory's
+ACLs (best effort) — keep your index directory in a location only you can read.
+
 ### Flags
 
 | Flag | Description |

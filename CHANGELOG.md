@@ -49,6 +49,17 @@ All notable changes to fast-grep are documented here.
   build for a given input order — no on-disk format change, existing indexes
   keep working.
 
+### Security — authenticated daemon control socket
+
+- The daemon's localhost control socket now requires a **per-daemon secret
+  token** on every command (`status`/`flush`/`stop`). Previously any local
+  process could connect to the daemon's port and stop it (a denial of service)
+  or trigger updates. The token is written to `<index>/daemon.token` (created
+  owner-only, `0600`, on Unix; best effort on Windows) and is the capability a
+  client must present; unauthenticated commands are rejected with
+  `error: unauthorized` and the daemon keeps running. Token comparison is
+  constant-time.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights

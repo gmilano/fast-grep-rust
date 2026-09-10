@@ -13,6 +13,7 @@ use crate::persist;
 const DEBOUNCE_SECS: u64 = 3;
 const PID_FILE: &str = "daemon.pid";
 const PORT_FILE: &str = "daemon.port";
+const TOKEN_FILE: &str = "daemon.token";
 
 enum Event {
     FsChange(Vec<PathBuf>),
@@ -26,6 +27,8 @@ struct Daemon {
     dirty: bool,
     pending_changes: HashSet<PathBuf>,
     last_event_time: Instant,
+    /// Secret required on every control command (see `daemon.token`).
+    token: String,
 }
 
 // --- PID/port file management ---
@@ -53,9 +56,71 @@ fn read_port_file(index_path: &Path) -> Option<u16> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+// --- Control-socket auth token (local cookie) ---
+//
+// The daemon binds a localhost port that any local process could otherwise
+// connect to and `stop`. We gate every command on a per-daemon secret token
+// written to `daemon.token`. The real boundary is the file's permissions
+// (owner-only on Unix); the token just stops a process that cannot read that
+// file from driving the daemon.
+
+/// Generate a random control token, persist it to `daemon.token`, and return it.
+fn write_token_file(index_path: &Path) -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating daemon token: {e}"))?;
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    write_token_secure(&index_path.join(TOKEN_FILE), token.as_bytes())?;
+    Ok(token)
+}
+
+fn read_token_file(index_path: &Path) -> Option<String> {
+    std::fs::read_to_string(index_path.join(TOKEN_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Write the token file readable only by the owner. On Unix the `0600` mode is
+/// applied atomically at create time so it is never briefly world-readable.
+#[cfg(unix)]
+fn write_token_secure(path: &Path, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Windows has no portable std permission API; the token file inherits the
+/// index directory's ACLs (typically user-restricted under a profile). Best
+/// effort — documented in the README.
+#[cfg(not(unix))]
+fn write_token_secure(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// Constant-time equality so token comparison leaks no timing signal.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn remove_daemon_files(index_path: &Path) {
     let _ = std::fs::remove_file(index_path.join(PID_FILE));
     let _ = std::fs::remove_file(index_path.join(PORT_FILE));
+    let _ = std::fs::remove_file(index_path.join(TOKEN_FILE));
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -95,10 +160,14 @@ pub fn is_daemon_running(index_path: &Path) -> bool {
 /// Send a command to the daemon and return its response.
 pub fn send_command(index_path: &Path, cmd: &str) -> Result<String> {
     let port = read_port_file(index_path).context("no daemon port file found")?;
+    let token = read_token_file(index_path)
+        .context("daemon token file missing — is the daemon running?")?;
     let stream = TcpStream::connect(("127.0.0.1", port)).context("connecting to daemon")?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(&stream);
     let mut writer = std::io::BufWriter::new(&stream);
+    // Auth line first, then the command.
+    writeln!(writer, "{}", token)?;
     writeln!(writer, "{}", cmd)?;
     writer.flush()?;
     let mut response = String::new();
@@ -213,9 +282,10 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     let port = listener.local_addr()?.port();
     listener.set_nonblocking(true)?;
 
-    // Write PID and port files
+    // Write PID and port files, and a per-daemon control token (gates commands).
     write_pid_file(index_path)?;
     write_port_file(index_path, port)?;
+    let token = write_token_file(index_path)?;
     eprintln!("[daemon] PID: {}, port: {}", std::process::id(), port);
 
     // Set up event channel
@@ -266,6 +336,7 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
         dirty: false,
         pending_changes: HashSet::new(),
         last_event_time: Instant::now(),
+        token,
     };
 
     eprintln!("[daemon] Ready, listening for events...");
@@ -296,6 +367,16 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
                 stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let mut reader = BufReader::new(&stream);
                 let mut writer = std::io::BufWriter::new(&stream);
+                // First line is the auth token; reject before reading or acting
+                // on any command (in particular, never `stop` unauthenticated).
+                let mut auth = String::new();
+                if reader.read_line(&mut auth).is_err()
+                    || !constant_time_eq(auth.trim().as_bytes(), daemon.token.as_bytes())
+                {
+                    let _ = writeln!(writer, "error: unauthorized");
+                    let _ = writer.flush();
+                    continue;
+                }
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() {
                     match line.trim() {
@@ -344,4 +425,49 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     remove_daemon_files(&daemon.index_path);
     eprintln!("[daemon] Stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab")); // different length
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn token_file_roundtrips_and_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = write_token_file(dir.path()).unwrap();
+        assert_eq!(token.len(), 64, "32 random bytes hex-encoded");
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(read_token_file(dir.path()).as_deref(), Some(token.as_str()));
+        // A fresh token is different (overwrites the file).
+        let token2 = write_token_file(dir.path()).unwrap();
+        assert_ne!(token, token2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_token_file(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join(TOKEN_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn missing_token_file_reads_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_token_file(dir.path()), None);
+    }
 }
