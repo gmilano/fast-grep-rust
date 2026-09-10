@@ -40,7 +40,7 @@ byteorder = "1"
 globset = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 anyhow = "1"
 memchr = "2"
 aho-corasick = "1"
@@ -52,11 +52,11 @@ getrandom = { version = "0.4", optional = true }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
+metal = "0.33"
 objc = "0.2"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]
