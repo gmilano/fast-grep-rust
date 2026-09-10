@@ -141,6 +141,19 @@ All notable changes to fast-grep are documented here.
   `SIMD_LITERAL.md` (the literal pre-filter, long since implemented and
   described in `docs/techniques.md`).
 
+### Dependencies
+
+- `notify` 7 → 8.2: same watcher API; drops the unmaintained `instant` (and
+  `filetime`) transitive crates, so the `RUSTSEC-2024-0384` ignore in
+  `.cargo/audit.toml` is gone. `roaring` 0.10 → 0.11: same API and the same
+  portable bitmap format — existing indexes load unchanged.
+- `memmap2` 0.9.10 → 0.9.11 (fixes the `RUSTSEC-2026-0186` unsoundness
+  advisory) and every other semver-compatible dependency refreshed with
+  `cargo update` (`ignore`, `anyhow`, `rayon`, `clap`, `regex`, …).
+- GitHub Actions moved to the Node 24 line: `actions/checkout` v7,
+  `actions/upload-artifact` v7, `actions/download-artifact` v8,
+  `softprops/action-gh-release` v3. Supersedes the open dependabot PRs.
+
 ## [0.4.0] — 2026-07-18
 
 ### Highlights
