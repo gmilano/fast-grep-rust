@@ -28,6 +28,19 @@ All notable changes to fast-grep are documented here.
 - Build reports binary / too-large skip counts; the same admission policy gates
   build, incremental update, the stale check, and the no-index scan so they
   agree on the file set.
+### Indexing — bounded (external-merge) build
+
+- **Flat build memory.** `fgr index` no longer assembles the whole inverted
+  index in RAM before writing it (peak memory used to grow with the repository
+  and could OOM on large trees). Postings are now accumulated in a buffer, and
+  when it fills they are spilled to a sorted temp segment; after the walk the
+  segments are k-way merged straight into the final index. Peak build RAM is
+  bounded and independent of corpus size.
+- **New `[index] build_buffer_mb`** in `<index>/config.toml` (default 256): the
+  build buffer size before a spill. `0` disables spilling (assemble in RAM —
+  fastest, if you have the memory).
+- The produced index is **byte-identical** to the previous single-pass build —
+  no on-disk format change, existing indexes keep working.
 
 ## [0.4.0] — 2026-07-18
 

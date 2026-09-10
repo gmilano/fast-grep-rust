@@ -1,3 +1,4 @@
+mod buildsort;
 mod casefold;
 mod cli;
 mod config;

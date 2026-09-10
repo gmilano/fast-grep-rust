@@ -16,6 +16,7 @@ src/
 ├── trigram.rs     # Classic trigram extraction and regex decomposition
 ├── sparse.rs      # Sparse n-gram algorithm (build_all + covering modes)
 ├── index.rs       # SparseIndex: HashMap<ngram, Vec<(doc_id, loc_mask, next_mask)>>
+├── buildsort.rs   # Bounded (external-merge) build: spill sorted segments + k-way merge
 ├── persist.rs     # Binary format: lookup table + mmap'd postings + meta.json
 ├── filetype.rs    # File classification: known-text, magic signatures, binary heuristic
 ├── config.rs      # <index>/config.toml: compaction thresholds + file-admission policy

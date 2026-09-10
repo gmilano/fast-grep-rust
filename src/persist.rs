@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::casefold;
-use crate::index::{Posting, SparseIndex, TrigramBuilder};
+use crate::index::{Posting, TrigramBuilder};
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
@@ -865,79 +865,110 @@ impl PersistentIndex {
     }
 }
 
-/// Serialize one trigram map to its four on-disk files under `output`, named
-/// `{prefix}.postings`, `{prefix}.lookup`, `{prefix}.bitmaps`,
-/// `{prefix}.bitmaps.lookup`. Used for both the case-sensitive map
-/// (`prefix = "ngrams"`) and the case-insensitive companion
-/// (`prefix = "ngrams.ci"`). Returns the postings byte length.
-fn write_ngram_files(
-    output: &Path,
-    prefix: &str,
-    ngrams: &HashMap<[u8; 3], TrigramBuilder>,
-) -> Result<u64> {
-    // Sort trigrams by hash for binary search
-    let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = ngrams.iter().collect();
-    trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
+/// Streams one trigram store's four on-disk files, emitting one `(key, blob)`
+/// at a time in ascending-key order. Both the in-memory `write_ngram_files`
+/// path and the external-merge build (`crate::buildsort`) feed this same
+/// `emit`, so their output is byte-identical. Files: `{prefix}.postings`
+/// (compact posting blobs concatenated), `{prefix}.lookup`
+/// (`[key u32][off u64][len u32]` per trigram, key-sorted, binary-searched),
+/// `{prefix}.bitmaps` (a RoaringBitmap of doc ids per trigram) and
+/// `{prefix}.bitmaps.lookup`.
+pub(crate) struct NgramFileWriter {
+    postings: BufWriter<File>,
+    bitmaps: BufWriter<File>,
+    lookup_entries: Vec<(u32, u64, u32)>,
+    bitmap_lookup_entries: Vec<(u32, u64, u32)>,
+    lookup_path: PathBuf,
+    bitmaps_lookup_path: PathBuf,
+    offset: u64,
+    bm_offset: u64,
+}
 
-    // Write compact (delta-varint) postings and build lookup (offset/len per
-    // trigram). Postings are already compact-encoded in `builder.bytes`, so we
-    // write them verbatim — no re-encode pass.
-    let postings_path = output.join(format!("{prefix}.postings"));
-    let mut postings_file = BufWriter::new(File::create(&postings_path)?);
-    let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut offset: u64 = 0;
-    for (tri, builder) in &trigram_list {
-        let len = builder.bytes.len() as u32;
-        postings_file.write_all(&builder.bytes)?;
-        lookup_entries.push((crc32fast::hash(*tri), offset, len));
-        offset += len as u64;
+impl NgramFileWriter {
+    pub(crate) fn create(output: &Path, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            postings: BufWriter::new(File::create(output.join(format!("{prefix}.postings")))?),
+            bitmaps: BufWriter::new(File::create(output.join(format!("{prefix}.bitmaps")))?),
+            lookup_entries: Vec::new(),
+            bitmap_lookup_entries: Vec::new(),
+            lookup_path: output.join(format!("{prefix}.lookup")),
+            bitmaps_lookup_path: output.join(format!("{prefix}.bitmaps.lookup")),
+            offset: 0,
+            bm_offset: 0,
+        })
     }
-    postings_file.flush()?;
-    let postings_len = offset;
 
-    let lookup_path = output.join(format!("{prefix}.lookup"));
-    let mut lookup_file = BufWriter::new(File::create(&lookup_path)?);
-    for (hash, off, len) in &lookup_entries {
-        lookup_file.write_u32::<LittleEndian>(*hash)?;
-        lookup_file.write_u64::<LittleEndian>(*off)?;
-        lookup_file.write_u32::<LittleEndian>(*len)?;
-    }
-    lookup_file.flush()?;
+    /// Append one trigram's compact posting `blob` (already delta-encoded) and
+    /// its derived doc-id bitmap. Keys MUST arrive in ascending order.
+    pub(crate) fn emit(&mut self, key: u32, blob: &[u8]) -> Result<()> {
+        self.postings.write_all(blob)?;
+        self.lookup_entries
+            .push((key, self.offset, blob.len() as u32));
+        self.offset += blob.len() as u64;
 
-    // Write Roaring Bitmaps (Tier 1: doc_id sets per trigram)
-    let bitmaps_path = output.join(format!("{prefix}.bitmaps"));
-    let mut bitmaps_file = BufWriter::new(File::create(&bitmaps_path)?);
-    let mut bitmap_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
-    let mut bm_offset: u64 = 0;
-    for (tri, builder) in &trigram_list {
         let mut bitmap = RoaringBitmap::new();
-        for (doc_id, _, _) in PostingReader::new(&builder.bytes) {
+        for (doc_id, _, _) in PostingReader::new(blob) {
             bitmap.insert(doc_id);
         }
         let mut bm_buf = Vec::new();
         bitmap.serialize_into(&mut bm_buf)?;
-        let bm_len = bm_buf.len() as u32;
-        bitmaps_file.write_all(&bm_buf)?;
-        bitmap_lookup_entries.push((crc32fast::hash(*tri), bm_offset, bm_len));
-        bm_offset += bm_len as u64;
+        self.bitmaps.write_all(&bm_buf)?;
+        self.bitmap_lookup_entries
+            .push((key, self.bm_offset, bm_buf.len() as u32));
+        self.bm_offset += bm_buf.len() as u64;
+        Ok(())
     }
-    bitmaps_file.flush()?;
 
-    let bitmaps_lookup_path = output.join(format!("{prefix}.bitmaps.lookup"));
-    let mut bm_lookup_file = BufWriter::new(File::create(&bitmaps_lookup_path)?);
-    for (hash, off, len) in &bitmap_lookup_entries {
-        bm_lookup_file.write_u32::<LittleEndian>(*hash)?;
-        bm_lookup_file.write_u64::<LittleEndian>(*off)?;
-        bm_lookup_file.write_u32::<LittleEndian>(*len)?;
+    /// Flush the postings/bitmaps and write the two lookup tables. Returns the
+    /// postings byte length and the number of trigrams emitted.
+    pub(crate) fn finish(mut self) -> Result<(u64, usize)> {
+        self.postings.flush()?;
+        self.bitmaps.flush()?;
+
+        let mut lookup_file = BufWriter::new(File::create(&self.lookup_path)?);
+        for (key, off, len) in &self.lookup_entries {
+            lookup_file.write_u32::<LittleEndian>(*key)?;
+            lookup_file.write_u64::<LittleEndian>(*off)?;
+            lookup_file.write_u32::<LittleEndian>(*len)?;
+        }
+        lookup_file.flush()?;
+
+        let mut bm_lookup_file = BufWriter::new(File::create(&self.bitmaps_lookup_path)?);
+        for (key, off, len) in &self.bitmap_lookup_entries {
+            bm_lookup_file.write_u32::<LittleEndian>(*key)?;
+            bm_lookup_file.write_u64::<LittleEndian>(*off)?;
+            bm_lookup_file.write_u32::<LittleEndian>(*len)?;
+        }
+        bm_lookup_file.flush()?;
+
+        Ok((self.offset, self.lookup_entries.len()))
     }
-    bm_lookup_file.flush()?;
+}
 
+/// Serialize one in-memory trigram map to its four `{prefix}.*` files under
+/// `output`. Used for the case-sensitive map (`prefix = "ngrams"`) and the
+/// case-insensitive companion (`prefix = "ngrams.ci"`) on the non-spilling
+/// build path. Returns the postings byte length.
+pub(crate) fn write_ngram_files(
+    output: &Path,
+    prefix: &str,
+    ngrams: &HashMap<[u8; 3], TrigramBuilder>,
+) -> Result<u64> {
+    // Emit trigrams in key order so the lookup can be binary-searched.
+    let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = ngrams.iter().collect();
+    trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
+
+    let mut w = NgramFileWriter::create(output, prefix)?;
+    for (tri, builder) in &trigram_list {
+        w.emit(crc32fast::hash(*tri), &builder.bytes)?;
+    }
+    let (postings_len, _) = w.finish()?;
     Ok(postings_len)
 }
 
 /// Remove a case-insensitive companion index's files (used when (re)building a
 /// case-sensitive-only index over a directory that previously had a CI index).
-fn remove_ci_files(output: &Path) {
+pub(crate) fn remove_ci_files(output: &Path) {
     for suffix in [
         "ngrams.ci.postings",
         "ngrams.ci.lookup",
@@ -1365,14 +1396,6 @@ pub fn build(
     // before `config.toml` is written below). The same policy gates the
     // incremental update + stale walk, so all three agree on the file set.
     let admission = crate::config::Admission::from_config(&crate::config::load(output).index, root);
-    let index = SparseIndex::build_from_directory(
-        root,
-        no_ignore,
-        type_filter,
-        verbose,
-        case_insensitive,
-        &admission,
-    )?;
 
     fs::create_dir_all(output).context("creating output directory")?;
 
@@ -1383,9 +1406,27 @@ pub fn build(
     let _ = fs::remove_dir_all(&slot_dir);
     fs::create_dir_all(&slot_dir).context("creating slot directory")?;
 
+    // Build the trigram files directly into the slot with a bounded buffer:
+    // postings are spilled to sorted temp segments when the buffer fills and
+    // k-way merged at the end, so peak RAM stays flat regardless of corpus size.
+    // The budget comes from `[index] build_buffer_mb` (0 = unbounded). The
+    // resulting `ngrams[.ci].*` files are byte-identical to the single-pass build.
+    let budget = crate::config::load(output).index.build_budget_bytes();
+    let out = crate::buildsort::build_bounded(
+        root,
+        &slot_dir,
+        no_ignore,
+        type_filter,
+        verbose,
+        case_insensitive,
+        budget,
+        &admission,
+    )?;
+    let postings_len = out.postings_len;
+
     // Collect file mtimes
     let mut file_mtimes = HashMap::new();
-    for path in &index.doc_ids {
+    for path in &out.doc_paths {
         if let Ok(m) = fs::metadata(path) {
             file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
         }
@@ -1395,20 +1436,10 @@ pub fn build(
     // index root (`output`) so slots never count as corpus dirs.
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
-    // Write the case-sensitive trigram files, and the case-insensitive
-    // companion (`ngrams.ci.*`) when this is a CI build.
-    let postings_len = write_ngram_files(&slot_dir, "ngrams", &index.ngrams)?;
-    if let Some(ci) = &index.ngrams_ci {
-        write_ngram_files(&slot_dir, "ngrams.ci", ci)?;
-    } else {
-        // A prior CI build over this directory may have left stale CI files.
-        remove_ci_files(&slot_dir);
-    }
-
     // Write docids
     let docids_path = slot_dir.join("docids.bin");
     let mut docids_file = BufWriter::new(File::create(&docids_path)?);
-    for path in &index.doc_ids {
+    for path in &out.doc_paths {
         let path_bytes = path.to_string_lossy();
         let bytes = path_bytes.as_bytes();
         docids_file.write_u16::<LittleEndian>(bytes.len() as u16)?;
@@ -1417,17 +1448,17 @@ pub fn build(
     docids_file.flush()?;
 
     // Write meta
-    let num_docs = index.doc_ids.len();
+    let num_docs = out.doc_paths.len();
     let meta = IndexMeta {
         version: INDEX_VERSION,
         num_docs,
-        num_ngrams: index.ngrams.len(),
+        num_ngrams: out.num_ngrams,
         root_dir: root.to_string_lossy().into_owned(),
         built_at: chrono_now(),
         file_mtimes,
         dir_mtimes,
         main_num_docs: Some(num_docs),
-        case_insensitive: index.ngrams_ci.is_some(),
+        case_insensitive: out.has_ci,
     };
     let meta_path = slot_dir.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
