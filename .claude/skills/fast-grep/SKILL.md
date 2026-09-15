@@ -25,23 +25,20 @@ Need to search this repo?
 ├── Pattern uses lookaround / backreferences?
 │   └── Yes → use `rg -P` or `grep -P` (fgr's regex engine doesn't support them)
 │
-├── Does ./.fgr/ exist?
-│   ├── Yes → fgr "<pattern>" . --index .fgr
-│   │        If results look stale (recent edits missing):
-│   │          fgr update . --index .fgr   # incremental, <1s for small changes
-│   │
-│   └── No → How big is the repo?
-│            ├── Small (< ~2000 files) → fgr "<pattern>" .   # no index needed
-│            └── Large, or repeated searches expected:
-│                   Ask the user before building an index
-│                   (build is one-time but can take ~60s on 80k+ files).
-│                   Then: fgr index . && fgr "<pattern>" . --index .fgr
+└── fgr "<pattern>" .
+    An index is found and used if the repo has one (a `.fgr` here or in any
+    parent), and refreshed first if edits have landed since it was built.
+    Nothing to pass, nothing to check.
+
+    No index and searches keep coming back to this repo?
+      Ask the user before building one — `fgr index .` is one-time but
+      takes ~60s on 80k+ files. Never build one unasked.
 ```
 
-`fgr` auto-builds an index on first use when `--index .fgr` is passed and
-the directory is missing. This is convenient for small repos but **don't
-rely on it for unfamiliar large trees** — the implicit ~60s build is
-surprising. Confirm with the user first.
+An index is only ever *used* automatically, never built automatically: with no
+`.fgr` to find, `fgr` scans the tree directly (ripgrep-comparable). The one
+exception is the explicit `--index PATH`, which still builds that path on first
+use — so don't reach for it casually on an unfamiliar large tree.
 
 ## Flag cheat-sheet (grep-compatible subset)
 
@@ -59,7 +56,9 @@ surprising. Confirm with the user first.
 | Glob filters | `--include '*.rs'` / `--exclude 'vendor/*'` (repeatable) |
 | Include `.gitignore`d files | `--no-ignore` |
 | Hidden files / dirs | `--hidden` |
-| Use persistent index | `--index .fgr` |
+| Point at an index elsewhere | `--index PATH` (or `FGR_INDEX=PATH`) |
+| Ignore the index for one run | `--no-index` |
+| Search the index without refreshing it | `--no-auto-update` |
 
 Subcommands: `index`, `update`, `compact`, `stats`, `daemon`, `bench`,
 `integrations`.
@@ -74,8 +73,8 @@ and other pipes work the same as with `grep`.
 For agent tool calls prefer the compact formats — same content, fewer tokens:
 
 ```bash
-fgr --agent "PATTERN" . --index .fgr                 # path once, then `line: text`
-fgr --format jsonl "PATTERN" . --index .fgr          # one {"path","line","text"} per match
+fgr --agent "PATTERN" .                              # path once, then `line: text`
+fgr --format jsonl "PATTERN" .                       # one {"path","line","text"} per match
 fgr --agent "PATTERN" . --max-results 50 --max-files 10   # cap the output (stderr notice; JSON gets `truncated`)
 fgr --agent-stats --agent "PATTERN" .                 # latency / bytes / token estimate on stderr
 ```
@@ -123,7 +122,9 @@ and `--hidden` to include dotfiles/dot-directories.
 ### 6. Index path is relative to the indexed root
 
 If you move or rename the repo, the existing `.fgr/` directory is invalidated.
-Rebuild after moves.
+Rebuild after moves. For the same reason an index is only refreshed from the
+directory it was built in: run from elsewhere, `fgr` searches it as-is and says
+so, and `fgr update` refuses rather than re-index the wrong tree.
 
 ## Index lifecycle
 
@@ -134,15 +135,18 @@ running `fgr index`.
 
 | Operation | Command | Cost |
 |---|---|---|
-| One-time build | `fgr index . [--output .fgr]` | ~60s for 80k files |
-| Incremental update after edits | `fgr update . --index .fgr` | <1s for 10–100 files |
-| Fold accumulated updates back into the baseline | `fgr compact --index .fgr` | seconds; also runs automatically past a threshold |
-| Inspect (docs, delta, tombstones, stale?) | `fgr stats --index .fgr` | instant |
-| Auto-update on FS changes | `fgr daemon start . --output .fgr` | background process |
+| One-time build | `fgr index .` | ~60s for 80k files |
+| Incremental update after edits | automatic, on the first search that notices | <1s for 10–100 files |
+| ...or explicitly | `fgr update` | same |
+| Fold accumulated updates back into the baseline | `fgr compact` | seconds; also runs automatically past a threshold |
+| Inspect (docs, delta, tombstones, stale?) | `fgr stats` | instant |
+| Keep it current off the search path | `fgr daemon start .` | background process |
 
-If a search returns no results but the user expects matches in recently-edited
-files, the index may be stale — run `fgr update` before concluding the result
-is correct, or suggest the daemon for active sessions.
+Recently-edited files missing from results is not the usual explanation any
+more — searches fold in what changed before answering. It is still worth
+ruling out on an index that a search declined to refresh (it says so on
+stderr), and the daemon is worth suggesting for a session doing heavy editing,
+since it moves the update cost off the search.
 
 ## When *not* to use `fgr`
 
@@ -155,17 +159,17 @@ is correct, or suggest the daemon for active sessions.
 
 ```bash
 # Find all callers of a function
-fgr "frobnicate\(" . --index .fgr
+fgr "frobnicate\(" .
 
 # Count TODOs per file
-fgr -c "TODO" . --index .fgr
+fgr -c "TODO" .
 
-# Files containing a struct definition (Rust only, small repo)
+# Files containing a struct definition (Rust only)
 fgr -l "struct Foo" . --type rs
 
 # With context, case-insensitive
-fgr -i -C 2 "panic" . --index .fgr
+fgr -i -C 2 "panic" .
 
-# After a large refactor: refresh the index
-fgr update . --index .fgr
+# Search a subtree — the repo's index still answers it
+fgr "frobnicate" src/parser
 ```
