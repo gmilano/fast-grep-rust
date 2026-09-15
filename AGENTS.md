@@ -131,10 +131,13 @@ compaction), `RELEASING.md`, `SECURITY.md`.
   - Delta overlay: `delta.postings`, `delta.lookup`, `delta.docids`, `deleted.bin`
     (tombstones).
   - Optional CI companion: the same four `ngrams.ci.*` files + `delta.ci.*`.
-- Format version is `INDEX_VERSION` (5). An index with another version is
-  rebuilt automatically on the next `--index` search.
+- Format version is `INDEX_VERSION` (6). An index with another version is
+  rebuilt automatically on the next `--index` search, and skipped (with a
+  notice, falling back to a direct scan) by index discovery.
 - Staleness: `is_stale()` compares stored directory mtimes and a sample of file
-  mtimes; `full_stale_check()` walks everything.
+  mtimes; `full_stale_check()` walks everything. Stamps are exact nanoseconds
+  (`mtime_nanos`) — they used to be bucketed to even seconds, which hid any
+  edit made within two seconds of the last update.
 
 ### Incremental update & compaction (src/persist.rs)
 - `update_incremental()` re-indexes only changed/new files into the **delta**
@@ -148,8 +151,21 @@ compaction), `RELEASING.md`, `SECURITY.md`.
   `127.0.0.1:<random port>` recorded in `<index>/daemon.port`; command set is
   closed (`status`, `flush`, `stop`) and every command carries the per-daemon
   token from `<index>/daemon.token` (owner-only on Unix; constant-time compare;
-  `error: unauthorized` otherwise). A search with `--index` asks a running
-  daemon to `flush` pending changes first.
+  `error: unauthorized` otherwise). An indexed search asks a running daemon to
+  `flush` pending changes first, and refreshes the index itself when no daemon
+  owns it (`refresh_if_stale` in `src/cli.rs`).
+
+### Choosing the index (src/cli.rs)
+- `resolve_index()`: `--no-index` wins, then `--index`, then `FGR_INDEX`, then
+  `discover_index()` — a walk up from the search path for a `.fgr` that loads.
+  A discovered index is used as found (never built) and, when it sits above the
+  current directory, the process moves there so the stored relative doc paths
+  resolve (`ResolvedIndex::enter_root`).
+- `root_is_trustworthy()` gates every automatic refresh: an index records its
+  root as given (`.` for the usual `fgr index .`), so a refresh run from a
+  different directory would walk *that* tree and overwrite the index with it.
+  Relative roots are only trusted when they resolve to the directory holding
+  the index; `fgr update` refuses outright rather than shredding the index.
 
 ## Build
 

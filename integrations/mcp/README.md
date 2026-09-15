@@ -51,5 +51,6 @@ Use fast-grep directly via a shell tool in your MCP configuration:
 
 If you build an MCP server for fast-grep, contributions are welcome. The server
 should: accept the tool definition above, call `fgr` as a subprocess, forward
-stdout to the tool result, forward stderr to a `logs` field, and respect the
-`indexed` flag by appending `--index .fgr` when true.
+stdout to the tool result, and forward stderr to a `logs` field. It does not
+need to locate the index: `fgr` finds a `.fgr` in the search path or a parent
+on its own, and `--no-index` is there when a caller wants a direct scan.

@@ -138,10 +138,10 @@ slot:
 ```
 
 ### `meta.json` — metadata
-- Format version (`INDEX_VERSION`, currently 5 — an index with another version
+- Format version (`INDEX_VERSION`, currently 6 — an index with another version
   is rebuilt automatically on the next `--index` search)
 - Document and trigram counts, root directory, build timestamp
-- Directory and file mtimes for staleness detection
+- Directory and file mtimes (exact nanoseconds) for staleness detection
 
 ### Delta overlay and tombstones
 - `delta.postings` / `delta.lookup` / `delta.docids`: postings of files

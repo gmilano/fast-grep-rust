@@ -17,10 +17,12 @@ use crate::index::TrigramBuilder;
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
-/// On-disk index format version. Bumped to 5 for the packed-u32 trigram key
-/// (was a CRC32 hash); the lookup key values change, so the loader rejects
-/// older indices and they get rebuilt rather than searched with the wrong key.
-const INDEX_VERSION: u32 = 5;
+/// On-disk index format version. Bumped to 6 for nanosecond mtime stamps (they
+/// were bucketed to even seconds, which hid edits made within two seconds of
+/// the last update); version 5 brought the packed-u32 trigram key (was a CRC32
+/// hash). The stored numbers change meaning in both cases, so the loader
+/// rejects older indices and they get rebuilt rather than misread.
+const INDEX_VERSION: u32 = 6;
 
 // --- Slot layout (two-slot baseline swap) ---
 //
@@ -848,7 +850,7 @@ impl PersistentIndex {
             let path = Path::new(path_str);
             match fs::metadata(path) {
                 Ok(m) => {
-                    if mtime_secs(&m) != stored_mtime {
+                    if mtime_nanos(&m) != stored_mtime {
                         return true;
                     }
                 }
@@ -860,7 +862,7 @@ impl PersistentIndex {
             let path = Path::new(path_str);
             match fs::metadata(path) {
                 Ok(m) => {
-                    if mtime_secs(&m) != stored_mtime {
+                    if mtime_nanos(&m) != stored_mtime {
                         return true;
                     }
                 }
@@ -1438,7 +1440,7 @@ pub fn build(
     let mut file_mtimes = HashMap::new();
     for path in &out.doc_paths {
         if let Ok(m) = fs::metadata(path) {
-            file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+            file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_nanos(&m));
         }
     }
 
@@ -1803,7 +1805,7 @@ fn collect_tree_state(
                 if let Ok(m) = entry.metadata() {
                     dirs.lock()
                         .unwrap()
-                        .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                        .insert(path.to_string_lossy().into_owned(), mtime_nanos(&m));
                 }
             } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 if let Ok(m) = entry.metadata() {
@@ -1818,7 +1820,7 @@ fn collect_tree_state(
                         files
                             .lock()
                             .unwrap()
-                            .insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+                            .insert(path.to_string_lossy().into_owned(), mtime_nanos(&m));
                     }
                 }
             }
@@ -2244,14 +2246,22 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
 /// Extract mtime from filesystem metadata, truncated to 2-second granularity.
 /// This avoids false stale detection from sub-second timestamp jitter on NTFS.
-fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
-    let secs = meta
-        .modified()
+/// Modification time as exact nanoseconds since the epoch, the stamp every
+/// change check compares.
+///
+/// Both the recording and the checking side read it from the same filesystem
+/// through the same call, so whatever resolution that filesystem actually has
+/// (nanoseconds on APFS/ext4/NTFS, whole seconds on older ones) round-trips
+/// consistently — there is nothing to normalise away, and normalising creates a
+/// window instead: the earlier `secs / 2 * 2` bucketing made every edit landing
+/// in the same two-second bucket as the last index update invisible to the
+/// stale check and to the incremental update.
+fn mtime_nanos(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    secs / 2 * 2
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Walk a directory tree and collect mtime for each directory (not files).
@@ -2275,7 +2285,7 @@ fn collect_dir_mtimes(
                 }
             }
             if let Ok(m) = entry.metadata() {
-                dir_mtimes.insert(entry.path().to_string_lossy().into_owned(), mtime_secs(&m));
+                dir_mtimes.insert(entry.path().to_string_lossy().into_owned(), mtime_nanos(&m));
             }
         }
     }

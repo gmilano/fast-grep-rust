@@ -1,5 +1,5 @@
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,10 @@ struct SearchOpts {
     /// Whether the search resolves through the persistent index (for the
     /// JSON envelope's `indexed` field).
     indexed: bool,
+    /// Refresh the index before searching when the tree has moved past it.
+    /// `--no-auto-update` clears it; the per-index `[search] auto_update`
+    /// config can also turn it off.
+    auto_update: bool,
     /// The pattern exactly as the user typed it (JSON envelope `query`).
     query: String,
     /// `--trim`: strip leading indentation from emitted content (lossy).
@@ -190,9 +194,25 @@ pub struct Cli {
     pub exclude: Vec<String>,
 
     // -- fast-grep specific flags --
-    /// Use persistent index for searching (path to .fgr dir)
+    /// Use persistent index for searching (path to .fgr dir). Built on first
+    /// use if missing. Without this flag fast-grep looks for a `.fgr` index in
+    /// the search path and its parents and uses it when one is there (never
+    /// building one), so an indexed repository stays indexed for every caller.
+    /// Env: FGR_INDEX (same meaning as the flag).
     #[arg(long = "index", value_name = "PATH", global = true)]
     pub index_path: Option<PathBuf>,
+
+    /// Ignore any index and scan the tree directly. Overrides `--index` and
+    /// `FGR_INDEX`, and turns off the `.fgr` auto-discovery.
+    #[arg(long = "no-index", global = true)]
+    pub no_index: bool,
+
+    /// Don't refresh a stale index before searching it. Results then come from
+    /// the index as it stands, which is faster but can miss edits made since it
+    /// was built. Per-index default lives in `<index>/config.toml`
+    /// (`[search] auto_update`).
+    #[arg(long = "no-auto-update", global = true)]
+    pub no_auto_update: bool,
 
     /// Don't respect .gitignore
     #[arg(long, global = true)]
@@ -400,7 +420,8 @@ pub fn run() -> Result<bool> {
             max_files: cli.max_files,
             max_output_bytes: cli.max_output_bytes,
         },
-        indexed: cli.index_path.is_some() && !cli.invert_match,
+        indexed: false, // resolved below, once we know which index answers
+        auto_update: !cli.no_auto_update,
         query: String::new(), // populated below from the raw pattern
         trim: cli.trim,
         context,
@@ -440,6 +461,10 @@ pub fn run() -> Result<bool> {
 
     let dir = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
 
+    // Which index answers this search: `--index` / `FGR_INDEX` when given,
+    // otherwise a `.fgr` discovered in the search path or one of its parents.
+    let index = resolve_index(&cli, &dir);
+
     let mut effective = if cli.fixed_strings {
         regex::escape(&pattern)
     } else {
@@ -463,6 +488,7 @@ pub fn run() -> Result<bool> {
     let mut opts = opts;
     opts.pattern = Some(effective.clone());
     opts.query = pattern;
+    opts.indexed = index.is_some() && !cli.invert_match;
 
     // Invert-match can't use the index — the trigram index locates *matches*,
     // so a "lines that don't match" query can't be answered from it; it always
@@ -473,14 +499,13 @@ pub fn run() -> Result<bool> {
     // against the folded store, and transparently falls back to scanning all
     // live docs when no CI index exists. Routing it through the indexed path
     // also lets a first `-i` search auto-build the CI index.
-    let found = if let Some(ref idx_path) = cli.index_path {
-        if cli.invert_match {
-            run_direct_search(&effective, &dir, &opts)?
-        } else {
-            run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?
+    let found = match index {
+        // Invert-match never uses the index, discovered or not.
+        Some(idx) if !cli.invert_match => {
+            let search_path = idx.enter_root(&dir)?;
+            run_indexed_search(&effective, &idx.path, search_path.as_path(), &opts)?
         }
-    } else {
-        run_direct_search(&effective, &dir, &opts)?
+        _ => run_direct_search(&effective, &dir, &opts)?,
     };
 
     Ok(found)
@@ -683,6 +708,187 @@ fn matched(stats: &RenderStats) -> bool {
     stats.matches > 0 || stats.truncated.is_some()
 }
 
+/// Directory name fast-grep looks for when no index was named explicitly.
+const INDEX_DIR_NAME: &str = ".fgr";
+
+/// The index a search resolved to, and where it lives relative to the process.
+struct ResolvedIndex {
+    /// Path to the index directory (the `.fgr`).
+    path: PathBuf,
+    /// The directory the index was discovered in, when that is not the current
+    /// working directory. An index records its documents relative to the
+    /// directory it was built in, so a search run from a subdirectory only
+    /// lines up once the process moves to that root — see [`Self::enter_root`].
+    root: Option<PathBuf>,
+}
+
+impl ResolvedIndex {
+    /// Move the process to the index root when the index was discovered above
+    /// the current directory, and return the search path re-expressed relative
+    /// to it (so `fgr foo` inside `src/` still only reports matches in `src/`).
+    fn enter_root(&self, search_path: &Path) -> Result<PathBuf> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(search_path.to_path_buf());
+        };
+        let abs = std::fs::canonicalize(search_path).unwrap_or_else(|_| search_path.to_path_buf());
+        // `root` is an ancestor of the search path by construction; if that
+        // ever fails to hold, stay put rather than search the wrong tree.
+        let Ok(rel) = abs.strip_prefix(root) else {
+            return Ok(search_path.to_path_buf());
+        };
+        let rel = if rel.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            rel.to_path_buf()
+        };
+        std::env::set_current_dir(root)?;
+        Ok(rel)
+    }
+}
+
+/// Pick the index for this search: `--index`, then `FGR_INDEX`, then a `.fgr`
+/// discovered in the search path or one of its parents. `--no-index` skips all
+/// three. An explicitly named index is built on first use (see
+/// [`run_indexed_search`]); a discovered one is only ever used as found, so a
+/// plain `fgr pattern` in an unindexed tree stays a direct scan.
+fn resolve_index(cli: &Cli, search_path: &Path) -> Option<ResolvedIndex> {
+    if cli.no_index {
+        return None;
+    }
+    if let Some(path) = cli.index_path.clone() {
+        return Some(ResolvedIndex { path, root: None });
+    }
+    if let Some(path) = index_path_from_env() {
+        return Some(ResolvedIndex { path, root: None });
+    }
+    discover_index(search_path)
+}
+
+/// `FGR_INDEX`, treating an empty value as unset (so `FGR_INDEX= fgr ...`
+/// disables an inherited setting without unsetting the variable).
+fn index_path_from_env() -> Option<PathBuf> {
+    let raw = std::env::var_os("FGR_INDEX")?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Walk up from the search path looking for a usable `.fgr`. The nearest one
+/// wins, so a nested project's own index beats its parent's.
+fn discover_index(search_path: &Path) -> Option<ResolvedIndex> {
+    let start = std::fs::canonicalize(search_path).ok()?;
+    // A file argument is searched through its directory's index.
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::canonicalize(d).ok());
+
+    for dir in start.ancestors() {
+        let candidate = dir.join(INDEX_DIR_NAME);
+        if !persist::index_exists(&candidate) {
+            continue;
+        }
+        // Present but written by an older format: rebuilding it behind the
+        // user's back would be a surprise for a search that never asked for an
+        // index, so say so once and scan directly.
+        if !persist::is_current(&candidate) {
+            eprintln!(
+                "fgr: index at {} was written by an older format — scanning directly (run `fgr index {}` to rebuild)",
+                candidate.display(),
+                dir.display()
+            );
+            return None;
+        }
+        let root = (Some(dir) != cwd.as_deref()).then(|| dir.to_path_buf());
+        return Some(ResolvedIndex {
+            path: candidate,
+            root,
+        });
+    }
+    None
+}
+
+/// Whether the root recorded in an index still names the tree this process
+/// would walk. An absolute root is cwd-independent and always trustworthy; a
+/// relative one (`.`, `sub/dir`) only means what it meant in the directory the
+/// index was built in, and the conventional `<root>/.fgr` layout is what lets
+/// us check that we are still there. Getting this wrong is not a missed
+/// refresh but a shredded index — an update run from the wrong directory walks
+/// that directory and indexes it.
+fn root_is_trustworthy(idx_path: &Path, root: &Path) -> bool {
+    if root.is_absolute() {
+        return true;
+    }
+    let parent = match idx_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // A bare `.fgr` lives in the current directory.
+        _ => Path::new("."),
+    };
+    match (std::fs::canonicalize(root), std::fs::canonicalize(parent)) {
+        (Ok(resolved_root), Ok(resolved_parent)) => resolved_root == resolved_parent,
+        _ => false,
+    }
+}
+
+/// Bring `idx` up to date with the tree when it has drifted, returning the
+/// reloaded index (or the original when it was already current). Mirrors what
+/// `fgr update` does — incremental update plus the config's auto-rebaseline —
+/// under the same lock, so a search, a daemon and an explicit update can race
+/// without corrupting the index.
+fn refresh_if_stale(
+    idx: persist::PersistentIndex,
+    idx_path: &Path,
+    opts: &SearchOpts,
+) -> Result<persist::PersistentIndex> {
+    if !idx.is_stale() {
+        return Ok(idx);
+    }
+    let root = PathBuf::from(&idx.meta.root_dir);
+    if !root_is_trustworthy(idx_path, &root) {
+        if !opts.quiet && !opts.format.is_json() {
+            eprintln!(
+                "fgr: index at {} is stale but its root `{}` doesn't resolve from here — \
+                 searching it as-is (run `fgr update` from that directory to refresh)",
+                idx_path.display(),
+                root.display()
+            );
+        }
+        return Ok(idx);
+    }
+    // The index is mmap'd: drop it before the update swaps the slot under us.
+    drop(idx);
+
+    let (_lock, waited) = persist::acquire_index_lock(idx_path)?;
+    if waited {
+        // Someone else was already updating; their work may be exactly ours.
+        let reloaded = persist::load(idx_path)?;
+        if !reloaded.is_stale() {
+            persist::release_index_lock(idx_path);
+            return Ok(reloaded);
+        }
+        drop(reloaded);
+    }
+    let refreshed = persist::update_incremental(idx_path, &root, false).and_then(|stats| {
+        let compaction = persist::maybe_auto_compact(idx_path, &stats, false)?;
+        Ok((stats, compaction))
+    });
+    persist::release_index_lock(idx_path);
+    let (stats, _compaction) = refreshed?;
+
+    if !opts.quiet && !opts.format.is_json() {
+        eprintln!(
+            "Index refreshed: +{} added, {} modified, {} deleted in {}ms",
+            stats.added, stats.modified, stats.deleted, stats.duration_ms
+        );
+    }
+    persist::load(idx_path)
+}
+
 fn run_indexed_search(
     pattern: &str,
     idx_path: &std::path::Path,
@@ -716,26 +922,52 @@ fn run_indexed_search(
         eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
     }
 
-    // If a daemon is managing this index, ensure it's up-to-date before searching
+    // If a daemon is managing this index, ensure it's up-to-date before
+    // searching — and remember that it did, so the refresh below stays out of
+    // the way of the process that owns the updates.
     #[cfg(feature = "daemon")]
-    if crate::daemon::is_daemon_running(idx_path) {
-        if let Ok(status) = crate::daemon::send_command(idx_path, "status") {
-            if status == "dirty" {
-                let _ = crate::daemon::send_command(idx_path, "flush");
+    let daemon_flushed = {
+        let running = crate::daemon::is_daemon_running(idx_path);
+        if running {
+            if let Ok(status) = crate::daemon::send_command(idx_path, "status") {
+                if status == "dirty" {
+                    let _ = crate::daemon::send_command(idx_path, "flush");
+                }
             }
         }
-    }
+        running
+    };
+    #[cfg(not(feature = "daemon"))]
+    let daemon_flushed = false;
 
     let start = Instant::now();
-    let idx = persist::load(idx_path)?;
+    let mut idx = persist::load(idx_path)?;
 
-    // Resolve path filter: only return results under search_path.
-    // Compare using the same path form as stored in the index (relative from cwd).
+    // No daemon keeping this index honest: fold the edits made since it was
+    // built in ourselves, so the answer describes the tree as it is now rather
+    // than the snapshot the index froze. The cheap mtime probe runs on every
+    // search; the update itself only when it actually diverged.
+    if opts.auto_update && !daemon_flushed && crate::config::load(idx_path).search.auto_update {
+        idx = refresh_if_stale(idx, idx_path, opts)?;
+    }
+
+    // Resolve path filter: only return results under search_path. Doc paths are
+    // stored exactly as the build walk produced them — `root_dir` joined with
+    // the tree-relative path — so the filter has to be expressed in that same
+    // space or it matches nothing (a `.`-rooted index stores `./src/x`, which
+    // no `src/…` prefix is a prefix of).
     let root_dir = PathBuf::from(&idx.meta.root_dir);
-    let path_filter = if search_path != root_dir && search_path != std::path::Path::new(".") {
-        Some(search_path.to_path_buf())
-    } else {
+    let path_filter = if search_path == root_dir || search_path == Path::new(".") {
         None
+    } else if search_path.is_absolute() {
+        Some(search_path.to_path_buf())
+    } else if root_dir.is_absolute() || root_dir == Path::new(".") {
+        // Absolute root: docs carry it as a prefix. `.` root: docs carry `./`.
+        Some(root_dir.join(search_path))
+    } else {
+        // Relative root other than `.`: docs and the search path are both
+        // expressed from the current directory already.
+        Some(search_path.to_path_buf())
     };
 
     let load_time = start.elapsed();
@@ -929,7 +1161,12 @@ fn run_subcommand(
 ) -> Result<()> {
     // `update` and `stats` take the index dir from the global `--index` flag,
     // defaulting to `.fgr` when it is omitted.
-    let idx_arg = || index_path.clone().unwrap_or_else(|| PathBuf::from(".fgr"));
+    let idx_arg = || {
+        index_path
+            .clone()
+            .or_else(index_path_from_env)
+            .unwrap_or_else(|| PathBuf::from(INDEX_DIR_NAME))
+    };
     match cmd {
         Commands::Index {
             dir,
@@ -965,7 +1202,22 @@ fn run_subcommand(
                 d
             } else {
                 let probe = persist::load(&idx_path)?;
-                PathBuf::from(&probe.meta.root_dir)
+                let root = PathBuf::from(&probe.meta.root_dir);
+                // Refuse rather than re-index whatever tree we happen to be
+                // standing in: the update walks `root`, so a relative root read
+                // from the wrong directory would replace the index's contents
+                // with this directory's.
+                if !root_is_trustworthy(&idx_path, &root) {
+                    anyhow::bail!(
+                        "index at {} records a relative root `{}` that doesn't resolve from \
+                         here — cd to the directory it was built in, or pass the directory \
+                         explicitly (`fgr update DIR --index {}`)",
+                        idx_path.display(),
+                        root.display(),
+                        idx_path.display()
+                    );
+                }
+                root
             };
             let (_lock, waited) = persist::acquire_index_lock(&idx_path)?;
             // If we waited for another process, reload and re-check — it may

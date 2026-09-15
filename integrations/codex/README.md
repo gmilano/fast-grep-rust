@@ -11,18 +11,15 @@ The `--agent` flag produces compact output that minimises token consumption.
 fgr --agent "$PATTERN" "$PATH" --max-results 100 --max-files 20
 ```
 
-With a pre-built index:
-
-```bash
-fgr --agent "$PATTERN" "$PATH" --index .fgr --max-results 100
-```
+Index the project once with `fgr index .` and the same command becomes an
+indexed search: the `.fgr` is found from the search path, and kept current.
 
 ## JSONL output for structured tool results
 
 If your Codex integration expects structured output:
 
 ```bash
-fgr --format jsonl "$PATTERN" "$PATH" --index .fgr
+fgr --format jsonl "$PATTERN" "$PATH"
 ```
 
 Each line is a self-contained JSON object:
@@ -37,5 +34,5 @@ Remove fast-grep from the tool definition and restore `grep -rn` or `rg`.
 
 ## Limits
 
-- Index must be rebuilt after large file changes: `fgr update --index .fgr`
+- Edits are folded in by the search that first notices them; `fgr daemon start .` moves that cost off the search path
 - Case-insensitive search (`-i`) is only indexed when the index was built with `fgr index -i`; otherwise it scans every indexed file

@@ -8,7 +8,7 @@ search latency and output token usage.
 ## Recommended command
 
 ```bash
-fgr --agent "$PATTERN" "$PATH" --index .fgr --max-results 100
+fgr --agent "$PATTERN" "$PATH" --max-results 100
 ```
 
 ## Configuration
@@ -18,7 +18,7 @@ In your OpenCode agent configuration:
 ```yaml
 tools:
   search:
-    command: "fgr --agent --index .fgr"
+    command: "fgr --agent"
     args:
       - pattern: "$PATTERN"
       - path: "$PATH"
@@ -35,6 +35,9 @@ tools:
 
 ## Limits
 
-- Index requires `fgr index . --output .fgr` (one-time, ~60s for large repos)
-- Incremental update: `fgr update --index .fgr`
+- Index it once with `fgr index .` (~60s for large repos); searches find that
+  `.fgr` from the search path or any parent, so the command above is the same
+  indexed or not
+- Edits are folded in by the search that first notices them; `fgr daemon start .`
+  moves that cost off the search path
 - Token estimates in `--agent-stats` are approximate (4 bytes/token heuristic)

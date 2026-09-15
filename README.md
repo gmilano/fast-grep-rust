@@ -132,6 +132,9 @@ operations (`index`, `update`, `compact`, `bench`, `stats`, `daemon`,
 # Index a codebase (one-time, ~60s for the Linux kernel)
 fgr index /path/to/codebase --output .fgr
 
+# ...and from then on, searches find that index by themselves
+fgr "process_request" /path/to/codebase
+
 # Same, plus a case-folded companion so `-i` searches are indexed too
 fgr index -i /path/to/codebase --output .fgr
 
@@ -172,7 +175,43 @@ fgr bench "static.*inline" /path/to/codebase
 fgr stats --index .fgr
 ```
 
+### Using the index: found, not flagged
+
+`fgr PATTERN` looks for a `.fgr` in the search path and walks up from there,
+and searches through the first index it finds — so a repository that has been
+indexed once stays indexed for every caller, with no flag to remember and
+nothing for an agent's tool definition to pass. The nearest index wins, so a
+nested project's own index beats its parent's, and a search from a
+subdirectory still only reports matches under it.
+
+An index found this way is used exactly as found: fast-grep never builds one
+behind your back, so a plain `fgr` in an unindexed tree is still the direct
+scan it always was. Building stays explicit — `fgr index .` — with one
+exception kept for compatibility: an explicit `--index PATH` still builds that
+index on first use.
+
+| To... | Use |
+| --- | --- |
+| point at an index elsewhere | `--index PATH`, or `FGR_INDEX=PATH` in the environment |
+| ignore any index for one run | `--no-index` |
+| search the index without refreshing it | `--no-auto-update` |
+
 ### Keeping the index fresh: delta, then rebaseline
+
+A search refreshes the index it is about to read when the tree has moved past
+it: an mtime probe of the recorded directories (and a sample of the files) runs
+on every indexed search, and the incremental update below runs on the searches
+that find real drift — so results describe the tree as it is, not the snapshot
+the index froze. The cost is paid by the search that notices, which is why a
+`fgr daemon` (below) is worth starting on a repository under active edit: it
+gets there first, off its own event loop. `--no-auto-update` skips the refresh
+for one run, and `[search] auto_update = false` in `<index>/config.toml` turns
+it off for that index.
+
+Two things it cannot do: an index whose recorded root no longer resolves from
+the directory you are in is searched as-is (refreshing it would walk the wrong
+tree), and drift is only visible once the filesystem gives the changed file a
+different mtime.
 
 An `fgr update` doesn't rewrite the primary index — it records changed files in
 a small **delta** overlay (and tombstones the stale docs). Searches read the

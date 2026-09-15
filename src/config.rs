@@ -56,6 +56,14 @@ binary_high_byte_pct = 30
 # growing with the repository. 0 disables spilling (fastest, but the whole index
 # is held in RAM). The final index is byte-identical either way.
 build_buffer_mb = 256
+
+[search]
+# Searches that resolve through this index refresh it first when the working
+# tree has moved on (the same incremental update `fgr update` runs), so results
+# never come from a stale snapshot. The cost is paid by the search that finds
+# the index stale; a running daemon usually gets there first. `--no-auto-update`
+# opts out for one run.
+auto_update = true
 ";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +72,8 @@ pub struct Config {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub index: IndexConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +207,27 @@ impl Default for IndexConfig {
             always_index_paths: Vec::new(),
             binary_high_byte_pct: default_binary_high_byte_pct(),
             build_buffer_mb: default_build_buffer_mb(),
+        }
+    }
+}
+
+/// How searches that resolve through this index behave.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Refresh a stale index (the incremental `fgr update`) before searching
+    /// it, so a search never answers from a snapshot the tree has moved past.
+    #[serde(default = "default_auto_update")]
+    pub auto_update: bool,
+}
+
+fn default_auto_update() -> bool {
+    true
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            auto_update: default_auto_update(),
         }
     }
 }

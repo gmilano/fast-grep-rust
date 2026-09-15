@@ -14,23 +14,15 @@ In `.aider.conf.yml` (project root) or `~/.aider.conf.yml` (global):
 grep: "fgr --agent"
 ```
 
-With a pre-built index:
-
-```yaml
-grep: "fgr --agent --index .fgr"
-```
-
 ## Building the index
 
 ```bash
-fgr index . --output .fgr
+fgr index .
 ```
 
-Run once per project. Update after large changesets:
-
-```bash
-fgr update --index .fgr
-```
+Run once per project — searches find the `.fgr` from the repo root or any
+subdirectory and keep it up to date as you edit, so the `grep:` line above
+stays the same.
 
 ## Falling back
 
@@ -39,5 +31,5 @@ Remove the `grep:` line from `.aider.conf.yml` to restore aider's default.
 ## Limits
 
 - Case-insensitive patterns (`-i`) are only indexed when the index was built with `fgr index -i`; otherwise they scan every indexed file
-- The index reflects files at build time; stale results possible before `update`
+- Edits are folded in by the search that first notices them; `fgr daemon start .` moves that cost off the search path
 - Token estimates from `--agent-stats` use ~4 bytes/token, not aider's tokenizer

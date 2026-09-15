@@ -18,8 +18,13 @@ cp target/release/fgr /usr/local/bin/fgr
 2. Build the index for your project (one-time, run from your repo root):
 
 ```bash
-fgr index . --output .fgr
+fgr index .
 ```
+
+Searches pick that `.fgr` up on their own — from the repo root or any
+subdirectory, with no flag in the tool definition — and refresh it when the
+tree has moved on, so the configuration below is the same whether or not the
+project is indexed.
 
 3. Add to `.claude/settings.json` in your project:
 
@@ -27,7 +32,7 @@ fgr index . --output .fgr
 {
   "tools": {
     "grep": {
-      "command": "fgr --agent --index .fgr",
+      "command": "fgr --agent",
       "description": "Fast indexed code search with agent-optimised output"
     }
   }
@@ -37,7 +42,7 @@ fgr index . --output .fgr
 ## Recommended command
 
 ```bash
-fgr --agent "$PATTERN" "$PATH" --index .fgr --max-results 100 --max-files 20
+fgr --agent "$PATTERN" "$PATH" --max-results 100 --max-files 20
 ```
 
 The `--max-results` and `--max-files` limits protect against accidental context
@@ -45,14 +50,10 @@ exhaustion on broad patterns.
 
 ## Without an index
 
-If you haven't built an index, drop `--index .fgr`:
-
-```bash
-fgr --agent "$PATTERN" "$PATH" --max-results 100
-```
-
-This is faster than ripgrep for repeated searches even without an index due to
-SIMD pre-filtering, but will not have the 10–25× speedup of indexed mode.
+The same command works in a project that was never indexed: with no `.fgr` to
+find, fast-grep scans the tree directly. That is faster than ripgrep for
+repeated searches thanks to SIMD pre-filtering, but without the 10–25×
+speedup indexed mode gives you.
 
 ## Falling back to ripgrep
 
@@ -72,5 +73,5 @@ To disable fast-grep and return to the default, remove the `"grep"` entry from
 ## Limits
 
 - Case-insensitive search (`-i`) is only indexed when the index was built with `fgr index -i`; otherwise it scans every indexed file.
-- The index must be rebuilt (or updated with `fgr update`) when files change significantly.
+- Edits are folded in by the search that first notices them; `fgr daemon start .` moves that cost off the search path.
 - Token estimates from `--agent-stats` use a 4-bytes/token heuristic, not Claude's tokenizer.
