@@ -4,6 +4,58 @@ All notable changes to fast-grep are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-15
+
+### Highlights
+
+An indexed repository now searches as one: `fgr PATTERN` finds the `.fgr`
+itself and keeps it current, so nothing — a shell, an agent's tool definition,
+a script — has to remember a flag for the index to be used.
+
+### Using the index without asking for it
+
+- **`.fgr` discovery.** With no `--index`, a search looks for a `.fgr` in the
+  search path and walks up from there, and uses the first index it finds. The
+  nearest one wins, so a nested project's index beats its parent's, and a
+  search from a subdirectory still reports only matches under it (fast-grep
+  moves to the index root internally so the stored relative paths resolve).
+- **A discovered index is used as found, never built.** A plain `fgr` in an
+  unindexed tree is still the direct scan it always was; building stays
+  explicit (`fgr index .`). An explicit `--index PATH` keeps its build-on-first
+  -use behaviour.
+- **`FGR_INDEX`** names an index for every invocation in an environment
+  (`--index` still wins; an empty value counts as unset). `fgr update`,
+  `fgr stats` and `fgr compact` honour it too.
+- **`--no-index`** forces the direct scan for one run.
+
+### Keeping it current
+
+- **A stale index is refreshed before it answers.** Every indexed search runs
+  the cheap mtime probe; the ones that find real drift fold it in with the same
+  incremental update `fgr update` runs (auto-rebaseline included) under the same
+  lock. `--no-auto-update`, or `[search] auto_update = false` in
+  `<index>/config.toml`, opts out. A running daemon still gets there first.
+- **Refusing to refresh against the wrong tree.** An index records its root as
+  given — `.` for the usual `fgr index .` — which only means what it meant in
+  the directory it was built in. Used from elsewhere, an update would walk
+  *that* directory and replace the index's contents with it. Both the new
+  search-time refresh and `fgr update` now check the recorded root against
+  where the index actually lives, and refuse (a notice; an error for `update`)
+  instead.
+
+### Fixed
+
+- **Edits within two seconds of the last index update were invisible.** mtimes
+  were stored bucketed to even seconds (`secs / 2 * 2`), so any change landing
+  in the same bucket as the build looked unchanged to both the stale check and
+  the incremental update. Stamps are now exact nanoseconds. **`INDEX_VERSION`
+  is 5 → 6: existing indexes are rebuilt** (automatically for `--index`;
+  discovery reports it and scans directly until you run `fgr index .`).
+- **A subdirectory path filter returned nothing on an indexed search.**
+  `fgr PATTERN src/deep --index .fgr` compared a `src/deep` prefix against doc
+  paths stored as `./src/deep/…` and matched none of them. The filter is now
+  built in the same space as the stored paths.
+
 ### Indexing — binary detection & size cap
 
 - **Binaries are skipped without being read.** Files were previously read in
