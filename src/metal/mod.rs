@@ -4,8 +4,6 @@
 //! Lines that pass go on to full regex verification on CPU.
 //! Falls back to CPU-only if Metal device init fails.
 
-use std::path::Path;
-
 #[cfg(target_os = "macos")]
 pub mod metal_impl;
 
